@@ -2,7 +2,7 @@
 
 目标：`agent.turn_ended` 的原因很多（完成、提问、用户中断、被新消息打断、进程崩溃、网络、限流/配额、上下文耗尽）。插件先把每次结束归入一个**类别**，再按策略决定下一步。Gate（review/verify）只是其中一个动作。
 
-本文基于 2026-09-29 在真实 kiro-cli 2.25.0（Paseo 0.10.1 测试 daemon）上的实测，与 [design.md](design.md) 配套。
+本文基于 2026-09-29 在真实 kiro-cli 2.25.0（Paseo 0.10.1 测试 daemon）上的实测，并补充 Paseo Codex provider 的源码级适配，与 [design.md](design.md) 配套。
 
 ## 1. 实测结果
 
@@ -29,6 +29,7 @@
   - `The request was throttled by the service`
   - `You've reached your daily usage limit…` / `…monthly limit…`
   - `Context limit exceeded unexpectedly. Please start a new session to continue.`
+- **S5**：Codex app-server 进程退出时，Paseo 上报 `Codex app-server exited …`；Codex 用量耗尽的 real-e2e 保护逻辑匹配 `hit your limit`。插件分别归类为 `crashed` 和 `quota_exhausted`，并用单测固定这些措辞。
 
 结论：
 
@@ -44,9 +45,9 @@
 |---|---|---|
 | `replaced` | `canceled` 且 `statusAtEnd === "running"` | 实测（E4） |
 | `user_canceled` | 其余 `canceled` | 实测（E3） |
-| `crashed` | `failed`，文本匹配 `exited unexpectedly\|SIGKILL\|SIGTERM\|spawn .* ENOENT` | 实测（E5） |
+| `crashed` | `failed`，文本匹配 `exited unexpectedly\|app-server exited\|SIGKILL\|SIGTERM\|spawn .* ENOENT` | Kiro 实测（E5）+ Codex 源码 |
 | `context_exhausted` | `failed`，文本匹配 `context (limit\|window\|length)\|too many tokens\|maximum context\|start a new session` | 文本推断 |
-| `quota_exhausted` | `failed`，文本匹配 `(daily\|monthly) (usage )?limit\|quota exceeded\|out of credits\|insufficient (credits\|balance\|quota)\|billing` | 文本推断（S4） |
+| `quota_exhausted` | `failed`，文本匹配 `(daily\|monthly) (usage )?limit\|hit your (usage )?limit\|quota exceeded\|out of credits\|insufficient (credits\|balance\|quota)\|billing` | 文本推断（S4、S5） |
 | `rate_limited` | `failed`，文本匹配 `too many requests\|throttl\|rate.?limit\|\b429\b\|overloaded\|try again later` | 文本推断（S4） |
 | `network` | `failed`，文本匹配 `dispatch failure\|ECONN\|ETIMEDOUT\|ENOTFOUND\|EAI_AGAIN\|socket hang up\|network\|timed? ?out\|\b50[234]\b` | 实测（E6 的 `dispatch failure`）加推断 |
 | `error` | 其余 `failed` | — |
@@ -191,7 +192,7 @@ data = { category, message, suggestion, attempt, maxAttempts, nextRetryAt }
 
 ## 7. 实施拆分
 
-1. `server/outcome.ts`：`classify()` 与正则表；单测覆盖 E1–E6 的真实 payload，以及 S4 的措辞。
+1. `server/outcome.ts`：`classify()` 与正则表；单测覆盖 E1–E6 的真实 payload、S4 的措辞，以及 Codex 的 app-server 退出和用量耗尽措辞。
 2. `shared/schema.ts`：`on_outcome` schema。`quota_exhausted` 和 `context_exhausted` 禁止配置 retry。
 3. `gate.ts`：`handleTurnEnded` 先分类再分派；notify 卡片；`turn_ended` 时补一次 `refresh()` 取 `statusAtEnd`（gate 路径原本就会 refresh，可以复用）。
 4. 链与重试：`chains` 表、carry 沿用基线、对账循环中的定时发送。
@@ -200,7 +201,7 @@ data = { category, message, suggestion, attempt, maxAttempts, nextRetryAt }
 
 ## 7.1 实现状态（2026-09-29）
 
-§7 的第 1–5 项已实现：`server/outcome.ts`（分类、预筛、相似度）、`shared/schema.ts`（`on_outcome`）、`server/gate.ts`（分派、任务链、代答、重试、对账）、`server/ledger.ts`（`chains`、`chain_children` 表）、`client/outcome-card.tsx`，以及 profile 脚本的 `--role answerer`。单测 53 个，其中 E1–E6 和 S4 使用真实的 kiro payload 和措辞。
+§7 的第 1–5 项已实现：`server/outcome.ts`（分类、预筛、相似度）、`shared/schema.ts`（`on_outcome`）、`server/gate.ts`（分派、任务链、代答、重试、对账）、`server/ledger.ts`（`chains`、`chain_children` 表）、`client/outcome-card.tsx`，以及 profile 脚本的 `--role answerer`。单测覆盖 E1–E6、S4 的 Kiro payload / 措辞，以及 Codex provider 的已知措辞。
 
 真实 kiro-cli 端到端：
 

@@ -8,7 +8,7 @@ import type { CardData } from "../shared/schema.ts";
 import { createGate, type Gate, type Paseo } from "./gate.ts";
 import { Ledger } from "./ledger.ts";
 import { parseVerdict } from "./prompts.ts";
-import { resolveReviewer } from "./reviewer.ts";
+import { resolveReviewer, resolveRole } from "./reviewer.ts";
 import { decideAutoApproval } from "./permissions.ts";
 
 // ---------- fixtures ----------
@@ -321,6 +321,29 @@ describe("dispatch and report", () => {
     assert.equal(card.reviewerChanges, null);
     assert.deepEqual(fake.archived, [create.agentId]);
     assert.equal(fake.sent.length, 0, "report mode never sends to the source");
+  });
+
+  test("a Codex child is dispatched outside Plan mode with structured output", async () => {
+    fake.agents.set(SOURCE, sourceAgent({
+      provider: "codex",
+      model: "gpt-5.5",
+      currentModeId: "auto-review",
+      thinkingOptionId: "high",
+      features: [
+        { type: "toggle", id: "plan_mode", label: "Plan", value: true },
+        { type: "toggle", id: "fast_mode", label: "Fast", value: true },
+      ],
+    }));
+    writePolicy({ version: 2, agents: { reviewer: { profile: null } } });
+    await sourceTurn({ change: edit });
+
+    assert.deepEqual(fake.created[0].config, {
+      provider: "codex/gpt-5.5",
+      modeId: "auto-review",
+      thinkingOptionId: "high",
+      featureValues: { plan_mode: false, fast_mode: true },
+    });
+    assert.ok(fake.created[0].outputSchema);
   });
 
   test("PASS and verify role", async () => {
@@ -982,6 +1005,42 @@ describe("reviewer config", () => {
       modeId: "auto-review",
       thinkingOptionId: "high",
     });
+  });
+
+  test("Codex managed roles leave Plan mode but keep the remaining source settings", () => {
+    const codexSource = {
+      provider: "codex",
+      model: "gpt-5.5",
+      modeId: "auto-review",
+      thinkingOptionId: "high",
+      featureValues: { plan_mode: true, fast_mode: true },
+    };
+    const resolved = resolveRole(
+      codexSource,
+      { profile: null },
+      "post-turn-gate-reviewer",
+      [],
+    );
+    assert.deepEqual(resolved, {
+      ok: true,
+      config: {
+        provider: "codex",
+        model: "gpt-5.5",
+        modeId: "auto-review",
+        thinkingOptionId: "high",
+        featureValues: { plan_mode: false, fast_mode: true },
+      },
+      source: "source agent",
+    });
+
+    const explicit = resolveRole(
+      codexSource,
+      { profile: null, features: { plan_mode: true } },
+      "post-turn-gate-reviewer",
+      [],
+    );
+    assert.ok(explicit.ok);
+    assert.deepEqual(explicit.config.featureValues, { plan_mode: false, fast_mode: true });
   });
 
   test("errors: unknown or ambiguous profile, provider switch without a model", () => {

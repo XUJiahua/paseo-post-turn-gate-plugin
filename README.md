@@ -81,6 +81,8 @@ Each role has its own block under `agents`:
 - `timeout_minutes` includes time spent waiting for a permission answer. A reviewer or verifier that times out is an ERROR; an answerer that times out hands the question to you.
 - The agents write card text (summary, findings, questions, answers) in the language of the original request. To fix a language, say so in `instructions`, for example `"Write all text in English."`.
 
+For the `codex` provider, managed reviewer, verifier and answerer agents inherit the source model, mode, thinking level and Fast setting. The plugin always turns Codex Plan mode off for those child agents: a Plan-mode turn ends with a plan-approval request, while a gate role must finish with its structured JSON result. Explicitly setting `agents.<role>.features.plan_mode` to `true` is therefore also overridden.
+
 To create the profiles, run:
 
 ```bash
@@ -131,4 +133,4 @@ npm test
 paseo plugin reload post-turn-gate
 ```
 
-Only verified end-to-end with the `kiro` provider so far; codex and claude are on the TODO list in the design doc.
+The full workflow has been verified end-to-end with the `kiro` provider. Codex-specific launch, structured-output dispatch and failure classification are covered by tests; a real Paseo + Codex smoke run remains on the TODO list in the design doc, as does Claude.

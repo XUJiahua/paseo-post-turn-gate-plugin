@@ -52,6 +52,19 @@ describe("classify: real kiro-cli 2.25 payloads (docs/turn-outcomes.md §1)", ()
   });
 });
 
+describe("classify: Codex provider wording", () => {
+  test("app-server exits are crashes", () => {
+    assert.equal(
+      turn({ kind: "failed", error: { message: "Codex app-server exited with code 17 and signal null\nprovider crashed" } }, []).category,
+      "crashed",
+    );
+  });
+
+  test("the Codex usage-limit message is quota exhaustion", () => {
+    assert.equal(turn({ kind: "failed", error: { message: "You've hit your usage limit" } }, []).category, "quota_exhausted");
+  });
+});
+
 describe("looksLikeQuestion (pre-screen, high recall)", () => {
   test("hits", () => {
     for (const text of [

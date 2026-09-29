@@ -39,10 +39,10 @@ export function replyText(items: readonly TurnItem[]): string {
 // ponytail: provider error texts, not structured codes; a reworded message falls through to
 // `error` (notify only, never a retry). Upgrade path: structured outcome fields from Paseo (§6).
 const FAILURE_PATTERNS: ReadonlyArray<[Exclude<Category, "done" | "awaiting_user" | "refused" | "user_canceled" | "replaced" | "error">, RegExp]> = [
-  ["crashed", /exited unexpectedly|\bsigkill\b|\bsigterm\b|spawn \S+ enoent/],
+  ["crashed", /exited unexpectedly|app-server exited|\bsigkill\b|\bsigterm\b|spawn \S+ enoent/],
   ["context_exhausted", /context (limit|window|length)|too many tokens|maximum context|start a new session/],
   // Checked before rate_limited: "quota exceeded, please wait" must never be retried.
-  ["quota_exhausted", /(daily|monthly) (usage )?limit|quota exceeded|out of credits|insufficient (credits|balance|quota)|billing/],
+  ["quota_exhausted", /(daily|monthly) (usage )?limit|hit your (usage )?limit|quota exceeded|out of credits|insufficient (credits|balance|quota)|billing/],
   ["rate_limited", /too many requests|throttl|rate.?limit|\b429\b|overloaded|try again later/],
   ["network", /dispatch failure|econn\w*|etimedout|enotfound|eai_again|socket hang up|network|timed? ?out|\b50[234]\b/],
 ];

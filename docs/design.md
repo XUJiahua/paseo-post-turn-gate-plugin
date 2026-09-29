@@ -3,7 +3,7 @@
 基于 Paseo lifecycle hook 的纯插件实现：Agent 完成一轮后，按仓库策略启动独立 Verifier / Reviewer，结果回写原 Agent timeline，可选自动修复。原始方案见 [issue #1](https://github.com/XUJiahua/paseo-post-turn-gate-plugin/issues/1)，本文按源码与实测结果对其做了修正。
 
 - 目标 Paseo 版本：`>=0.10.0`。验证基于 paseo `3b4118360`（server 0.10.0）和本机 Paseo Desktop 0.10.1。
-- 对 provider 不做限制：Reviewer 默认继承源 Agent 的配置（含 mode），也可以通过 Paseo agent profile 或显式字段覆盖（§3.1）；不强制只读。已在真实环境验证的只有 **kiro-cli**（2.25.0），codex / claude 的验证项见 §15。
+- 对 provider 不做限制：Reviewer 默认继承源 Agent 的配置（含 mode），也可以通过 Paseo agent profile 或显式字段覆盖（§3.1）；不强制只读。已在真实环境验证的只有 **kiro-cli**（2.25.0）；Codex 的 provider 差异已适配并有单测，真实 Codex / Claude 冒烟项见 §15。
 
 ## 1. 已验证的平台行为
 
@@ -61,6 +61,17 @@
 | A2 | App 中的入口 | “历史”页（`fetch_agent_history_request`）会列出已归档的 agent，可以打开查看完整 timeline（只读，无同步状态） | 源码 + paseo 单测 |
 | A3 | Subagents 栏 | 已归档的子 Agent **不显示**（`subagents/select.ts`） | 源码 |
 | A4 | 向已归档 agent `send` | 会自动取消归档 | 源码 `agent-prompt.ts` |
+
+### 1.4 Codex provider 适配
+
+| # | 行为 | 处理 | 依据 |
+|---|---|---|---|
+| C1 | `outputSchema` | Gate 的 verdict / answer schema 原样传给 Paseo；Codex provider 会规范化后传给 `turn/start` | Paseo Codex provider 源码与单测 |
+| C2 | 源 Agent 开着 `plan_mode` | reviewer、verifier、answerer 强制以 `plan_mode: false` 启动；其余 model、mode、thinking、Fast 设置照常继承 | 本插件单测；Paseo Plan 模式会在 turn 完成后产生计划确认请求 |
+| C3 | Codex app-server 退出 | `Codex app-server exited …` 归类为 `crashed` | Paseo Codex transport 源码与本插件单测 |
+| C4 | Codex 用量耗尽 | `You've hit your usage limit` 归类为 `quota_exhausted`，不会自动重试 | Paseo Codex real-e2e 的错误判定措辞与本插件单测 |
+
+这些是源码/契约级适配，不替代 §15 的真实 Paseo + Codex 冒烟。
 
 ## 2. 相对原方案的修正
 
@@ -145,6 +156,7 @@
 - **分层**：源 Agent → agent profile → 显式字段，上层覆盖下层。
 - **默认 profile 可以不存在**：`profile` 等于角色默认 id 而 daemon 里没有这个 profile 时，改为继承源 Agent，并在卡片上提示运行 `npm run profiles`。这样没建过 profile 也能直接用。用户自己写的其他 profile 必须存在，否则 `ERROR`。
 - **切换 provider 时清空**：model、mode、thinking、features 都是 provider 专属的。某一层换了 provider，就丢弃从下层继承来的这些字段，不做混用。例如源 Agent 是 kiro，profile 是 codex：只用 profile 里的值，不会把 kiro 的 mode 带过去。
+- **Codex Plan mode 例外**：Gate 托管的三个角色都必须输出结构化结果，因此最终 provider 为 `codex` 且存在 `plan_mode` 时会强制设为 `false`；Fast 等其他 feature 保持分层后的值。
 - **缺 model 即报错**：最终没有 model（例如只写了 `"provider": "claude"`）→ `ERROR`，提示设置 `model`。Paseo 创建时要求 `provider/model` 格式（V12）。
 - **profile 引用**：先按 id 精确匹配，再按 name 精确匹配；name 重名 → `ERROR`，要求改用 id。profile 不存在 → `ERROR`，并列出现有 profile。
   - profile 存在 daemon 配置的 `daemon.agentProfiles` 里，插件在每次 dispatch 时用 `paseo.config.get()` 读取。已用测试 daemon 实测：插件会话有读取权限，profile（claude / `bypassPermissions`）会原样用于创建 Verifier。
@@ -438,7 +450,8 @@ server/gate.test.ts        # 真实 git + sqlite、fake paseo 的状态机测试
 
 ## 15. 待办与后续
 
-- [ ] **TODO：实测 codex、claude**，逐项对照 kiro 的结论：K3（能否继承配置创建）、K5（结论能否解析；codex 带 `outputSchema`）、K6（用户拒绝权限后这一轮是否继续）。
+- [ ] **TODO：真实 Paseo + codex 冒烟**：确认继承配置创建、`outputSchema` verdict、拒绝权限后继续，以及源 Agent 开启 Plan mode 时子 Agent 实际以 Plan off 运行。源码级适配与单测已完成。
+- [ ] **TODO：实测 claude**：逐项对照 K3、K5、K6。
 
 后续（不在 MVP）：
 

@@ -23,6 +23,19 @@ export type ResolvedReviewer =
   | { ok: true; config: LaunchConfig & { model: string }; source: string; note?: string }
   | { ok: false; error: string };
 
+/**
+ * Provider features normally inherit from the source agent. Codex Plan mode is the
+ * exception: a turn in that mode ends with a plan-approval request instead of the
+ * structured reply that a gate-managed role must return.
+ */
+export function prepareManagedLaunch(config: LaunchConfig & { model: string }): LaunchConfig & { model: string } {
+  if (config.provider !== "codex" || !Object.hasOwn(config.featureValues ?? {}, "plan_mode")) return config;
+  return {
+    ...config,
+    featureValues: { ...config.featureValues, plan_mode: false },
+  };
+}
+
 function findProfile(profiles: readonly AgentProfileLike[], ref: string): AgentProfileLike | string {
   const byId = profiles.find((profile) => profile.id === ref);
   if (byId) return byId;
@@ -94,9 +107,11 @@ export function resolveRole(
 ): ResolvedReviewer {
   const missingDefault = spec.profile === defaultProfile && !profiles.some((profile) => profile.id === defaultProfile);
   const resolved = resolveReviewer(source, { ...spec, profile: missingDefault ? null : spec.profile }, profiles);
-  if (!resolved.ok || !missingDefault) return resolved;
+  if (!resolved.ok) return resolved;
+  const managed = { ...resolved, config: prepareManagedLaunch(resolved.config) };
+  if (!missingDefault) return managed;
   return {
-    ...resolved,
+    ...managed,
     note: `profile "${defaultProfile}" does not exist, so the source agent's settings were used; create it with npm run profiles`,
   };
 }
