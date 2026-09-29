@@ -50,6 +50,24 @@ The initializer writes four files:
 
 It refuses to overwrite any of them unless you pass `--force`; `post-turn-gate-init --help` or `npm run init -- --help` lists all options.
 
+### Install and tailor it with a coding agent
+
+You can give a coding agent the provider-neutral setup task template in
+[docs/install-with-agent.md](docs/install-with-agent.md), after replacing its target-repository placeholders. It tells
+the agent how to install the plugin, preserve an existing setup, inspect authoritative project files, and write
+distinct repository-specific rules for the reviewer, verifier and answerer. It also keeps sensitive and behavioral
+decisions with the user.
+
+To print the same task with an absolute target path filled in:
+
+```bash
+npx --yes --package=git+https://github.com/XUJiahua/paseo-post-turn-gate-plugin.git \
+  post-turn-gate-init --agent-prompt --dir /path/to/repo
+```
+
+Paste that output into the coding agent which can access the target repository. The setup turn itself is not gated:
+policy and rules are captured when a turn starts, so the plugin takes effect on the next turn that changes files.
+
 | Field | Values | Default |
 |---|---|---|
 | `trigger` | `root_only`, `root_and_opt_in`, `all` | `root_and_opt_in` |

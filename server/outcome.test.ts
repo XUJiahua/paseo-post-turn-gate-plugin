@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import path from "node:path";
 import { describe, test } from "node:test";
 import { classify, currentTurnItems, looksLikeQuestion, similarity, stopSignal } from "./outcome.ts";
 import { answerRisk } from "./permissions.ts";
@@ -176,5 +177,33 @@ describe("on_outcome schema", () => {
     assert.equal(chosen.on_outcome.network, "notify", "other fields keep their defaults");
     assert.throws(() => run("--fix", "0"), /Command failed/);
     assert.throws(() => run("--check", "review,review"), /Command failed/);
+  });
+
+  test("the CLI prints a safe, repository-specific coding-Agent setup task", () => {
+    const target = path.resolve("a target repository");
+    const prompt = execFileSync(
+      process.execPath,
+      ["bin/post-turn-gate-init.mjs", "--agent-prompt", "--dir", target],
+      { encoding: "utf8" },
+    );
+    assert.ok(prompt.includes(target));
+    assert.match(prompt, /paseo plugin install XUJiahua\/paseo-post-turn-gate-plugin/);
+    assert.match(prompt, /Never use `--force`/);
+    assert.match(prompt, /reviewer\.md/);
+    assert.match(prompt, /verifier\.md/);
+    assert.match(prompt, /answerer\.md/);
+    assert.match(prompt, /next agent turn/i);
+    assert.match(prompt, /exact installed plugin checkout/i);
+    assert.match(prompt, /does not contain.*bin\/post-turn-gate-init\.mjs.*stop/is);
+    assert.doesNotMatch(
+      prompt,
+      /npx --yes --package=git\+https:\/\/github\.com\/XUJiahua\/paseo-post-turn-gate-plugin\.git[\s\\]*post-turn-gate-init --dir/,
+    );
+    assert.doesNotMatch(prompt, /\{\{TARGET_REPOSITORY\}\}/);
+    assert.doesNotMatch(prompt, /\{\{TARGET_REPOSITORY_SHELL\}\}/);
+    assert.throws(
+      () => execFileSync(process.execPath, ["bin/post-turn-gate-init.mjs", "--agent-prompt", "--stdout"]),
+      /Command failed/,
+    );
   });
 });

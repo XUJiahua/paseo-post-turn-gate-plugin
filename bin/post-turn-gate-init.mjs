@@ -2,7 +2,7 @@
 // Initializes the repository policy without depending on the plugin runtime packages. Keeping this
 // entry point dependency-free lets it run directly from a Git package through npm exec / npx.
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
 
@@ -58,6 +58,7 @@ Options:
   --dir <path>     repository to write into (default: current directory; the git root is used)
   --force          overwrite existing files
   --stdout         print the policy instead of writing files
+  --agent-prompt   print a coding-Agent setup task for --dir; write nothing
   -h, --help       show this help`;
 
 // Text inside <!-- --> is guidance for the person editing the file; active Markdown below it is added
@@ -114,12 +115,28 @@ const { values } = parseArgs({
     dir: { type: "string", default: process.cwd() },
     force: { type: "boolean", default: false },
     stdout: { type: "boolean", default: false },
+    "agent-prompt": { type: "boolean", default: false },
     help: { type: "boolean", short: "h", default: false },
   },
   strict: true,
 });
 if (values.help) {
   console.log(USAGE);
+  process.exit(0);
+}
+if (values["agent-prompt"]) {
+  if (values.stdout || values.force || values.report || values.fix !== undefined) {
+    fail("--agent-prompt cannot be combined with --stdout, --force, --report or --fix");
+  }
+  const target = path.resolve(values.dir);
+  if (/[\r\n]/.test(target)) fail("--dir cannot contain a newline");
+  const shellTarget = `'${target.replaceAll("'", `'\\''`)}'`;
+  const prompt = readFileSync(new URL("../docs/install-with-agent.md", import.meta.url), "utf8");
+  process.stdout.write(
+    prompt
+      .replaceAll("{{TARGET_REPOSITORY_SHELL}}", shellTarget)
+      .replaceAll("{{TARGET_REPOSITORY}}", target.replaceAll("`", "\\`")),
+  );
   process.exit(0);
 }
 
