@@ -1,6 +1,7 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { createGate, type Paseo } from "./server/gate.ts";
 import { Ledger, defaultLedgerPath } from "./server/ledger.ts";
+import { stopAnsweringRpc } from "./shared/schema.ts";
 
 const RECONCILE_INTERVAL_MS = 60_000;
 
@@ -25,8 +26,13 @@ export default function contribute(server: PluginServerContext) {
   server.on("agent.permission_requested", (event, { paseo }) => gate.onPermission(event, capture(paseo)));
   server.on("agent.permission_resolved", (event, { paseo }) => gate.onPermission(event, capture(paseo)));
 
+  server.handle(stopAnsweringRpc, async ({ chainId }, { paseo }) => ({
+    stopped: await gate.stopAnswering(chainId, capture(paseo)),
+  }));
+
   return async () => {
     if (timer) clearInterval(timer);
+    gate.close();
     await gate.idle();
     ledger.close();
   };

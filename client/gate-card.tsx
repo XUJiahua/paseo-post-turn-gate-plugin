@@ -18,10 +18,8 @@ const LABELS: Record<RunStatus, string> = {
 
 const FINISHED: RunStatus[] = ["PASSED", "INCONCLUSIVE", "FAILED", "NEEDS_HUMAN", "ERROR", "SUPERSEDED"];
 
-export function GateCard({ item, theme }: PluginTimelineItemProps<CardData>) {
-  const data = item.data;
-  const styles = useMemo(
-    () => ({
+export function cardStyles(theme: PluginTimelineItemProps["theme"]) {
+  return {
       card: {
         gap: 6,
         borderWidth: 1,
@@ -52,9 +50,12 @@ export function GateCard({ item, theme }: PluginTimelineItemProps<CardData>) {
       denyText: { color: theme.colors.foreground },
       permission: { gap: 6, padding: 8, borderRadius: 8, backgroundColor: theme.colors.surface2 },
       finding: { gap: 2, paddingLeft: 8, borderLeftWidth: 2, borderLeftColor: theme.colors.statusDanger },
-    }),
-    [theme],
-  );
+  };
+}
+
+export function GateCard({ item, theme }: PluginTimelineItemProps<CardData>) {
+  const data = item.data;
+  const styles = useMemo(() => cardStyles(theme), [theme]);
 
   let statusStyle = styles.running;
   if (data.status === "PASSED") statusStyle = styles.success;
@@ -112,10 +113,18 @@ export function GateCard({ item, theme }: PluginTimelineItemProps<CardData>) {
   );
 }
 
-type Styles = Record<"permission" | "body" | "muted" | "danger" | "actions" | "allow" | "allowText" | "deny" | "denyText", object>;
+export type Styles = Record<"permission" | "body" | "muted" | "danger" | "actions" | "allow" | "allowText" | "deny" | "denyText", object>;
 
 /** Answers the reviewer's pending permission from the source agent's timeline. */
-function PermissionPrompt({ permission, styles }: { permission: PermissionCard; styles: Styles }) {
+export function PermissionPrompt({
+  permission,
+  styles,
+  who = "Reviewer",
+}: {
+  permission: PermissionCard;
+  styles: Styles;
+  who?: string;
+}) {
   const paseo = usePaseo();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -139,7 +148,9 @@ function PermissionPrompt({ permission, styles }: { permission: PermissionCard; 
 
   return (
     <View style={styles.permission}>
-      <Text style={styles.body}>Reviewer asks: {permission.title}</Text>
+      <Text style={styles.body}>
+        {who} asks: {permission.title}
+      </Text>
       {permission.reason ? <Text style={styles.danger}>Needs you: {permission.reason}</Text> : null}
       {permission.detail ? (
         <Text style={styles.muted} selectable>
@@ -162,7 +173,7 @@ function PermissionPrompt({ permission, styles }: { permission: PermissionCard; 
         ))}
       </View>
       {permission.kind === "tool" ? (
-        <Text style={styles.muted}>Denying ends the reviewer's turn on some providers (e.g. kiro).</Text>
+        <Text style={styles.muted}>Denying ends the {who.toLowerCase()}'s turn on some providers (e.g. kiro).</Text>
       ) : null}
       {error ? <Text style={styles.danger}>{error}</Text> : null}
     </View>

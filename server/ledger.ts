@@ -36,6 +36,49 @@ export interface Run {
   updated_at: number;
 }
 
+/** A task that spans several turns (answered questions, retries); see docs/turn-outcomes.md §4. */
+export interface Chain {
+  agent_id: string;
+  chain_id: string;
+  workspace_id: string;
+  repo_root: string;
+  policy_json: string;
+  policy_hash: string;
+  base_tree: string;
+  request_text: string;
+  retries: number;
+  answers: number;
+  last_question: string | null;
+  stop_answering: number;
+  next_retry_at: number | null;
+  retry_message: string | null;
+  answer_child_id: string | null;
+  answer_dispatch_json: string | null;
+  answer_deadline_at: number | null;
+  card_json: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+const CHAIN_COLUMNS = [
+  "workspace_id",
+  "repo_root",
+  "policy_json",
+  "policy_hash",
+  "base_tree",
+  "request_text",
+  "retries",
+  "answers",
+  "last_question",
+  "stop_answering",
+  "next_retry_at",
+  "retry_message",
+  "answer_child_id",
+  "answer_dispatch_json",
+  "answer_deadline_at",
+  "card_json",
+] as const;
+
 export type NewRun = Pick<
   Run,
   | "run_id"
@@ -114,6 +157,33 @@ export class Ledger {
       );
       CREATE INDEX IF NOT EXISTS gate_runs_child ON gate_runs(child_agent_id);
       CREATE INDEX IF NOT EXISTS gate_runs_source_status ON gate_runs(source_agent_id, status);
+      CREATE TABLE IF NOT EXISTS chains (
+        agent_id TEXT PRIMARY KEY,
+        chain_id TEXT NOT NULL UNIQUE,
+        workspace_id TEXT NOT NULL,
+        repo_root TEXT NOT NULL,
+        policy_json TEXT NOT NULL,
+        policy_hash TEXT NOT NULL,
+        base_tree TEXT NOT NULL,
+        request_text TEXT NOT NULL,
+        retries INTEGER NOT NULL DEFAULT 0,
+        answers INTEGER NOT NULL DEFAULT 0,
+        last_question TEXT,
+        stop_answering INTEGER NOT NULL DEFAULT 0,
+        next_retry_at INTEGER,
+        retry_message TEXT,
+        answer_child_id TEXT,
+        answer_dispatch_json TEXT,
+        answer_deadline_at INTEGER,
+        card_json TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS chain_children (
+        child_agent_id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        chain_id TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS gate_children (
         child_agent_id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL,
@@ -197,6 +267,71 @@ export class Ledger {
         `SELECT * FROM gate_runs WHERE source_agent_id = ? AND status NOT IN (${placeholders}) ORDER BY created_at`,
       )
       .all(sourceAgentId, ...TERMINAL_STATUSES) as unknown as Run[];
+  }
+
+  // ---------- chains ----------
+
+  chain(agentId: string): Chain | null {
+    return (this.db.prepare("SELECT * FROM chains WHERE agent_id = ?").get(agentId) as Chain | undefined) ?? null;
+  }
+
+  chainById(chainId: string): Chain | null {
+    return (this.db.prepare("SELECT * FROM chains WHERE chain_id = ?").get(chainId) as Chain | undefined) ?? null;
+  }
+
+  chains(): Chain[] {
+    return this.db.prepare("SELECT * FROM chains ORDER BY created_at").all() as unknown as Chain[];
+  }
+
+  createChain(
+    chain: Pick<Chain, "agent_id" | "chain_id" | "workspace_id" | "repo_root" | "policy_json" | "policy_hash" | "base_tree" | "request_text">,
+    now: number,
+  ): Chain {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO chains
+          (agent_id, chain_id, workspace_id, repo_root, policy_json, policy_hash, base_tree, request_text, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        chain.agent_id,
+        chain.chain_id,
+        chain.workspace_id,
+        chain.repo_root,
+        chain.policy_json,
+        chain.policy_hash,
+        chain.base_tree,
+        chain.request_text,
+        now,
+        now,
+      );
+    return this.chain(chain.agent_id)!;
+  }
+
+  updateChain(agentId: string, patch: Partial<Pick<Chain, (typeof CHAIN_COLUMNS)[number]>>, now: number): Chain | null {
+    const entries = Object.entries(patch).filter(([key]) => (CHAIN_COLUMNS as readonly string[]).includes(key));
+    const assignments = [...entries.map(([key]) => `${key} = ?`), "updated_at = ?"].join(", ");
+    const values = entries.map(([, value]) => (value === undefined ? null : value)) as Array<string | number | null>;
+    this.db.prepare(`UPDATE chains SET ${assignments} WHERE agent_id = ?`).run(...values, now, agentId);
+    return this.chain(agentId);
+  }
+
+  deleteChain(agentId: string): void {
+    this.db.prepare("DELETE FROM chains WHERE agent_id = ?").run(agentId);
+  }
+
+  addChainChild(childAgentId: string, agentId: string, chainId: string): void {
+    this.db
+      .prepare("INSERT OR IGNORE INTO chain_children (child_agent_id, agent_id, chain_id) VALUES (?, ?, ?)")
+      .run(childAgentId, agentId, chainId);
+  }
+
+  /** Answerer agents: the source agent and chain they serve (the chain may already be gone). */
+  chainChild(childAgentId: string): { agentId: string; chainId: string } | null {
+    const row = this.db
+      .prepare("SELECT agent_id, chain_id FROM chain_children WHERE child_agent_id = ?")
+      .get(childAgentId) as { agent_id: string; chain_id: string } | undefined;
+    return row ? { agentId: row.agent_id, chainId: row.chain_id } : null;
   }
 
   close(): void {

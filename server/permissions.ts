@@ -31,6 +31,18 @@ const DANGEROUS: ReadonlyArray<[RegExp, string]> = [
   [/(^|[\s/'"=])\.env\b|\.(pem|p12|key)\b|\bid_(rsa|ed25519)\b|\.aws\/credentials|\.netrc\b/i, "secret or credential file"],
 ];
 
+// Natural-language red flags for answers given on the user's behalf (second check after the answerer).
+const RISKY_ANSWER =
+  /\bforce[- ]push|\bdeploy(ing)? to (prod|production|staging)|\bpublish(ing)? (to|on) (npm|pypi|crates|the store)|\bdrop (the )?(table|database)|\bdelete (the )?(database|data|branch|repo(sitory)?|bucket|production|user data)|\b(password|credential|secret|api[ -]?key|private key)s?\b|\b(pay|purchase|billing|credit card)\b|删除(数据|分支|仓库)|强制推送|发布到|部署到|密码|密钥|付费|付款/i;
+
+/** Why an auto-answer must go to the user instead; null when nothing risky was found. */
+export function answerRisk(text: string): string | null {
+  for (const [pattern, reason] of DANGEROUS) {
+    if (pattern.test(text)) return reason;
+  }
+  return RISKY_ANSWER.test(text) ? "involves an irreversible, outward-facing or credential decision" : null;
+}
+
 function requestText(request: PermissionLike): string {
   const detail = request.detail as { command?: unknown; filePath?: unknown } | undefined;
   const input = request.input ?? {};

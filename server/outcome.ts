@@ -1,0 +1,137 @@
+// Classifies why an agent turn ended (docs/turn-outcomes.md §2). Pure functions, no I/O.
+import type { Category } from "../shared/schema.ts";
+
+export interface OutcomeLike {
+  kind: "completed" | "failed" | "canceled";
+  error?: { message: string; code?: string };
+  reason?: string;
+}
+
+export interface TurnItem {
+  type: string;
+  text?: unknown;
+}
+
+/** Items after the latest user message: what this turn produced. */
+export function currentTurnItems<Item extends TurnItem>(timeline: readonly Item[]): Item[] {
+  let start = 0;
+  timeline.forEach((item, index) => {
+    if (item.type === "user_message") start = index + 1;
+  });
+  return timeline.slice(start);
+}
+
+const SYSTEM_ERROR = "[System Error]";
+
+function assistantTexts(items: readonly TurnItem[]): string[] {
+  return items
+    .filter((item) => item.type === "assistant_message" && typeof item.text === "string")
+    .map((item) => item.text as string);
+}
+
+/** The agent's reply without Paseo's synthetic error messages. */
+export function replyText(items: readonly TurnItem[]): string {
+  return assistantTexts(items)
+    .filter((text) => !text.startsWith(SYSTEM_ERROR))
+    .join("");
+}
+
+// ponytail: provider error texts, not structured codes; a reworded message falls through to
+// `error` (notify only, never a retry). Upgrade path: structured outcome fields from Paseo (§6).
+const FAILURE_PATTERNS: ReadonlyArray<[Exclude<Category, "done" | "awaiting_user" | "user_canceled" | "replaced" | "error">, RegExp]> = [
+  ["crashed", /exited unexpectedly|\bsigkill\b|\bsigterm\b|spawn \S+ enoent/],
+  ["context_exhausted", /context (limit|window|length)|too many tokens|maximum context|start a new session/],
+  // Checked before rate_limited: "quota exceeded, please wait" must never be retried.
+  ["quota_exhausted", /(daily|monthly) (usage )?limit|quota exceeded|out of credits|insufficient (credits|balance|quota)|billing/],
+  ["rate_limited", /too many requests|throttl|rate.?limit|\b429\b|overloaded|try again later/],
+  ["network", /dispatch failure|econn\w*|etimedout|enotfound|eai_again|socket hang up|network|timed? ?out|\b50[234]\b/],
+];
+
+export interface Classification {
+  category: Category;
+  /** Short human-readable cause, e.g. the provider error text. */
+  detail: string | null;
+}
+
+export function classify(input: {
+  outcome: OutcomeLike;
+  turnItems: readonly TurnItem[];
+  /** Agent status right after the turn ended; "running" means a newer turn already started. */
+  statusAtEnd: string | null;
+}): Classification {
+  const { outcome, turnItems } = input;
+  if (outcome.kind === "canceled") {
+    return {
+      category: input.statusAtEnd === "running" ? "replaced" : "user_canceled",
+      detail: outcome.reason ?? null,
+    };
+  }
+  if (outcome.kind === "failed") {
+    const systemErrors = assistantTexts(turnItems).filter((text) => text.startsWith(SYSTEM_ERROR));
+    const haystack = [outcome.error?.message ?? "", ...systemErrors].join("\n").toLowerCase();
+    const detail = (systemErrors.at(-1)?.slice(SYSTEM_ERROR.length).trim() || outcome.error?.message || "").slice(0, 600);
+    for (const [category, pattern] of FAILURE_PATTERNS) {
+      if (pattern.test(haystack)) return { category, detail: detail || null };
+    }
+    return { category: "error", detail: detail || null };
+  }
+  return looksLikeQuestion(replyText(turnItems))
+    ? { category: "awaiting_user", detail: null }
+    : { category: "done", detail: null };
+}
+
+const ASKING =
+  /\b(should i|shall i|would you like|do you want|which (one|option)|let me know|please confirm|before i (proceed|continue)|waiting for (your|you))\b|要不要|是否需要|需要我|请确认|请告诉我|你希望|选哪个/i;
+
+/**
+ * Cheap, high-recall pre-screen for "the agent stopped to ask the user something".
+ * A hit only means the semantic check (answerer agent) runs; a miss means `done`.
+ */
+export function looksLikeQuestion(reply: string): boolean {
+  const text = reply
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/[*_`>#]+/g, "")
+    .trim();
+  if (!text) return false;
+  if (/[?？]\s*$/.test(text)) return true;
+  const tail = text.slice(-300);
+  if (ASKING.test(tail)) return true;
+  // Ends with an option list of at least two items ("1. …\n2. …", "A) …\nB) …") introduced as a choice,
+  // not a summary like "Steps taken:".
+  const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+  const trailing = [];
+  for (let index = lines.length - 1; index >= 0 && /^(\d+[.)]|[A-Za-z][.)]|[-•])\s+\S/.test(lines[index]); index -= 1) {
+    trailing.push(lines[index]);
+  }
+  const intro = lines[lines.length - 1 - trailing.length] ?? "";
+  return trailing.length >= 2 && /[?？]\s*$|\b(options?|choose|prefer|which|either)\b|方案|选择|哪/i.test(intro);
+}
+
+export const SUGGESTIONS: Record<Category, string | null> = {
+  done: null,
+  awaiting_user: "The agent is waiting for your answer.",
+  user_canceled: null,
+  replaced: null,
+  crashed: "The agent process exited. Send a message to continue; Paseo restarts the session.",
+  network: "Network error. Send a message to continue when the connection is back.",
+  rate_limited: "The provider is throttling requests. Wait a little, then send a message to continue.",
+  quota_exhausted: "The provider quota or credits are used up. Top up or switch provider, then continue.",
+  context_exhausted: "The conversation ran out of context. Start a new agent or compact the context.",
+  error: "The turn failed. Check the error and decide how to continue.",
+};
+
+/** Character-bigram Jaccard similarity; works for CJK text without word boundaries. */
+export function similarity(left: string, right: string): number {
+  const grams = (text: string) => {
+    const clean = text.toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+    const set = new Set<string>();
+    for (let index = 0; index < clean.length - 1; index += 1) set.add(clean.slice(index, index + 2));
+    return set;
+  };
+  const a = grams(left);
+  const b = grams(right);
+  if (a.size === 0 || b.size === 0) return 0;
+  let shared = 0;
+  for (const gram of a) if (b.has(gram)) shared += 1;
+  return shared / (a.size + b.size - shared);
+}

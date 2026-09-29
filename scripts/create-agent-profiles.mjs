@@ -17,6 +17,13 @@ const ROLES = {
     notes:
       "Independent code review after an agent turn: correctness, regressions, error handling, security, tests, maintainability. Used by the post-turn-gate plugin.",
   },
+  answerer: {
+    id: "post-turn-gate-answerer",
+    name: "Gate answerer",
+    icon: "compass",
+    notes:
+      "Answers an agent's questions on the user's behalf when the request and repository settle them; escalates product, risky or personal decisions. Used by the post-turn-gate plugin.",
+  },
   verifier: {
     id: "post-turn-gate-verifier",
     name: "Gate verifier",
@@ -34,7 +41,7 @@ Options:
   --mode <id>        Provider mode (default: provider default)
   --thinking <id>    Thinking option (default: model default)
   --feature k=v      Feature value, repeatable; v is parsed as JSON when possible
-  --role <role>      reviewer | verifier | both (default: both)
+  --role <role>      reviewer | verifier | answerer | all (default: all)
   --id <id>          Profile id (only with a single --role)
   --name <name>      Profile name (only with a single --role)
   --home <path>      Local daemon home (default: ~/.paseo)
@@ -65,7 +72,7 @@ const { values } = parseArgs({
     mode: { type: "string" },
     thinking: { type: "string" },
     feature: { type: "string", multiple: true, default: [] },
-    role: { type: "string", default: "both" },
+    role: { type: "string", default: "all" },
     id: { type: "string" },
     name: { type: "string" },
     home: { type: "string" },
@@ -82,8 +89,9 @@ if (values.help) {
   process.exit(0);
 }
 if (!values.provider || !values.model) fail(`--provider and --model are required\n\n${USAGE}`);
-const roles = values.role === "both" ? ["reviewer", "verifier"] : [values.role];
-if (!roles.every((role) => role in ROLES)) fail(`--role must be reviewer, verifier or both`);
+const roles =
+  values.role === "all" ? Object.keys(ROLES) : values.role === "both" ? ["reviewer", "verifier"] : [values.role];
+if (!roles.every((role) => role in ROLES)) fail(`--role must be reviewer, verifier, answerer or all`);
 if ((values.id || values.name) && roles.length > 1) fail("--id and --name need a single --role");
 
 const featureValues = {};

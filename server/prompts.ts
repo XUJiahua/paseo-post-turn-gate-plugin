@@ -1,5 +1,6 @@
-import type { Verdict } from "../shared/schema.ts";
-import { verdictSchema } from "../shared/schema.ts";
+import type { ZodType, output } from "zod";
+import type { AnswerReply, Verdict } from "../shared/schema.ts";
+import { answerReplySchema, verdictSchema } from "../shared/schema.ts";
 
 const ROLE = {
   verify: `You are an independent VERIFIER. Answer one question: does the change fully deliver the original request?
@@ -71,8 +72,8 @@ export function latestAssistantText(
   return output;
 }
 
-/** Parses a verdict from reply text; null when nothing valid is found (never treated as PASS). */
-export function parseVerdict(text: string): Verdict | null {
+/** Parses a JSON reply (raw, fenced, or embedded in prose); null when nothing validates. */
+export function parseJsonReply<Schema extends ZodType>(text: string, schema: Schema): output<Schema> | null {
   const candidates = [text.trim()];
   const fences = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)].map((match) => match[1].trim());
   candidates.push(...fences.reverse());
@@ -81,11 +82,73 @@ export function parseVerdict(text: string): Verdict | null {
   if (firstBrace !== -1 && lastBrace > firstBrace) candidates.push(text.slice(firstBrace, lastBrace + 1));
   for (const candidate of candidates) {
     try {
-      const parsed = verdictSchema.safeParse(JSON.parse(candidate));
+      const parsed = schema.safeParse(JSON.parse(candidate));
       if (parsed.success) return parsed.data;
     } catch {
       // try the next candidate
     }
   }
   return null;
+}
+
+/** Never treated as PASS when null. */
+export function parseVerdict(text: string): Verdict | null {
+  return parseJsonReply(text, verdictSchema);
+}
+
+export function parseAnswer(text: string): AnswerReply | null {
+  return parseJsonReply(text, answerReplySchema);
+}
+
+export const ANSWER_PREFIX = "[post-turn gate answered on your behalf]";
+
+export function buildAnswerPrompt(input: {
+  requestText: string;
+  repoRoot: string;
+  baseTree: string;
+  endTree: string;
+  agentReply: string;
+  previousQuestion: string | null;
+  instructions?: string;
+}): string {
+  const extra = input.instructions?.trim()
+    ? `\nAdditional rules from the repository policy:\n<<<RULES\n${input.instructions.trim()}\nRULES>>>\n`
+    : "";
+  const previous = input.previousQuestion
+    ? `\nYou already answered this earlier question in the same task: ${JSON.stringify(input.previousQuestion)}\nIf the agent is asking the same thing again, escalate.\n`
+    : "";
+  return `You stand in for the user of a coding agent. The agent just stopped its turn. Decide whether it is
+waiting for the user, and if so answer on the user's behalf when that is safe, so the work can continue
+without a human.
+${extra}${previous}
+Repository: ${input.repoRoot}
+Work done so far in this task: git -C ${JSON.stringify(input.repoRoot)} diff ${input.baseTree} ${input.endTree}
+You may read files and run read-only commands to inform the answer. Do not modify the repository.
+
+Original request from the user:
+<<<REQUEST
+${input.requestText}
+REQUEST>>>
+
+The agent's last message:
+<<<AGENT
+${input.agentReply}
+AGENT>>>
+
+Classify the agent's state:
+- "awaiting_user": it asks the user a question or for a decision and stopped.
+- "incomplete": it did not ask anything but clearly stopped before finishing (e.g. "next I will …").
+- "done": it finished the request and is not waiting for anything.
+
+For "awaiting_user", choose decision "answer" only when the request, the repository, or common engineering
+practice clearly determines the answer. Keep the answer short and actionable. Choose "escalate" when:
+- it is a product or business trade-off the request does not settle (several reasonable options);
+- it involves deleting data, force-pushing, publishing, deploying, spending money, changing permissions,
+  credentials or secrets, or sending anything outside this machine;
+- it needs information only the user has (accounts, personal preferences, passwords, external context);
+- you are not confident.
+For "incomplete" and "done", use decision "answer" with an empty answer.
+
+Reply with ONLY one JSON object, no prose and no code fence:
+{"state":"awaiting_user|incomplete|done","question":"<the question, verbatim or summarized>","decision":"answer|escalate","answer":"<reply to send to the agent>","reason":"<one sentence>"}`;
 }

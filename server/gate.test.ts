@@ -155,8 +155,10 @@ async function sourceTurn(options: {
   agentId?: string;
   parentAgentId?: string | null;
   messageId?: string;
+  text?: string;
+  reply?: string;
   change?: () => void;
-  outcome?: { kind: "completed" } | { kind: "canceled"; reason: string };
+  outcome?: { kind: "completed" } | { kind: "canceled"; reason: string } | { kind: "failed"; error: { message: string; code?: string } };
 }) {
   const agent = hookAgent(options.agentId ?? SOURCE, options.parentAgentId ?? null);
   gate.onTurnStarted({ agent, turnId: "t" }, fake.paseo);
@@ -168,8 +170,8 @@ async function sourceTurn(options: {
       turnId: "t",
       outcome: options.outcome ?? { kind: "completed" },
       timeline: [
-        { type: "user_message", text: "Implement feature X", messageId: options.messageId ?? "msg-1" },
-        { type: "assistant_message", text: "Done." },
+        { type: "user_message", text: options.text ?? "Implement feature X", messageId: options.messageId ?? "msg-1" },
+        { type: "assistant_message", text: options.reply ?? "Done." },
       ] as never,
     },
     fake.paseo,
@@ -198,7 +200,7 @@ async function childTurn(childId: string, reply: string, change?: () => void) {
 }
 
 const onlyRun = () => {
-  const runs = [...fake.cards.entries()].filter(([id]) => !id.startsWith("post-turn-gate:config:"));
+  const runs = [...fake.cards.entries()].filter(([id]) => !id.startsWith("post-turn-gate:config:") && !id.startsWith("post-turn-gate:outcome:"));
   assert.equal(runs.length, 1, "expected exactly one run card");
   return runs[0][1];
 };
@@ -565,6 +567,191 @@ describe("recovery", () => {
     await gate.idle();
     assert.equal(fake.created.length, 2);
     assert.equal(onlyRun().round, 2);
+  });
+});
+
+describe("turn outcomes: answers, retries, chains", () => {
+  const ANSWER = (answer: string, extra: Record<string, string> = {}) =>
+    JSON.stringify({ state: "awaiting_user", question: "Which language?", decision: "answer", answer, reason: "the repo is TypeScript", ...extra });
+  const answerers = () => fake.created.filter((create) => create.labels["post-turn-gate.role"] === "answerer");
+  const reviewers = () => fake.created.filter((create) => create.labels["post-turn-gate.role"] === "reviewer");
+  const outcomeCard = () => {
+    const cards = [...fake.cards.entries()].filter(([id]) => id.startsWith("post-turn-gate:outcome:"));
+    assert.equal(cards.length, 1, "expected one outcome card");
+    return cards[0][1] as unknown as Record<string, any>;
+  };
+  const baseOf = (prompt: string) => /diff ([0-9a-f]{40}) ([0-9a-f]{40})/.exec(prompt)![1];
+
+  test("a question is answered by the answerer; the follow-up turn is gated against the chain's first baseline", async () => {
+    writePolicy({ version: 1, action: "review" });
+    fake.profiles.push({ id: "post-turn-gate-answerer", name: "Gate answerer", provider: "codex", model: "gpt-5.5" });
+    await sourceTurn({ change: edit, reply: "Which language should I use for the script?" });
+    assert.equal(reviewers().length, 0, "no review while the agent waits");
+    assert.equal(answerers().length, 1);
+    const ask = answerers()[0];
+    assert.deepEqual(ask.config, { provider: "codex/gpt-5.5" }, "answerer profile is used when it exists");
+    assert.match(ask.prompt, /Which language should I use/);
+    assert.equal(outcomeCard().state, "answering");
+
+    await childTurn(ask.agentId, ANSWER("Use TypeScript."));
+    assert.deepEqual(fake.archived, [ask.agentId]);
+    assert.equal(fake.sent.length, 1);
+    assert.match(fake.sent[0].messageId!, /^ptg:answer:.+:1$/);
+    assert.match(fake.sent[0].text, /^\[post-turn gate answered on your behalf\]\nUse TypeScript\.$/);
+    assert.equal(outcomeCard().state, "answered");
+
+    const firstBase = baseOf(ask.prompt);
+    await sourceTurn({
+      messageId: fake.sent[0].messageId,
+      text: fake.sent[0].text,
+      change: () => writeFileSync(path.join(repo, "b.ts"), "export {}\n"),
+    });
+    assert.equal(reviewers().length, 1);
+    assert.equal(baseOf(reviewers()[0].prompt), firstBase, "review covers the whole task");
+    assert.match(reviewers()[0].prompt, /Answered on the user's behalf/);
+    assert.equal(outcomeCard().state, "resolved");
+  });
+
+  test("escalation, risky answers, repeated questions and the limit go to the user", async () => {
+    writePolicy({ version: 1, action: "review", on_outcome: { awaiting_user: { answer: { max: 2 } } } });
+    await sourceTurn({ change: edit, reply: "Should I pick A or B?", messageId: "m1" });
+    await childTurn(answerers()[0].agentId, ANSWER("", { decision: "escalate", reason: "product decision" }));
+    assert.equal(outcomeCard().state, "needs_user");
+    assert.match(outcomeCard().message, /product decision/);
+    assert.equal(fake.sent.length, 0);
+
+    await sourceTurn({ text: "Pick A", messageId: "m2", reply: "Push to main now?" });
+    await childTurn(answerers()[1].agentId, ANSWER("Yes, run git push origin main", { question: "Push to main now?" }));
+    assert.equal(outcomeCard().state, "needs_user");
+    assert.match(outcomeCard().message, /not answered automatically/);
+    assert.equal(fake.sent.length, 0);
+
+    await sourceTurn({ text: "no", messageId: "m3", reply: "Which language?" });
+    await childTurn(answerers()[2].agentId, ANSWER("TypeScript"));
+    assert.equal(fake.sent.length, 1);
+    await sourceTurn({ messageId: fake.sent[0].messageId, text: fake.sent[0].text, reply: "Which language, again?" });
+    await childTurn(answerers()[3].agentId, ANSWER("TypeScript", { question: "Which language again?" }));
+    assert.equal(fake.sent.length, 1, "same question twice is escalated");
+    assert.match(outcomeCard().message, /same question/);
+
+    await sourceTurn({ text: "TS!", messageId: "m4", reply: "Anything else?" });
+    assert.equal(answerers().length, 5, "escalations do not use up the limit: 1 of 2 answers sent");
+  });
+
+  test("the answer limit and stop button stop auto-answering", async () => {
+    writePolicy({ version: 1, action: "review", on_outcome: { awaiting_user: { answer: { max: 1 } } } });
+    await sourceTurn({ change: edit, reply: "Which language?" });
+    await childTurn(answerers()[0].agentId, ANSWER("TypeScript"));
+    await sourceTurn({ messageId: fake.sent[0].messageId, text: fake.sent[0].text, reply: "And which test runner?" });
+    assert.equal(answerers().length, 1);
+    assert.match(outcomeCard().message, /limit reached/);
+
+    const chainId = outcomeCard().chainId;
+    assert.equal(await gate.stopAnswering(chainId, fake.paseo), true);
+    assert.equal(outcomeCard().canStopAnswering, false);
+  });
+
+  test("the answerer can say the agent was done: gate runs, nothing is sent", async () => {
+    writePolicy({ version: 1, action: "review" });
+    await sourceTurn({ change: edit, reply: "Implemented. Let me know if you need anything else." });
+    await childTurn(answerers()[0].agentId, JSON.stringify({ state: "done", decision: "answer" }));
+    assert.equal(fake.sent.length, 0);
+    assert.equal(reviewers().length, 1);
+  });
+
+  test("a user reply while the answerer runs cancels it and continues the chain", async () => {
+    writePolicy({ version: 1, action: "review" });
+    await sourceTurn({ change: edit, reply: "Which language?" });
+    const ask = answerers()[0];
+    gate.onTurnStarted({ agent: hookAgent(SOURCE), turnId: "u" }, fake.paseo);
+    await gate.idle();
+    assert.deepEqual(fake.archived, [ask.agentId]);
+    assert.equal(outcomeCard().state, "stopped");
+    await childTurn(ask.agentId, ANSWER("TypeScript")); // late reply is ignored
+    assert.equal(fake.sent.length, 0);
+  });
+
+  test("network failure: notify by default, retry when configured, then gate against the original baseline", async () => {
+    const networkFailure = {
+      kind: "failed" as const,
+      error: { message: "Internal error", code: "-32603" },
+    };
+    const reply = '[System Error] Internal error | code=-32603 | data="An unknown error occurred: dispatch failure"';
+    writePolicy({ version: 1, action: "review" });
+    await sourceTurn({ change: edit, outcome: networkFailure, reply, messageId: "n1" });
+    assert.equal(outcomeCard().category, "network");
+    assert.equal(outcomeCard().state, "notice");
+    assert.equal(fake.sent.length, 0);
+
+    fake.cards.clear();
+    await sourceTurn({ text: "go on", messageId: "n2" }); // user continues manually: chain ends with a review
+    assert.equal(reviewers().length, 1);
+    const manualBase = baseOf(reviewers()[0].prompt);
+
+    fake.cards.clear();
+    writePolicy({ version: 1, action: "review", on_outcome: { network: { retry: { max: 1, delay_seconds: 30, message: "Retry please." } } } });
+    await sourceTurn({ change: () => writeFileSync(path.join(repo, "c.txt"), "c"), outcome: networkFailure, reply, messageId: "n3" });
+    assert.equal(outcomeCard().state, "retry_scheduled");
+    gate.reconcile(fake.paseo);
+    await gate.idle();
+    assert.equal(fake.sent.length, 0, "not due yet");
+    clock += 31_000;
+    gate.reconcile(fake.paseo);
+    await gate.idle();
+    assert.deepEqual(fake.sent.map((s) => [s.text, s.messageId?.replace(/:[^:]+:1$/, ":*:1")]), [["Retry please.", "ptg:retry:*:1"]]);
+    assert.equal(outcomeCard().state, "retrying");
+
+    await sourceTurn({ messageId: fake.sent[0].messageId, text: "Retry please.", outcome: networkFailure, reply });
+    assert.match(outcomeCard().message, /retries used up/);
+    await sourceTurn({ text: "try again", messageId: "n4", change: () => writeFileSync(path.join(repo, "d.txt"), "d") });
+    assert.equal(reviewers().length, 2);
+    assert.notEqual(baseOf(reviewers()[1].prompt), manualBase);
+  });
+
+  test("quota errors cannot be configured to retry", async () => {
+    writePolicy({ version: 1, action: "review", on_outcome: { quota_exhausted: { retry: { max: 1, delay_seconds: 30 } } } });
+    await sourceTurn({ change: edit });
+    assert.match(fake.cards.get(`post-turn-gate:config:${SOURCE}`)?.error ?? "", /on_outcome\.quota_exhausted/);
+  });
+
+  test("a user stop drops the chain; a replaced turn keeps its baseline for the next turn", async () => {
+    writePolicy({ version: 1, action: "review" });
+    const agent = hookAgent(SOURCE);
+    gate.onTurnStarted({ agent, turnId: "t1" }, fake.paseo);
+    await gate.idle();
+    edit(); // work done by the turn that gets replaced
+    gate.onTurnStarted({ agent, turnId: "t2" }, fake.paseo); // arrives before t1 ends (E4)
+    await gate.idle();
+    fake.agents.get(SOURCE)!.status = "running";
+    gate.onTurnEnded({ agent, turnId: "t1", outcome: { kind: "canceled", reason: "Interrupted" }, timeline: [] as never }, fake.paseo);
+    await gate.idle();
+    fake.agents.get(SOURCE)!.status = "idle";
+    gate.onTurnEnded(
+      { agent, turnId: "t2", outcome: { kind: "completed" }, timeline: [{ type: "user_message", text: "new", messageId: "r2" }, { type: "assistant_message", text: "Done." }] as never },
+      fake.paseo,
+    );
+    await gate.idle();
+    assert.equal(reviewers().length, 1, "t1's edit is reviewed as part of t2");
+
+    fake.created.length = 0;
+    await sourceTurn({ change: () => writeFileSync(path.join(repo, "e.txt"), "e"), reply: "Which one?", messageId: "q1" });
+    await sourceTurn({ outcome: { kind: "canceled", reason: "Interrupted" }, messageId: "q2" });
+    assert.equal(outcomeCard().state, "stopped");
+  });
+
+  test("answerer permissions follow the same auto-approval rules", async () => {
+    writePolicy({ version: 1, action: "review" });
+    await sourceTurn({ change: edit, reply: "Which language?" });
+    const childId = answerers()[0].agentId;
+    const request = (id: string, command: string) => ({
+      agent: hookAgent(childId, SOURCE),
+      request: { id, name: "execute", kind: "tool", title: command, detail: { type: "shell", command }, actions: [{ id: "allow_once", label: "Yes", behavior: "allow" }] },
+    });
+    gate.onPermission(request("p1", "cat package.json") as never, fake.paseo);
+    gate.onPermission(request("p2", "sudo rm x") as never, fake.paseo);
+    await gate.idle();
+    assert.deepEqual(fake.answered.map((a) => a.requestId), ["p1"]);
+    assert.equal(outcomeCard().permission?.reason, "privilege escalation");
   });
 });
 
