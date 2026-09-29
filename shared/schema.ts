@@ -14,6 +14,8 @@ export const reviewerSchema = z
     features: z.record(z.string(), z.unknown()).optional(),
     /** Appended to the built-in role prompt; cannot replace the verdict contract. */
     instructions: z.string().max(4000).optional(),
+    /** auto: approve routine tool use, escalate risky requests to the card; ask: every request goes to the user. */
+    permissions: z.enum(["auto", "ask"]).default("auto"),
     timeout_minutes: z.number().int().min(1).max(240).optional(),
   })
   .strict();
@@ -31,7 +33,7 @@ export const policySchema = z
       })
       .strict()
       .default({ on_fail: "report", max_fix_rounds: 2 }),
-    reviewer: reviewerSchema.default({}),
+    reviewer: reviewerSchema.default({ permissions: "auto" }),
   })
   .strict();
 export type Policy = z.output<typeof policySchema>;
@@ -87,6 +89,8 @@ export const permissionCardSchema = z.object({
   kind: z.string(),
   title: z.string(),
   detail: z.string().nullable(),
+  /** Why the plugin did not approve it automatically. */
+  reason: z.string().nullable(),
   actions: z.array(z.object({ id: z.string(), label: z.string(), behavior: z.enum(["allow", "deny"]) })),
 });
 export type PermissionCard = z.output<typeof permissionCardSchema>;
@@ -98,6 +102,7 @@ export const cardSchema = z.object({
   maxFixRounds: z.number().int(),
   waiting: z.boolean(),
   permission: permissionCardSchema.nullable(),
+  autoApproved: z.number().int(),
   summary: z.string().nullable(),
   findings: z.array(findingSchema),
   otherFindings: z.number().int(),

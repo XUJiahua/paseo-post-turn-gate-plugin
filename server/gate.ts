@@ -14,6 +14,7 @@ import {
 import { diffStat, snapshotTree, toplevel } from "./git.ts";
 import type { Ledger, RoundRecord, Run } from "./ledger.ts";
 import { buildFixPrompt, buildGatePrompt, latestAssistantText, parseVerdict } from "./prompts.ts";
+import { decideAutoApproval } from "./permissions.ts";
 import { resolveReviewer } from "./reviewer.ts";
 
 export type Paseo = PluginHookContext["paseo"];
@@ -83,6 +84,7 @@ export function createGate(options: GateOptions): Gate {
   const pending = new Map<string, Pending>();
   // Pending permission of each run's current child, shown on the card so it can be answered there.
   const waiting = new Map<string, PermissionCard>();
+  const autoApproved = new Map<string, number>(); // run id → requests approved without a human
 
   // ponytail: one global queue serializes all gate work; a slow agent create delays other agents' events.
   // Upgrade path: per-source-agent queues if this ever becomes a bottleneck.
@@ -111,6 +113,7 @@ export function createGate(options: GateOptions): Gate {
       maxFixRounds: policy.review.on_fail === "fix" ? policy.review.max_fix_rounds : 0,
       waiting: waiting.has(run.run_id),
       permission: waiting.get(run.run_id) ?? null,
+      autoApproved: autoApproved.get(run.run_id) ?? 0,
       summary: verdict ? truncate(verdict.summary, 2000) : null,
       findings: shown,
       otherFindings: (verdict?.findings.length ?? 0) - shown.length,
@@ -139,6 +142,7 @@ export function createGate(options: GateOptions): Gate {
       maxFixRounds: 0,
       waiting: false,
       permission: null,
+      autoApproved: 0,
       summary: null,
       findings: [],
       otherFindings: 0,
@@ -158,7 +162,10 @@ export function createGate(options: GateOptions): Gate {
 
   async function transition(paseo: Paseo, run: Run, patch: Partial<Run>): Promise<Run> {
     const next = ledger.update(run.run_id, patch, now());
-    if (isTerminal(next.status)) waiting.delete(next.run_id);
+    if (isTerminal(next.status)) {
+      waiting.delete(next.run_id);
+      autoApproved.delete(next.run_id);
+    }
     await publishCard(paseo, next).catch((error) => log("card update failed", error));
     return next;
   }
@@ -426,7 +433,29 @@ export function createGate(options: GateOptions): Gate {
     if (!owned || owned.run.child_agent_id !== agentId || isTerminal(owned.run.status)) return;
     const runId = owned.run.run_id;
     if ("request" in event) {
-      waiting.set(runId, permissionCard(agentId, event.request));
+      const policy = JSON.parse(owned.run.policy_json) as Policy;
+      if (policy.reviewer.permissions !== "ask") {
+        const decision = decideAutoApproval(event.request, owned.run.repo_root);
+        if (decision.approve) {
+          try {
+            await paseo.agents.ref(agentId).respondToPermission({
+              requestId: event.request.id,
+              response: { behavior: "allow", ...(decision.actionId ? { selectedActionId: decision.actionId } : {}) },
+            });
+            autoApproved.set(runId, (autoApproved.get(runId) ?? 0) + 1);
+            log(`auto-approved for ${agentId}: ${event.request.title ?? event.request.name}`);
+            return;
+          } catch (error) {
+            log("auto-approve failed; asking the user", error instanceof Error ? error.message : error);
+          }
+        } else {
+          waiting.set(runId, permissionCard(agentId, event.request, decision.reason));
+          log(`escalated to user for ${agentId}: ${decision.reason}`);
+          await publishCard(paseo, owned.run);
+          return;
+        }
+      }
+      waiting.set(runId, permissionCard(agentId, event.request, null));
     } else if (waiting.get(runId)?.requestId === event.requestId) {
       waiting.delete(runId);
     } else {
@@ -435,7 +464,7 @@ export function createGate(options: GateOptions): Gate {
     await publishCard(paseo, owned.run);
   }
 
-  function permissionCard(agentId: string, request: PermissionRequested["request"]): PermissionCard {
+  function permissionCard(agentId: string, request: PermissionRequested["request"], reason: string | null): PermissionCard {
     const detail = request.detail as { command?: unknown; filePath?: unknown } | undefined;
     const text =
       typeof detail?.command === "string"
@@ -454,6 +483,7 @@ export function createGate(options: GateOptions): Gate {
       kind: request.kind,
       title: truncate(request.title ?? request.name, 300),
       detail: text ? truncate(text, 1000) : null,
+      reason,
       actions: actions.length > 0
         ? actions
         : [

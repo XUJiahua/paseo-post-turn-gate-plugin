@@ -85,6 +85,9 @@ export function GateCard({ item, theme }: PluginTimelineItemProps<CardData>) {
           <Text style={styles.muted}>Fix: {finding.suggested_fix}</Text>
         </View>
       ))}
+      {data.autoApproved > 0 ? (
+        <Text style={styles.muted}>{data.autoApproved} routine permission request(s) approved automatically</Text>
+      ) : null}
       {data.otherFindings > 0 ? (
         <Text style={styles.muted}>+{data.otherFindings} non-blocking finding(s)</Text>
       ) : null}
@@ -137,6 +140,7 @@ function PermissionPrompt({ permission, styles }: { permission: PermissionCard; 
   return (
     <View style={styles.permission}>
       <Text style={styles.body}>Reviewer asks: {permission.title}</Text>
+      {permission.reason ? <Text style={styles.danger}>Needs you: {permission.reason}</Text> : null}
       {permission.detail ? (
         <Text style={styles.muted} selectable>
           {permission.detail}

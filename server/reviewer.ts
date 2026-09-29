@@ -41,7 +41,7 @@ function findProfile(profiles: readonly AgentProfileLike[], ref: string): AgentP
  */
 export function resolveReviewer(
   source: LaunchConfig,
-  spec: ReviewerSpec,
+  spec: Partial<ReviewerSpec>,
   profiles: readonly AgentProfileLike[],
 ): ResolvedReviewer {
   const layers: Array<{ label: string; config: Partial<LaunchConfig> }> = [];
