@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "action": "review",
+  "trigger": "root_and_opt_in",
+  "review": { "on_fail": "report", "max_fix_rounds": 2 }
+}
