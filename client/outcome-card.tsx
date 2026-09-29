@@ -4,7 +4,7 @@ import { useMemo, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import type { Category, OutcomeCard as OutcomeCardData } from "../shared/schema.ts";
 import { stopAnsweringRpc } from "../shared/schema.ts";
-import { PermissionPrompt, cardStyles } from "./gate-card.tsx";
+import { LogsCommand, PermissionPrompt, cardStyles } from "./gate-card.tsx";
 
 const CATEGORY_LABELS: Record<Category, string> = {
   done: "Finished",
@@ -111,8 +111,12 @@ export function OutcomeCard({ item, theme }: PluginTimelineItemProps<OutcomeCard
       {error ? <Text style={styles.danger}>{error}</Text> : null}
       {data.childAgentId ? (
         <Text style={styles.muted} selectable>
-          Answerer · {data.childAgentId} (open it from History)
+          Answerer · {data.childAgentId}
+          {data.state === "answering" ? " (in this agent's Subagents)" : " (open it from History)"}
         </Text>
+      ) : null}
+      {data.childAgentId ? (
+        <LogsCommand agentId={data.childAgentId} follow={data.state === "answering"} styles={styles} />
       ) : null}
     </View>
   );

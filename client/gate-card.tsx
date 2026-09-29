@@ -2,6 +2,7 @@ import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
 import { usePaseo } from "@getpaseo/plugin/client";
 import { useMemo, useState } from "react";
 import { Pressable, Text, View } from "react-native";
+import { copyText } from "@getpaseo/plugin/client/react-native";
 import type { CardData, PermissionCard, RunStatus } from "../shared/schema.ts";
 
 const LABELS: Record<RunStatus, string> = {
@@ -14,6 +15,24 @@ const LABELS: Record<RunStatus, string> = {
   NEEDS_HUMAN: "NEEDS HUMAN",
   ERROR: "ERROR",
   SUPERSEDED: "Superseded",
+};
+
+type CheckState = CardData["checks"][number]["state"];
+const CHECK_LABELS: Record<CheckState, string> = {
+  pending: "waiting",
+  running: "running",
+  PASS: "PASS",
+  FAIL: "FAIL",
+  INCONCLUSIVE: "INCONCLUSIVE",
+  skipped: "skipped",
+};
+const CHECK_STYLE: Record<CheckState, (styles: ReturnType<typeof cardStyles>) => object> = {
+  pending: (styles) => styles.muted,
+  running: (styles) => styles.running,
+  PASS: (styles) => styles.success,
+  FAIL: (styles) => styles.danger,
+  INCONCLUSIVE: (styles) => styles.warning,
+  skipped: (styles) => styles.muted,
 };
 
 const FINISHED: RunStatus[] = ["PASSED", "INCONCLUSIVE", "FAILED", "NEEDS_HUMAN", "ERROR", "SUPERSEDED"];
@@ -49,6 +68,15 @@ export function cardStyles(theme: PluginTimelineItemProps["theme"]) {
       },
       denyText: { color: theme.colors.foreground },
       permission: { gap: 6, padding: 8, borderRadius: 8, backgroundColor: theme.colors.surface2 },
+      command: {
+        flexDirection: "row" as const,
+        alignItems: "center" as const,
+        gap: 8,
+        padding: 8,
+        borderRadius: 6,
+        backgroundColor: theme.colors.surface2,
+      },
+      code: { flex: 1, color: theme.colors.foreground, fontFamily: "monospace" },
       finding: { gap: 2, paddingLeft: 8, borderLeftWidth: 2, borderLeftColor: theme.colors.statusDanger },
   };
 }
@@ -62,7 +90,10 @@ export function GateCard({ item, theme }: PluginTimelineItemProps<CardData>) {
   if (data.status === "INCONCLUSIVE" || data.status === "SUPERSEDED") statusStyle = styles.warning;
   if (data.status === "FAILED" || data.status === "ERROR" || data.status === "NEEDS_HUMAN") statusStyle = styles.danger;
 
-  const role = data.action === "verify" ? "Verify" : data.action === "review" ? "Review" : "Gate";
+  const name = (check: string) => (check === "verify" ? "Verify" : "Review");
+  // Cards written before multi-check runs have no rows; fall back to the single action.
+  const role =
+    data.checks.length > 0 ? data.checks.map((row) => name(row.check)).join(" → ") : data.action ? name(data.action) : "Gate";
   const rounds = data.maxFixRounds > 0 ? ` · round ${data.round}/${data.maxFixRounds + 1}` : "";
   const status = data.waiting ? "Waiting for permission" : LABELS[data.status];
 
@@ -76,7 +107,19 @@ export function GateCard({ item, theme }: PluginTimelineItemProps<CardData>) {
         <Text style={data.waiting ? styles.warning : statusStyle}>{status}</Text>
       </View>
       {data.permission ? <PermissionPrompt permission={data.permission} styles={styles} /> : null}
-      {data.summary ? <Text style={styles.body}>{data.summary}</Text> : null}
+      {data.checks.length > 1 ? (
+        data.checks.map((row) => (
+          <Text key={row.check} style={styles.body}>
+            <Text style={CHECK_STYLE[row.state](styles)}>
+              {name(row.check)} · {CHECK_LABELS[row.state]}
+            </Text>
+            {row.summary ? `: ${row.summary}` : ""}
+          </Text>
+        ))
+      ) : data.summary ? (
+        <Text style={styles.body}>{data.summary}</Text>
+      ) : null}
+      {data.note ? <Text style={styles.muted}>{data.note}</Text> : null}
       {data.findings.map((finding, index) => (
         <View key={`${index}-${finding.title}`} style={styles.finding}>
           <Text style={styles.body}>
@@ -109,11 +152,43 @@ export function GateCard({ item, theme }: PluginTimelineItemProps<CardData>) {
           {FINISHED.includes(data.status) ? " (open it from History)" : " (in this agent's Subagents)"}
         </Text>
       ) : null}
+      {data.childAgentId ? (
+        <LogsCommand agentId={data.childAgentId} follow={!FINISHED.includes(data.status)} styles={styles} />
+      ) : null}
     </View>
   );
 }
 
-export type Styles = Record<"permission" | "body" | "muted" | "danger" | "actions" | "allow" | "allowText" | "deny" | "denyText", object>;
+/** The `paseo logs` command for a child agent, selectable and with a Copy button (cards cannot open other agents). */
+export function LogsCommand({ agentId, follow, styles }: { agentId: string; follow: boolean; styles: Styles }) {
+  const command = `paseo logs ${agentId}${follow ? " -f" : ""}`;
+  const [copied, setCopied] = useState<string | null>(null);
+  async function copy() {
+    try {
+      await copyText(command);
+      setCopied("Copied");
+    } catch {
+      setCopied("Copy failed; select the text instead");
+    }
+  }
+  return (
+    <View style={styles.command}>
+      <Text style={styles.code} selectable>
+        {command}
+      </Text>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`Copy command: ${command}`}
+        style={styles.deny}
+        onPress={() => void copy()}
+      >
+        <Text style={styles.denyText}>{copied ?? "Copy"}</Text>
+      </Pressable>
+    </View>
+  );
+}
+
+export type Styles = Record<"permission" | "body" | "muted" | "danger" | "actions" | "allow" | "allowText" | "deny" | "denyText" | "command" | "code", object>;
 
 /** Answers the reviewer's pending permission from the source agent's timeline. */
 export function PermissionPrompt({
