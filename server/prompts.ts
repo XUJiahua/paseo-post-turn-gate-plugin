@@ -11,6 +11,11 @@ Look for correctness bugs, regressions, missing error handling, security problem
 and maintainability issues. Report only real, evidenced problems.`,
 } as const;
 
+// The user reads these texts on the card, so they follow the request's language; a policy instruction can override it.
+const LANGUAGE_RULE = `Write the free-text JSON values (summary, question, answer, reason, title, evidence, suggested_fix) in the
+  language of the original request, unless the additional instructions name another language. Keep JSON keys,
+  enum values, code, paths and commands as they are.`;
+
 export function buildGatePrompt(input: {
   action: "verify" | "review";
   requestText: string;
@@ -38,6 +43,7 @@ Rules:
 - Severity: CRITICAL/HIGH block acceptance; MEDIUM/LOW do not.
 - verdict is FAIL when any CRITICAL or HIGH finding exists, PASS when none exists,
   INCONCLUSIVE only when you could not gather enough evidence.
+- ${LANGUAGE_RULE}
 
 Reply with ONLY one JSON object, no prose and no code fence, in exactly this shape:
 {"verdict":"PASS|FAIL|INCONCLUSIVE","summary":"...","findings":[{"severity":"CRITICAL|HIGH|MEDIUM|LOW","title":"...","evidence":"...","suggested_fix":"..."}]}`;
@@ -163,6 +169,7 @@ stays inside this repository, and stays within the scope of the original request
   offers to implement);
 - you are not confident.
 For "incomplete", "refused" and "done", use decision "answer" with an empty answer.
+${LANGUAGE_RULE}
 
 Reply with ONLY one JSON object, no prose and no code fence:
 {"state":"awaiting_user|incomplete|refused|done","question":"<the question, verbatim or summarized>","decision":"answer|escalate","answer":"<reply to send to the agent>","reason":"<one sentence>"}`;

@@ -51,6 +51,7 @@ By default the reviewer uses the same provider, model, mode, thinking level and 
 - If a layer switches to another provider, nothing provider-specific is carried over from the layers below it.
 - `profile` is matched by id first, then by exact name.
 - `instructions` is added to the built-in prompt. It cannot change the verdict format.
+- The reviewer and answerer write card text (summary, findings, questions, answers) in the language of the original request. To fix a language, say so in `instructions`, for example `"Write all text in English."`.
 
 To create the profiles, run:
 

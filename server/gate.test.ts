@@ -882,6 +882,7 @@ describe("reviewer config", () => {
     assert.deepEqual(fake.created[0].config, { provider: "codex/gpt-5.5", modeId: "auto-review" });
     assert.match(fake.created[0].prompt, /Check the README too\./);
     assert.match(fake.created[0].prompt, /Reply with ONLY one JSON object/, "contract stays after instructions");
+    assert.match(fake.created[0].prompt, /language of the original request/, "card text follows the user's language");
 
     fake.profiles.length = 0;
     await sourceTurn({ change: () => writeFileSync(path.join(repo, "b.txt"), "b"), messageId: "m2" });
