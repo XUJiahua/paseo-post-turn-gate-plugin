@@ -68,7 +68,8 @@ Every turn of a gated agent is sorted into a category, and `on_outcome` in the p
 | Category | Detected from | Default |
 |---|---|---|
 | `done` | turn completed | `gate` (run the review or verify) |
-| `awaiting_user` | the agent stopped to ask something (a rule-based pre-screen, then a semantic check by the answerer) | `{ "answer": { "max": 3 } }`: the answerer agent replies for you, or hands the question to you |
+| `awaiting_user` | the agent stopped to ask something, or the turn looks unfinished (unclosed code block, ended on a tool call, open todos). A rule-based pre-screen runs first, then a semantic check by the answerer | `{ "answer": { "max": 3 } }`: the answerer agent replies for you (or says "Continue."), or hands the question to you |
+| `refused` | the answerer judged the reply a refusal | `notify` |
 | `user_canceled`, `replaced` | you stopped the agent, or sent a new message | `ignore` |
 | `crashed`, `network`, `rate_limited` | error text of a failed turn | `notify`, or `{ "retry": { "max", "delay_seconds", "message" } }` |
 | `quota_exhausted`, `context_exhausted`, `error` | error text of a failed turn | `notify` (retry is not allowed) |
@@ -81,6 +82,7 @@ Every turn of a gated agent is sorted into a category, and `on_outcome` in the p
 ```
 
 - The answerer never answers product trade-offs, anything irreversible or outward-facing (deleting data, pushing, publishing, deploying, spending money), credentials, or information only you have. It also hands a question to you when the agent asks the same thing twice.
+- The plugin never waits forever. A reviewer times out after `timeout_minutes` (default 30), including time spent waiting for a permission answer. The answerer times out after 10 minutes and then hands the question to you.
 - Answers are sent as `[post-turn gate answered on your behalf]` and stay visible in the timeline.
 - The outcome card has a **Stop auto-answering** button.
 - A task that spans several turns (answered questions, retries) is reviewed as a whole, starting from its first turn.

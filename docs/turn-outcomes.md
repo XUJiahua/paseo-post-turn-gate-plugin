@@ -218,6 +218,31 @@ data = { category, message, suggestion, attempt, maxAttempts, nextRetryAt }
 - `action: "none"` 时 `on_outcome` 仍然生效（代答、重试、通知），只是不做 review。
 - messageId 前缀：answerer 自己的 prompt 用 `ptg:ask:`，发给源 Agent 的代答用 `ptg:answer:`，重试用 `ptg:retry:`，fix 轮保持 `ptg:<run>:fix:<n>`。
 
+## 7.2 截断、拒答的启发式识别（第 1 类，已实现）
+
+Paseo 不传 `stopReason`（S1），所以粗筛额外加入以下信号，命中后同样交给 answerer 做语义判断。按顺序匹配，命中即停：
+
+| 信号 | 规则 | answerer 的处理 |
+|---|---|---|
+| `refused` | 回复开头是 “I'm sorry, but I can't help / I am unable to … / 抱歉，我无法 …” | `refused` → 新类别 `refused`，默认 notify，不代答 |
+| `truncated` | 回复中 ``` 的个数为奇数（代码块未闭合） | `incomplete` → 回复 “Continue.” |
+| `tool_last` | 这一轮最后一项是工具调用，之后没有回复（疑似轮次上限） | 同上 |
+| `todo_pending` | 这一轮最后一个 todo 清单里还有未完成项 | 同上 |
+| `question` | 原有的提问预筛 | 原有逻辑 |
+
+- 命中的信号会写进 answerer 的 prompt（“The plugin noticed: …”）。
+- “句末没有标点”**不作为**信号：kiro 的正常回复经常不带句号（如 E1 的 `ALL DONE`），误报太多。
+- 上游方案见 [paseo-pr-turn-outcome.md](paseo-pr-turn-outcome.md)。
+
+## 7.3 不卡住（2026-09-29）
+
+原则：插件自己**永远不会无限等待**。只有真正需要人来判断的事才交给人；交出去时，卡片会写明该怎么继续。
+
+- **Reviewer / Verifier**：超时（默认 30 分钟）也包括等待授权的时间，不再因为有待处理的权限请求而顺延。超时后判 `ERROR`，写明 “a permission request was not answered”，并归档 Reviewer。常规请求本来就会自动批准（design.md §5），会等待的只剩高风险请求。
+- **answerer**：超时 10 分钟；超时后把问题交给用户。
+- **needs_user**：这是 Agent 本身停下来等人，并不是插件卡住。卡片提示 “Reply in the chat to continue”。你一回复，卡片立即变为 “You replied; the task continues”，这条任务链之后的轮次照常代答、review。
+- **answerer 更敢答**：Agent 自己给出了推荐选项，而且该选项可逆、在仓库内、没有超出原需求范围时，answerer 回复 “Go with your recommendation.”。超出原需求范围的（例如用户只要分析，Agent 提议动手实现）仍然转交给用户。线上第一次 needs_user 就属于这种情况，按规则转交是对的。
+
 ## 8. 已确认的决定（2026-09-29）
 
 - `awaiting_user` 默认由 post-turn Agent 代答（§3.1），不能代答时 escalate 给用户。
