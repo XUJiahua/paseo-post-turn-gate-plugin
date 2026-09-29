@@ -78,14 +78,45 @@ export function latestAssistantText(
   return output;
 }
 
-/** Parses a JSON reply (raw, fenced, or embedded in prose); null when nothing validates. */
+/** Finds complete top-level JSON objects without being confused by braces inside strings. */
+function jsonObjects(text: string): string[] {
+  const objects: string[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (start === -1) {
+      if (char === "{") {
+        start = index;
+        depth = 1;
+      }
+      continue;
+    }
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === "{") depth += 1;
+    else if (char === "}" && --depth === 0) {
+      objects.push(text.slice(start, index + 1));
+      start = -1;
+    }
+  }
+  return objects;
+}
+
+/** Parses the final JSON reply (raw, fenced, or embedded in prose); null when it does not validate. */
 export function parseJsonReply<Schema extends ZodType>(text: string, schema: Schema): output<Schema> | null {
   const candidates = [text.trim()];
-  const fences = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)].map((match) => match[1].trim());
-  candidates.push(...fences.reverse());
-  const lastBrace = text.lastIndexOf("}");
-  const firstBrace = text.indexOf("{");
-  if (firstBrace !== -1 && lastBrace > firstBrace) candidates.push(text.slice(firstBrace, lastBrace + 1));
+  const lastFence = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)].at(-1)?.[1].trim();
+  if (lastFence) candidates.push(lastFence);
+  const lastObject = jsonObjects(text).at(-1);
+  if (lastObject) candidates.push(lastObject);
   for (const candidate of candidates) {
     try {
       const parsed = schema.safeParse(JSON.parse(candidate));

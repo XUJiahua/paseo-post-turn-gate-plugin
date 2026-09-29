@@ -961,6 +961,12 @@ describe("parseVerdict", () => {
     assert.equal(parseVerdict("PASS"), null);
     assert.equal(parseVerdict(""), null);
   });
+
+  test("uses the final structured reply after Codex progress messages", () => {
+    const progress = JSON.stringify({ verdict: "INCONCLUSIVE", summary: "正在审查", findings: [] });
+    const text = `${progress}\n我会先检查代码和测试。\n${PASS}`;
+    assert.equal(parseVerdict(text)?.verdict, "PASS");
+  });
 });
 
 describe("reviewer config", () => {
