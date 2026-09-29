@@ -136,7 +136,7 @@ describe("on_outcome schema", () => {
     assert.equal(policySchema.safeParse({ version: 2, on_outcome: { bogus: "ignore" } }).success, false);
   });
 
-  test("done lists the checks, on_fail picks fix rounds, each role has a default profile, v1 fields are rejected", () => {
+  test("done lists the checks, on_fail picks fix rounds, profiles default off, v1 fields are rejected", () => {
     const policy = policySchema.parse({ version: 2 });
     assert.deepEqual(gateChecks(policy), ["review"]);
     assert.equal(maxFixRounds(policy), 2, "fix is the default");
@@ -148,7 +148,7 @@ describe("on_outcome schema", () => {
     assert.equal(policySchema.safeParse({ version: 2, on_outcome: { done: "review" } }).success, false);
     assert.deepEqual(
       [policy.agents.reviewer.profile, policy.agents.verifier.profile, policy.agents.answerer.profile],
-      ["post-turn-gate-reviewer", "post-turn-gate-verifier", "post-turn-gate-answerer"],
+      [null, null, null],
     );
     assert.equal(policy.agents.answerer.timeout_minutes, 10);
     assert.equal(policySchema.parse({ version: 2, agents: { verifier: { profile: null } } }).agents.verifier.profile, null);
@@ -163,16 +163,18 @@ describe("on_outcome schema", () => {
 
   test("npm run init writes every field with its default, plus the chosen options", () => {
     const run = (...args: string[]) =>
-      JSON.parse(execFileSync(process.execPath, ["--experimental-strip-types", "--no-warnings", "scripts/init-policy.ts", "--stdout", ...args], { encoding: "utf8" }));
+      JSON.parse(execFileSync(process.execPath, ["bin/post-turn-gate-init.mjs", "--stdout", ...args], { encoding: "utf8" }));
     const defaults = run();
     assert.deepEqual(defaults, policySchema.parse({ version: 2 }));
     assert.deepEqual(defaults.on_fail, { fix: { max_rounds: 2 } });
     assert.equal(run("--report").on_fail, "report");
     assert.deepEqual(defaults.on_outcome.done, ["review"]);
-    assert.equal(defaults.agents.verifier.profile, "post-turn-gate-verifier");
+    assert.equal(defaults.agents.verifier.profile, null);
     const chosen = run("--check", "verify,review", "--fix", "3");
     assert.deepEqual(chosen.on_fail, { fix: { max_rounds: 3 } });
     assert.deepEqual(chosen.on_outcome.done, ["verify", "review"]);
     assert.equal(chosen.on_outcome.network, "notify", "other fields keep their defaults");
+    assert.throws(() => run("--fix", "0"), /Command failed/);
+    assert.throws(() => run("--check", "review,review"), /Command failed/);
   });
 });

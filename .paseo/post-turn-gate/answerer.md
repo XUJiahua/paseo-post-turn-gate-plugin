@@ -1,11 +1,11 @@
 <!--
 Answerer rules for this repository (.paseo/post-turn-gate/answerer.md).
-
-Rules for the agent that answers the coding agent's questions on your behalf. It never answers product
-trade-offs, irreversible or outward-facing actions, credentials, or things only you know; use this file to
-say which decisions it may make. Everything inside these comment markers is ignored; write your rules below the closing marker. Examples:
-
-- Language and tooling choices are yours to make; follow what the repository already uses.
-- Prefer the simplest option that stays within the original request.
-- Never approve adding a new dependency; hand that question to me.
+The Markdown below is active and is appended to the built-in answerer prompt. Edit it to record decisions
+the answerer may make for this project and choices that must always be escalated to a person.
 -->
+# Repository answer instructions
+
+- Base answers on repository-local guidance and the project's existing architecture and conventions.
+- Prefer existing dependencies, tools, and patterns over introducing a new project-wide choice.
+- Choose the smallest reversible option that stays within the original request.
+- Escalate when the repository does not determine the answer or the choice changes product behavior.

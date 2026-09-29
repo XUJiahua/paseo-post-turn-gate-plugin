@@ -350,7 +350,7 @@ export function createGate(options: GateOptions): Gate {
     const spec = policy.agents[role];
     const source = await refreshAgent(paseo, run.source_agent_id);
     if (!source) return fail(paseo, run, "source agent no longer exists");
-    const profiles = (await paseo.config.get()).config.agentProfiles ?? [];
+    const profiles = spec.profile ? (await paseo.config.get()).config.agentProfiles ?? [] : [];
     const resolved = resolveRole(inheritedConfig(source), spec, ROLE_PROFILE[role], profiles);
     if (!resolved.ok) return fail(paseo, run, `agents.${role}: ${resolved.error}`);
     const { model, ...launch } = resolved.config;
@@ -769,7 +769,7 @@ export function createGate(options: GateOptions): Gate {
     const source = await refreshAgent(paseo, chain.agent_id);
     if (!source) return;
     const spec = policy.agents.answerer;
-    const profiles = (await paseo.config.get()).config.agentProfiles ?? [];
+    const profiles = spec.profile ? (await paseo.config.get()).config.agentProfiles ?? [] : [];
     const resolved = resolveRole(inheritedConfig(source), spec, ROLE_PROFILE.answerer, profiles);
     if (!resolved.ok) return needsUser(paseo, chain, reply.slice(-600), `cannot start the answerer: ${resolved.error}`);
     const { model, ...launch } = resolved.config;

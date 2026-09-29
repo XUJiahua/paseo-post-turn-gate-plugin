@@ -7,7 +7,7 @@ export const POLICY_PATH = ".paseo/post-turn-gate.json";
 export type Role = "reviewer" | "verifier" | "answerer";
 export type Check = "review" | "verify";
 export const ROLE_OF: Record<Check, Role> = { review: "reviewer", verify: "verifier" };
-/** Profile ids created by `npm run profiles`; each role's default profile. */
+/** Optional profile ids created by `npm run profiles`. */
 export const ROLE_PROFILE: Record<Role, string> = {
   reviewer: "post-turn-gate-reviewer",
   verifier: "post-turn-gate-verifier",
@@ -22,10 +22,10 @@ function agentSchema(role: Role, timeoutMinutes: number) {
   return z
     .object({
       /**
-       * Paseo agent profile, matched by id first, then by exact name. null: no profile, inherit the source agent.
-       * The role's default profile falls back to the source agent when it does not exist; any other name must exist.
+       * Optional Paseo launch profile, matched by id first, then by exact name.
+       * null: inherit the source agent; repository instructions are configured separately below.
        */
-      profile: z.string().min(1).nullable().default(ROLE_PROFILE[role]),
+      profile: z.string().min(1).nullable().default(null),
       provider: z.string().min(1).optional(),
       model: z.string().min(1).optional(),
       mode: z.string().min(1).optional(),

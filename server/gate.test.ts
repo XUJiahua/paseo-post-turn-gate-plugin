@@ -384,15 +384,17 @@ describe("dispatch and report", () => {
     assert.deepEqual(onlyRun().checks.map((row) => row.state), ["running", "pending"]);
   });
 
-  test("a missing default profile falls back to the source agent with a note; null skips profiles", async () => {
+  test("the default policy inherits the source agent without depending on Paseo profiles", async () => {
+    fake.profiles.push({
+      id: "post-turn-gate-reviewer",
+      name: "Gate reviewer",
+      provider: "codex",
+      model: "gpt-5.5",
+    });
     writePolicy({ version: 2 });
     await sourceTurn({ change: edit, messageId: "a" });
-    assert.match(onlyRun().note ?? "", /post-turn-gate-reviewer" does not exist/);
-    await childTurn(fake.created[0].agentId, PASS);
-    fake.cards.clear();
-    writePolicy({ version: 2, agents: { reviewer: { profile: null } } });
-    await sourceTurn({ change: () => writeFileSync(path.join(repo, "b.txt"), "b"), messageId: "b" });
     assert.equal(onlyRun().note, null);
+    assert.equal(fake.created[0].config.provider, "kiro/claude-opus-4.8");
   });
 
   test("rules files in the repository are appended to the role prompt, frozen at turn start", async () => {
@@ -404,15 +406,22 @@ describe("dispatch and report", () => {
     assert.doesNotMatch(fake.created[0].prompt, /changed mid-turn/);
   });
 
-  test("npm run init writes rule templates that add nothing until the user writes a rule", async () => {
-    execFileSync(process.execPath, ["--experimental-strip-types", "--no-warnings", "scripts/init-policy.ts", "--dir", repo]);
+  test("npm run init writes active repository instructions for every role", async () => {
+    execFileSync(process.execPath, ["bin/post-turn-gate-init.mjs", "--dir", repo]);
+    for (const role of ["reviewer", "verifier", "answerer"]) {
+      const template = readFileSync(path.join(repo, `.paseo/post-turn-gate/${role}.md`), "utf8");
+      const active = template.replace(/<!--[\s\S]*?-->/g, "").trim();
+      assert.notEqual(active, "", `${role}.md must contain active instructions`);
+    }
     await sourceTurn({ change: edit, messageId: "a" });
-    assert.doesNotMatch(fake.created[0].prompt, /Additional instructions/, "an untouched template is only comments");
+    assert.match(fake.created[0].prompt, /Additional instructions from the repository policy/);
+    assert.match(fake.created[0].prompt, /repository-local guidance/);
     await childTurn(fake.created[0].agentId, PASS);
     const rules = path.join(repo, ".paseo/post-turn-gate/reviewer.md");
     writeFileSync(rules, `${readFileSync(rules, "utf8")}\n- Money is integer cents.\n`);
     await sourceTurn({ change: () => writeFileSync(path.join(repo, "b.txt"), "b"), messageId: "b" });
-    assert.match(fake.created[1].prompt, /<<<INSTRUCTIONS\n- Money is integer cents\.\nINSTRUCTIONS>>>/);
+    assert.match(fake.created[1].prompt, /# Repository review instructions/);
+    assert.match(fake.created[1].prompt, /- Money is integer cents\./);
   });
 
   test("a named rules file must exist and stay inside the repository", async () => {
@@ -423,19 +432,6 @@ describe("dispatch and report", () => {
     await sourceTurn({ change: () => writeFileSync(path.join(repo, "b.txt"), "b"), messageId: "b" });
     assert.match(fake.cards.get(`post-turn-gate:config:${SOURCE}`)?.error ?? "", /inside the repository/);
     assert.equal(fake.created.length, 0);
-  });
-
-  test("each role uses its own profile when it exists and the policy names none", async () => {
-    fake.profiles.push(
-      { id: "post-turn-gate-reviewer", name: "Gate reviewer", provider: "codex", model: "gpt-5.5" },
-      { id: "post-turn-gate-verifier", name: "Gate verifier", provider: "claude", model: "opus" },
-    );
-    writePolicy({ version: 2, on_outcome: { done: ["verify"] } });
-    await sourceTurn({ change: edit, messageId: "v" });
-    assert.equal(fake.created[0].config.provider, "claude/opus");
-    writePolicy({ version: 2 });
-    await sourceTurn({ change: () => writeFileSync(path.join(repo, "b.txt"), "b"), messageId: "r" });
-    assert.equal(fake.created.at(-1)?.config.provider, "codex/gpt-5.5");
   });
 
   test("an unparseable reply is an ERROR, never a PASS", async () => {
@@ -706,7 +702,7 @@ describe("turn outcomes: answers, retries, chains", () => {
   const baseOf = (prompt: string) => /diff ([0-9a-f]{40}) ([0-9a-f]{40})/.exec(prompt)![1];
 
   test("a question is answered by the answerer; the follow-up turn is gated against the chain's first baseline", async () => {
-    writePolicy({ version: 2 });
+    writePolicy({ version: 2, agents: { answerer: { profile: "post-turn-gate-answerer" } } });
     fake.profiles.push({ id: "post-turn-gate-answerer", name: "Gate answerer", provider: "codex", model: "gpt-5.5" });
     await sourceTurn({ change: edit, reply: "Which language should I use for the script?" });
     assert.equal(reviewers().length, 0, "no review while the agent waits");

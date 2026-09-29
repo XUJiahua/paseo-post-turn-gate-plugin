@@ -1,15 +1,11 @@
 <!--
 Verifier rules for this repository (.paseo/post-turn-gate/verifier.md).
-
-Rules the post-turn verifier applies when it checks that a change delivers the request. Its built-in job:
-map every requirement to evidence, build, and run the relevant tests. Tell it how to do that here.
-Everything inside these comment markers is ignored; write your rules below the closing marker. Examples:
-
-## How to build and test
-- Build: npm run build
-- Unit tests: npm test
-- E2E tests: npm run test:e2e (needs `docker compose up -d` first)
-
-## Evidence that counts
-- A UI change needs a screenshot or a Playwright test, not only a code read.
+The Markdown below is active and is appended to the built-in verifier prompt. Edit it to name this
+project's acceptance criteria, authoritative documentation, test commands, and required evidence.
 -->
+# Repository verification instructions
+
+- Read relevant repository-local guidance and turn every part of the original request into an explicit check.
+- Discover build and test commands from this repository's manifests and documentation; run the relevant ones.
+- Require observable evidence for behavior changes instead of relying only on a code diff.
+- Mark missing evidence as inconclusive or a finding; never silently assume a requirement is satisfied.

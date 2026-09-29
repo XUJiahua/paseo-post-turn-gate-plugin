@@ -3,7 +3,11 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "bin": {
+    "post-turn-gate-init": "bin/post-turn-gate-init.mjs"
+  },
   "files": [
+    "bin/",
     "paseo-plugin.json",
     "index.client.tsx",
     "index.server.ts",
@@ -15,7 +19,7 @@
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --no-warnings --test server/*.test.ts",
     "profiles": "node scripts/create-agent-profiles.mjs",
-    "init": "node --experimental-strip-types --no-warnings scripts/init-policy.ts"
+    "init": "node bin/post-turn-gate-init.mjs"
   },
   "devDependencies": {
     "@getpaseo/plugin": "0.10.1",

@@ -168,5 +168,5 @@ for (const { role, profile, action } of written) {
 }
 const example = written[0];
 console.log(`
-The default policy uses these profiles by id. To pick another one, set it in .paseo/post-turn-gate.json:
+Profiles are opt-in. To use one, set it in .paseo/post-turn-gate.json:
   "agents": { "${example.role}": { "profile": "<id or name>" } }`);

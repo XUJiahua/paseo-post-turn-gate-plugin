@@ -8,19 +8,19 @@
   },
   "agents": {
     "reviewer": {
-      "profile": "post-turn-gate-reviewer",
+      "profile": null,
       "instructions_file": ".paseo/post-turn-gate/reviewer.md",
       "permissions": "auto",
       "timeout_minutes": 30
     },
     "verifier": {
-      "profile": "post-turn-gate-verifier",
+      "profile": null,
       "instructions_file": ".paseo/post-turn-gate/verifier.md",
       "permissions": "auto",
       "timeout_minutes": 30
     },
     "answerer": {
-      "profile": "post-turn-gate-answerer",
+      "profile": null,
       "instructions_file": ".paseo/post-turn-gate/answerer.md",
       "permissions": "auto",
       "timeout_minutes": 10
