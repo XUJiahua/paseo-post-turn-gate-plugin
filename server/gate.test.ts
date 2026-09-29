@@ -529,22 +529,22 @@ describe("recovery", () => {
     assert.equal(onlyRun().status, "PASSED");
   });
 
-  test("a running reviewer times out, unless it is waiting for permission", async () => {
+  test("a running reviewer times out, even while it waits for a permission answer", async () => {
     writePolicy({ version: 1, action: "review" });
     await sourceTurn({ change: edit });
     const child = fake.agents.get(fake.created[0].agentId)!;
     child.pendingPermissions = [{}];
-    clock += 5_000;
+    clock += 500;
     gate.reconcile(fake.paseo);
     await gate.idle();
-    assert.equal(onlyRun().status, "REVIEWING", "permission wait extends the deadline");
+    assert.equal(onlyRun().status, "REVIEWING", "still inside the deadline");
 
-    child.pendingPermissions = [];
     clock += 5_000;
     gate.reconcile(fake.paseo);
     await gate.idle();
     assert.equal(onlyRun().status, "ERROR");
-    assert.match(onlyRun().error ?? "", /timed out/);
+    assert.match(onlyRun().error ?? "", /timed out .*permission request was not answered/);
+    assert.deepEqual(fake.archived, [child.id], "the stuck reviewer is archived");
   });
 
   test("a FIXING run whose fix message never landed is re-sent with the same messageId", async () => {
@@ -706,6 +706,42 @@ describe("turn outcomes: answers, retries, chains", () => {
     await sourceTurn({ text: "try again", messageId: "n4", change: () => writeFileSync(path.join(repo, "d.txt"), "d") });
     assert.equal(reviewers().length, 2);
     assert.notEqual(baseOf(reviewers()[1].prompt), manualBase);
+  });
+
+  test("a refusal found by the answerer becomes a notice, nothing is sent", async () => {
+    writePolicy({ version: 1, action: "review" });
+    await sourceTurn({ change: edit, reply: "I'm sorry, but I can't help with that." });
+    assert.match(answerers()[0].prompt, /starts like a refusal/);
+    await childTurn(answerers()[0].agentId, JSON.stringify({ state: "refused", decision: "answer", reason: "policy" }));
+    assert.equal(outcomeCard().category, "refused");
+    assert.equal(fake.sent.length, 0);
+    assert.equal(reviewers().length, 0);
+  });
+
+  test("a truncated reply is continued; your own reply resolves a needs-user card", async () => {
+    writePolicy({ version: 1, action: "review" });
+    await sourceTurn({ change: edit, reply: "Here is the file:\n```ts\nexport function a() {" });
+    assert.match(answerers()[0].prompt, /unclosed code block/);
+    await childTurn(answerers()[0].agentId, JSON.stringify({ state: "incomplete", decision: "answer" }));
+    assert.equal(fake.sent.at(-1)?.text, "[post-turn gate answered on your behalf]\nContinue.");
+
+    await sourceTurn({ messageId: fake.sent[0].messageId, text: fake.sent[0].text, reply: "Should I pick A or B?" });
+    await childTurn(answerers()[1].agentId, ANSWER("", { decision: "escalate", reason: "product decision" }));
+    assert.equal(outcomeCard().state, "needs_user");
+    gate.onTurnStarted({ agent: hookAgent(SOURCE), turnId: "you" }, fake.paseo);
+    await gate.idle();
+    assert.equal(outcomeCard().state, "resolved");
+    assert.match(outcomeCard().message, /You replied/);
+  });
+
+  test("the answerer times out quickly and hands the question over", async () => {
+    writePolicy({ version: 1, action: "review" });
+    await sourceTurn({ change: edit, reply: "Which language?" });
+    clock += 5_000; // test default timeout is 1s
+    gate.reconcile(fake.paseo);
+    await gate.idle();
+    assert.equal(outcomeCard().state, "needs_user");
+    assert.match(outcomeCard().message, /answerer timed out/);
   });
 
   test("quota errors cannot be configured to retry", async () => {

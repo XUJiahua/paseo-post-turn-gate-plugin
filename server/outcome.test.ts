@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { classify, currentTurnItems, looksLikeQuestion, similarity } from "./outcome.ts";
+import { classify, currentTurnItems, looksLikeQuestion, similarity, stopSignal } from "./outcome.ts";
 import { answerRisk } from "./permissions.ts";
 import { policySchema } from "../shared/schema.ts";
 
@@ -69,6 +69,29 @@ describe("looksLikeQuestion (pre-screen, high recall)", () => {
     for (const text of ["Done. All tests pass.", "Fixed the bug in parse().", "Steps taken:\n1. Read\n2. Fixed", "```js\nif (a?.b) {}\n```\nImplemented.", ""]) {
       assert.equal(looksLikeQuestion(text), false, text);
     }
+  });
+});
+
+describe("stopSignal (truncation, turn limit, todos, refusal)", () => {
+  test("detects each signal", () => {
+    assert.equal(stopSignal([says("Here:\n```ts\nconst a = 1;")]), "truncated");
+    assert.equal(stopSignal([says("Let me check."), tool("completed")]), "tool_last");
+    assert.equal(
+      stopSignal([{ type: "todo", items: [{ text: "a", completed: true }, { text: "b", completed: false }] }, says("Progress so far.")] as never),
+      "todo_pending",
+    );
+    assert.equal(stopSignal([says("I'm sorry, but I can't help with that request.")]), "refused");
+    assert.equal(stopSignal([says("抱歉，我无法完成这个请求。")]), "refused");
+    assert.equal(stopSignal([says("Which one?")]), "question");
+  });
+  test("does not flag normal finished turns", () => {
+    assert.equal(stopSignal([tool("completed"), says("Done. Tests pass")]), null);
+    assert.equal(stopSignal([says("```ts\nconst a = 1;\n```\nImplemented")]), null);
+    assert.equal(stopSignal([{ type: "todo", items: [{ text: "a", completed: true }] }, says("All done.")] as never), null);
+    assert.equal(stopSignal([says("I can't reproduce the bug anymore after the fix; all tests pass.")]), null);
+  });
+  test("classify routes a truncated reply to the semantic check with its signal", () => {
+    assert.deepEqual(turn({ kind: "completed" }, [says("```js\nfunction")]), { category: "awaiting_user", detail: "truncated" });
   });
 });
 

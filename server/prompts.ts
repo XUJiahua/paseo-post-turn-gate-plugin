@@ -109,8 +109,17 @@ export function buildAnswerPrompt(input: {
   endTree: string;
   agentReply: string;
   previousQuestion: string | null;
+  signal?: string | null;
   instructions?: string;
 }): string {
+  const hints: Record<string, string> = {
+    truncated: "The reply ends inside an unclosed code block; it may have been cut off.",
+    tool_last: "The turn ended right after a tool call, without a final reply; the agent may have been stopped by a turn limit.",
+    todo_pending: "The agent's todo list still has unfinished items.",
+    refused: "The reply starts like a refusal.",
+    question: "The reply looks like it asks the user something.",
+  };
+  const hint = input.signal && hints[input.signal] ? `\nThe plugin noticed: ${hints[input.signal]}\n` : "";
   const extra = input.instructions?.trim()
     ? `\nAdditional rules from the repository policy:\n<<<RULES\n${input.instructions.trim()}\nRULES>>>\n`
     : "";
@@ -120,7 +129,7 @@ export function buildAnswerPrompt(input: {
   return `You stand in for the user of a coding agent. The agent just stopped its turn. Decide whether it is
 waiting for the user, and if so answer on the user's behalf when that is safe, so the work can continue
 without a human.
-${extra}${previous}
+${extra}${previous}${hint}
 Repository: ${input.repoRoot}
 Work done so far in this task: git -C ${JSON.stringify(input.repoRoot)} diff ${input.baseTree} ${input.endTree}
 You may read files and run read-only commands to inform the answer. Do not modify the repository.
@@ -137,18 +146,24 @@ AGENT>>>
 
 Classify the agent's state:
 - "awaiting_user": it asks the user a question or for a decision and stopped.
-- "incomplete": it did not ask anything but clearly stopped before finishing (e.g. "next I will …").
+- "incomplete": it did not ask anything but stopped before finishing (e.g. "next I will …", a reply cut off
+  mid-way, unfinished todo items, or it stopped right after a tool call).
+- "refused": it declined to do the request (a policy or safety refusal), so there is nothing to answer.
 - "done": it finished the request and is not waiting for anything.
 
 For "awaiting_user", choose decision "answer" only when the request, the repository, or common engineering
-practice clearly determines the answer. Keep the answer short and actionable. Choose "escalate" when:
+practice clearly determines the answer. If the agent recommends one option and that option is reversible,
+stays inside this repository, and stays within the scope of the original request, answer
+"Go with your recommendation." Keep the answer short and actionable. Choose "escalate" when:
 - it is a product or business trade-off the request does not settle (several reasonable options);
 - it involves deleting data, force-pushing, publishing, deploying, spending money, changing permissions,
   credentials or secrets, or sending anything outside this machine;
 - it needs information only the user has (accounts, personal preferences, passwords, external context);
+- it would expand the work beyond what the user asked for (e.g. the user asked for analysis, the agent
+  offers to implement);
 - you are not confident.
-For "incomplete" and "done", use decision "answer" with an empty answer.
+For "incomplete", "refused" and "done", use decision "answer" with an empty answer.
 
 Reply with ONLY one JSON object, no prose and no code fence:
-{"state":"awaiting_user|incomplete|done","question":"<the question, verbatim or summarized>","decision":"answer|escalate","answer":"<reply to send to the agent>","reason":"<one sentence>"}`;
+{"state":"awaiting_user|incomplete|refused|done","question":"<the question, verbatim or summarized>","decision":"answer|escalate","answer":"<reply to send to the agent>","reason":"<one sentence>"}`;
 }

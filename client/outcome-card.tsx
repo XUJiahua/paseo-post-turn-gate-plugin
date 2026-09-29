@@ -9,6 +9,7 @@ import { PermissionPrompt, cardStyles } from "./gate-card.tsx";
 const CATEGORY_LABELS: Record<Category, string> = {
   done: "Finished",
   awaiting_user: "Waiting for an answer",
+  refused: "Agent declined",
   user_canceled: "Stopped",
   replaced: "Replaced",
   crashed: "Agent process exited",

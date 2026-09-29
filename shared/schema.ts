@@ -27,6 +27,7 @@ export type ReviewerSpec = z.output<typeof reviewerSchema>;
 export const CATEGORIES = [
   "done",
   "awaiting_user",
+  "refused",
   "user_canceled",
   "replaced",
   "crashed",
@@ -71,6 +72,7 @@ export const onOutcomeSchema = z
   .object({
     done: z.enum(["gate", "notify", "ignore"]).default("gate"),
     awaiting_user: z.union([z.enum(["gate", "notify", "ignore"]), answerActionSchema]).default({ answer: { max: 3 } }),
+    refused: passive.default("notify"),
     user_canceled: passive.default("ignore"),
     replaced: passive.default("ignore"),
     crashed: retryable.default("notify"),
@@ -85,7 +87,7 @@ export type OnOutcome = z.output<typeof onOutcomeSchema>;
 export type OutcomeAction = OnOutcome[Category];
 
 export const answerReplySchema = z.object({
-  state: z.enum(["awaiting_user", "done", "incomplete"]),
+  state: z.enum(["awaiting_user", "done", "incomplete", "refused"]),
   question: z.string().default(""),
   decision: z.enum(["answer", "escalate"]),
   answer: z.string().default(""),

@@ -416,6 +416,8 @@ export function createGate(options: GateOptions): Gate {
   const ANSWERER_PROFILE = "post-turn-gate-answerer";
   // Errs towards escalating: a false match hands the question to the user, a miss can loop.
   const SAME_QUESTION = 0.5;
+  // The answerer only reads and decides; if it takes longer than this, hand the question to the user.
+  const ANSWER_TIMEOUT_MS = 10 * 60 * 1000;
   const retryTimers = new Set<ReturnType<typeof setTimeout>>();
   const sendable = (status: string | undefined) => status === "idle" || status === "error";
 
@@ -602,7 +604,7 @@ export function createGate(options: GateOptions): Gate {
       if (!cfg) return needsUser(paseo, chain, reply.slice(-600), "auto-answer is off for this repository");
       if (chain.stop_answering) return needsUser(paseo, chain, reply.slice(-600), "auto-answering was stopped for this task");
       if (chain.answers >= cfg.max) return needsUser(paseo, chain, reply.slice(-600), `auto-answer limit reached (${cfg.max})`);
-      return dispatchAnswerer(paseo, chain, reply, cfg);
+      return dispatchAnswerer(paseo, chain, reply, cfg, detail);
     }
     const base = {
       category,
@@ -675,7 +677,13 @@ export function createGate(options: GateOptions): Gate {
 
   // ----- answers -----
 
-  async function dispatchAnswerer(paseo: Paseo, chain: Chain, reply: string, cfg: AnswerConfig): Promise<void> {
+  async function dispatchAnswerer(
+    paseo: Paseo,
+    chain: Chain,
+    reply: string,
+    cfg: AnswerConfig,
+    signal: string | null,
+  ): Promise<void> {
     const policy = JSON.parse(chain.policy_json) as Policy;
     const source = await refreshAgent(paseo, chain.agent_id);
     if (!source) return;
@@ -702,6 +710,7 @@ export function createGate(options: GateOptions): Gate {
         endTree,
         agentReply: truncate(reply, 6000),
         previousQuestion: chain.last_question,
+        signal,
         instructions: cfg.instructions,
       }),
       clientMessageId: key,
@@ -718,7 +727,7 @@ export function createGate(options: GateOptions): Gate {
       {
         answer_child_id: childAgentId,
         answer_dispatch_json: JSON.stringify({ workspaceId: chain.workspace_id, ...payload }),
-        answer_deadline_at: now() + defaultTimeoutMs,
+        answer_deadline_at: now() + Math.min(defaultTimeoutMs, ANSWER_TIMEOUT_MS),
       },
       now(),
     )!;
@@ -767,6 +776,21 @@ export function createGate(options: GateOptions): Gate {
     if (reply.state === "done") {
       await startGate(paseo, taskFromChain(current));
       return endChain(paseo, owner.agentId, { state: "resolved", message: "The agent had finished; nothing to answer." });
+    }
+    if (reply.state === "refused") {
+      const policy = JSON.parse(current.policy_json) as Policy;
+      if (policy.on_outcome.refused === "ignore") return endChain(paseo, owner.agentId, null);
+      await publishChainCard(paseo, current, {
+        category: "refused",
+        state: "notice",
+        question: null,
+        answer: null,
+        message: reply.reason ? truncate(reply.reason, 1000) : null,
+        suggestion: SUGGESTIONS.refused,
+        canStopAnswering: false,
+        permission: null,
+      });
+      return;
     }
     const question = reply.question.trim() || chainCard(current).question || "";
     if (reply.state === "awaiting_user" && reply.decision === "escalate") {
@@ -854,6 +878,18 @@ export function createGate(options: GateOptions): Gate {
         permission: null,
         message: "You replied first; the automatic step was canceled.",
       });
+    }
+    if (chain && chain.card_json) {
+      const card = chainCard(chain);
+      if (card.state === "needs_user" || (card.state === "notice" && card.category !== "done")) {
+        chain = await publishChainCard(paseo, chain, {
+          state: "resolved",
+          canStopAnswering: false,
+          permission: null,
+          message: "You replied; the task continues from your answer.",
+          suggestion: null,
+        });
+      }
     }
     if (chain) {
       pending.set(agentId, {
@@ -1032,10 +1068,10 @@ export function createGate(options: GateOptions): Gate {
     const agent = await refreshAgent(paseo, watched);
     if (!agent) return fail(paseo, run, `agent ${watched} no longer exists`);
     if (agent.status === "running" || agent.status === "initializing") {
-      if (agent.pendingPermissions.length > 0) {
-        ledger.update(run.run_id, { deadline_at: now() + timeoutOf(run) }, now());
-      } else if (run.deadline_at !== null && now() > run.deadline_at) {
-        return fail(paseo, run, `timed out after ${Math.round(timeoutOf(run) / 60000)} minutes`);
+      // A gate never waits forever: time spent waiting for a permission answer counts too.
+      if (run.deadline_at !== null && now() > run.deadline_at) {
+        const waitingOn = agent.pendingPermissions.length > 0 ? " (a permission request was not answered)" : "";
+        return fail(paseo, run, `timed out after ${Math.round(timeoutOf(run) / 60000)} minutes${waitingOn}`);
       }
       return;
     }
@@ -1089,9 +1125,7 @@ export function createGate(options: GateOptions): Gate {
     const child = await refreshAgent(paseo, childId).catch(() => null);
     if (!child) return createAnswerer(paseo, chain); // the create never landed; replay it idempotently
     if (child.status === "running" || child.status === "initializing") {
-      if (child.pendingPermissions.length > 0) {
-        ledger.updateChain(chain.agent_id, { answer_deadline_at: now() + defaultTimeoutMs }, now());
-      } else if (chain.answer_deadline_at !== null && now() > chain.answer_deadline_at) {
+      if (chain.answer_deadline_at !== null && now() > chain.answer_deadline_at) {
         return needsUser(paseo, await cancelChainWork(paseo, chain), undefined, "the answerer timed out");
       }
       return;

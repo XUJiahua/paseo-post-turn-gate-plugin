@@ -38,7 +38,7 @@ export function replyText(items: readonly TurnItem[]): string {
 
 // ponytail: provider error texts, not structured codes; a reworded message falls through to
 // `error` (notify only, never a retry). Upgrade path: structured outcome fields from Paseo (§6).
-const FAILURE_PATTERNS: ReadonlyArray<[Exclude<Category, "done" | "awaiting_user" | "user_canceled" | "replaced" | "error">, RegExp]> = [
+const FAILURE_PATTERNS: ReadonlyArray<[Exclude<Category, "done" | "awaiting_user" | "refused" | "user_canceled" | "replaced" | "error">, RegExp]> = [
   ["crashed", /exited unexpectedly|\bsigkill\b|\bsigterm\b|spawn \S+ enoent/],
   ["context_exhausted", /context (limit|window|length)|too many tokens|maximum context|start a new session/],
   // Checked before rate_limited: "quota exceeded, please wait" must never be retried.
@@ -75,9 +75,32 @@ export function classify(input: {
     }
     return { category: "error", detail: detail || null };
   }
-  return looksLikeQuestion(replyText(turnItems))
-    ? { category: "awaiting_user", detail: null }
-    : { category: "done", detail: null };
+  const signal = stopSignal(turnItems);
+  return signal ? { category: "awaiting_user", detail: signal } : { category: "done", detail: null };
+}
+
+export type StopSignal = "question" | "truncated" | "tool_last" | "todo_pending" | "refused";
+
+const REFUSAL =
+  /^(i('m| am) sorry[,.]?\s*(but\s*)?)?(i\s+)?(can(no|')?t|am unable to|won't|will not|must decline to)\s+(help|assist|do|comply|complete|continue|provide)|^抱歉[，,]?\s*我(无法|不能)|^我(无法|不能)(帮|协助|完成|提供)/i;
+
+/**
+ * Cheap, high-recall pre-screen for "the turn may not really be finished": a question, a reply cut off
+ * mid code block, a turn that ended right after a tool call, unfinished todos, or a refusal.
+ * A hit only means the semantic check (answerer agent) runs; a miss means `done`.
+ * Deliberately not a signal: a reply without final punctuation (too common in normal replies).
+ */
+export function stopSignal(items: readonly (TurnItem & { items?: unknown })[]): StopSignal | null {
+  const reply = replyText(items);
+  const trimmed = reply.trim();
+  if (REFUSAL.test(trimmed.replace(/[*_`>#]+/g, "").trim())) return "refused";
+  if (((trimmed.match(/```/g) ?? []).length % 2) === 1) return "truncated";
+  const last = [...items].reverse().find((item) => item.type === "tool_call" || item.type === "assistant_message");
+  if (last?.type === "tool_call") return "tool_last";
+  const todo = [...items].reverse().find((item) => item.type === "todo");
+  const todoItems = Array.isArray(todo?.items) ? (todo.items as Array<{ completed?: boolean; status?: string }>) : [];
+  if (todoItems.some((entry) => entry.completed === false && entry.status !== "completed")) return "todo_pending";
+  return looksLikeQuestion(reply) ? "question" : null;
 }
 
 const ASKING =
@@ -109,7 +132,8 @@ export function looksLikeQuestion(reply: string): boolean {
 
 export const SUGGESTIONS: Record<Category, string | null> = {
   done: null,
-  awaiting_user: "The agent is waiting for your answer.",
+  awaiting_user: "Reply in the chat to continue; the task picks up from your answer.",
+  refused: "The agent declined the request. Rephrase it or adjust the task, then continue.",
   user_canceled: null,
   replaced: null,
   crashed: "The agent process exited. Send a message to continue; Paseo restarts the session.",
