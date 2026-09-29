@@ -117,7 +117,7 @@ Every turn of a gated agent is sorted into a category, and `on_outcome` in the p
 - The outcome card has a **Stop auto-answering** button.
 - A task that spans several turns (answered questions, retries) is reviewed as a whole, starting from its first turn.
 
-- **Which turns are gated:** root agents, and sub-agents labelled `post-turn-gate.target=true`. A turn is gated only if it completed and changed the working tree.
+- **Which turns are gated:** root agents, and sub-agents labelled `post-turn-gate.target=true`. A turn gets a check, an answerer or a retry only if its task changed the working tree; a turn that only answers a question or asks you one is left alone. So an agent that asks before it starts editing is not auto-answered: tell it in its own instructions to decide routine choices itself.
 - **The child agents:** reviewers, verifiers and answerers run in the same workspace as the source agent and are created as its children.
 - **Permissions:** by default, routine requests from these agents (reading, building, testing, edits inside the repo) are approved automatically, one at a time. Risky requests (`rm -rf`, `git push`, `sudo`, publishing, deploy tools, secrets, paths outside the repo) are shown on the card with a reason and Yes/No buttons. Set `"permissions": "ask"` on a role to answer every request yourself.
 - **Where to find them:** while running, a child agent is listed under the source agent's **Subagents**; when finished it is archived and can be opened from **History**. From a terminal, `paseo logs <id> -f` follows a running one and `paseo logs <id>` shows a finished one; the card prints the command with the id.
