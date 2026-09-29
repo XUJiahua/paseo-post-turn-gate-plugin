@@ -199,12 +199,14 @@ onFixTurnEnded(run, outcome):
 用临时 index 给整个工作区（包括未跟踪、未被忽略的文件）拍快照，不改动真实 index 和工作区：
 
 ```text
-GIT_INDEX_FILE=<tmp> git -C <root> read-tree HEAD   # 空仓库时跳过
+cp --preserve=timestamps <git-path index> <tmp>      # 复用 stat 缓存；新仓库没有 index 就跳过
 GIT_INDEX_FILE=<tmp> git -C <root> add -A
 GIT_INDEX_FILE=<tmp> git -C <root> write-tree        → tree sha
 ```
 
-全部使用 `execFile`，不经过 shell。已验证：连续两次快照结果相同；真实 index 中的暂存状态不受影响；被忽略的文件不计入；改动一个未跟踪文件，tree 会变化。
+- 复制真实 index 而不是 `read-tree HEAD`：后者没有 stat 缓存，每次都要重新哈希整个工作区。
+- 复制时必须保留 mtime：否则 git 的 racy 检测会把同一秒内、大小不变的改动当作未修改。单测在这里踩过坑，已修复。
+- 全部使用 `execFile`，不经过 shell。
 
 ## 5. Reviewer 的权限与工作区改动
 
@@ -264,16 +266,21 @@ CREATE TABLE gate_runs (
   end_tree        TEXT NOT NULL,
   status          TEXT NOT NULL,
   round           INTEGER NOT NULL,
-  child_agent_id  TEXT,
+  child_agent_id  TEXT,              -- 当前轮
+  dispatch_json   TEXT,              -- 本轮 create 的完整参数，恢复时原样重放（同 key 必须同 payload，V9）
+  deadline_at     INTEGER,
   verdict         TEXT,
   result_json     TEXT,
+  reviewer_changes TEXT,             -- Reviewer 改动的 diffstat
   rounds_json     TEXT NOT NULL DEFAULT '[]',
   error           TEXT,
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL
 );
 CREATE INDEX gate_runs_child ON gate_runs(child_agent_id);
-CREATE INDEX gate_runs_source_active ON gate_runs(source_agent_id, status);
+CREATE INDEX gate_runs_source_status ON gate_runs(source_agent_id, status);
+-- 每一轮的子 Agent 在创建前登记，旧轮次子 Agent 的迟到事件也能识别为 managed
+CREATE TABLE gate_children (child_agent_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, round INTEGER NOT NULL);
 ```
 
 在 claim 之前，`turn_started` 到 `turn_ended` 之间的策略快照只放在内存里。hook 本身不会重放，把它持久化没有意义。
@@ -281,9 +288,12 @@ CREATE INDEX gate_runs_source_active ON gate_runs(source_agent_id, status);
 ## 9. 恢复与对账
 
 - **触发时机**：第一次拿到 `context.paseo` 时（任意 hook 或 RPC）；之后只要存在未终结的 run，就每 60 秒检查一次。只扫描 ledger，不扫描历史 Agent。
-- **`DISPATCHING`**：用同一个 id 和 key 重放 create（V9、V10）。成功 → `REVIEWING`；返回 `outcomeUnknown` → 查询子 Agent，存在则进入 `REVIEWING`，否则 `ERROR`。
-- **`REVIEWING`**：`refresh(child)`。仍在 running → 继续等；已 idle → 用 `timeline.refetch({ direction: "tail" })` 取结果并 finalize；超时 → `ERROR`。
-- **`FIXING`**：`refresh(source)`。已 idle，且 timeline 中已有 `ptg:…:fix:<n>` 之后的回复 → 调用 `onFixTurnEnded(completed)`；否则继续等，直到超时。
+- **`DISPATCHING`**：用 `dispatch_json` 中记录的同一份参数（同 id、同 key）重放 create（V9、V10）。成功 → `REVIEWING`；失败时先查询子 Agent，存在则进入 `REVIEWING`，否则 `ERROR`。如果还没来得及记录 `dispatch_json`，就重新 dispatch。
+- **`REVIEWING`**：`refresh(child)`。仍在 running → 继续等（有待处理的权限请求时顺延截止时间）；已 idle → 用 `timeline.refetch({ direction: "tail" })` 取结果并 finalize；超时 → `ERROR`。
+- **`FIXING`**：`refresh(source)`。已 idle 时在 timeline 中查找 `ptg:…:fix:<n>`：
+  - 找不到 → 用同一个 messageId 重发；
+  - 找到，但之后还有其他用户消息 → `SUPERSEDED`；
+  - 找到，且之后没有其他用户消息 → `onFixTurnEnded(completed)`。
 
 `ponytail:` 插件启动后、第一个事件到来之前不会做恢复。要彻底解决，需要给 Paseo 提 PR 暴露 `server.paseo`。
 
@@ -291,7 +301,8 @@ CREATE INDEX gate_runs_source_active ON gate_runs(source_agent_id, status);
 
 ```ts
 timeline.append({ type: "plugin", id: "post-turn-gate:<run_id>", kind: "post-turn-gate", version: 1, data })
-data = { status, action, round, maxFixRounds, summary?, findings?, childAgentId?, childTitle?, error? }
+data = { status, action, round, maxFixRounds, waiting, summary, findings, otherFindings,
+         childAgentId, childTitle, reviewerChanges, error }
 ```
 
 `findings` 只保留阻塞项（CRITICAL/HIGH），其余只给计数，保证数据小于 64 KiB。客户端用 `addTimelineRenderer` 渲染，颜色取 `theme.colors.status*`。
@@ -324,8 +335,10 @@ server/git.ts              # toplevel、tree 快照
 server/ledger.ts           # node:sqlite
 server/prompts.ts
 client/gate-card.tsx
-test/gate.test.ts          # 用 fake paseo 测状态机（node:test）
+server/gate.test.ts        # 真实 git + sqlite、fake paseo 的状态机测试（node:test，npm test）
 ```
+
+`server/` 下的测试文件不会被入口 import，因此不会打进插件包。插件模块之间的 import 带 `.ts` 后缀：Paseo 的 esbuild 能解析，node 的 `--experimental-strip-types` 也能直接运行，不需要额外的测试依赖。
 
 ## 13. 验收标准
 
