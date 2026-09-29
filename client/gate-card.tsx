@@ -1,7 +1,8 @@
 import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
-import { useMemo } from "react";
-import { Text, View } from "react-native";
-import type { CardData, RunStatus } from "../shared/schema.ts";
+import { usePaseo } from "@getpaseo/plugin/client";
+import { useMemo, useState } from "react";
+import { Pressable, Text, View } from "react-native";
+import type { CardData, PermissionCard, RunStatus } from "../shared/schema.ts";
 
 const LABELS: Record<RunStatus, string> = {
   DISPATCHING: "Starting",
@@ -14,6 +15,8 @@ const LABELS: Record<RunStatus, string> = {
   ERROR: "ERROR",
   SUPERSEDED: "Superseded",
 };
+
+const FINISHED: RunStatus[] = ["PASSED", "INCONCLUSIVE", "FAILED", "NEEDS_HUMAN", "ERROR", "SUPERSEDED"];
 
 export function GateCard({ item, theme }: PluginTimelineItemProps<CardData>) {
   const data = item.data;
@@ -35,6 +38,19 @@ export function GateCard({ item, theme }: PluginTimelineItemProps<CardData>) {
       warning: { color: theme.colors.statusWarning, fontWeight: "600" as const },
       danger: { color: theme.colors.statusDanger, fontWeight: "600" as const },
       running: { color: theme.colors.accent, fontWeight: "600" as const },
+      actions: { flexDirection: "row" as const, flexWrap: "wrap" as const, gap: 8 },
+      allow: { paddingVertical: 6, paddingHorizontal: 12, borderRadius: 6, backgroundColor: theme.colors.accent },
+      allowText: { color: theme.colors.accentForeground },
+      deny: {
+        paddingVertical: 6,
+        paddingHorizontal: 12,
+        borderRadius: 6,
+        borderWidth: 1,
+        borderColor: theme.colors.border,
+        backgroundColor: theme.colors.surface2,
+      },
+      denyText: { color: theme.colors.foreground },
+      permission: { gap: 6, padding: 8, borderRadius: 8, backgroundColor: theme.colors.surface2 },
       finding: { gap: 2, paddingLeft: 8, borderLeftWidth: 2, borderLeftColor: theme.colors.statusDanger },
     }),
     [theme],
@@ -58,6 +74,7 @@ export function GateCard({ item, theme }: PluginTimelineItemProps<CardData>) {
         </Text>
         <Text style={data.waiting ? styles.warning : statusStyle}>{status}</Text>
       </View>
+      {data.permission ? <PermissionPrompt permission={data.permission} styles={styles} /> : null}
       {data.summary ? <Text style={styles.body}>{data.summary}</Text> : null}
       {data.findings.map((finding, index) => (
         <View key={`${index}-${finding.title}`} style={styles.finding}>
@@ -84,9 +101,66 @@ export function GateCard({ item, theme }: PluginTimelineItemProps<CardData>) {
       ) : null}
       {data.childAgentId ? (
         <Text style={styles.muted} selectable>
-          {data.childTitle ?? "Reviewer"} · {data.childAgentId} (open it from History)
+          {data.childTitle ?? "Reviewer"} · {data.childAgentId}
+          {FINISHED.includes(data.status) ? " (open it from History)" : " (in this agent's Subagents)"}
         </Text>
       ) : null}
+    </View>
+  );
+}
+
+type Styles = Record<"permission" | "body" | "muted" | "danger" | "actions" | "allow" | "allowText" | "deny" | "denyText", object>;
+
+/** Answers the reviewer's pending permission from the source agent's timeline. */
+function PermissionPrompt({ permission, styles }: { permission: PermissionCard; styles: Styles }) {
+  const paseo = usePaseo();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function answer(action: PermissionCard["actions"][number]) {
+    setBusy(true);
+    setError(null);
+    try {
+      await paseo.agents.ref(permission.agentId).respondToPermission({
+        requestId: permission.requestId,
+        response:
+          action.behavior === "allow"
+            ? { behavior: "allow", ...(action.id ? { selectedActionId: action.id } : {}) }
+            : { behavior: "deny", ...(action.id ? { selectedActionId: action.id } : {}), message: "Denied from the post-turn gate card" },
+      });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <View style={styles.permission}>
+      <Text style={styles.body}>Reviewer asks: {permission.title}</Text>
+      {permission.detail ? (
+        <Text style={styles.muted} selectable>
+          {permission.detail}
+        </Text>
+      ) : null}
+      <View style={styles.actions}>
+        {permission.actions.map((action) => (
+          <Pressable
+            key={`${action.behavior}-${action.id}-${action.label}`}
+            accessibilityRole="button"
+            accessibilityLabel={`${action.label}: ${permission.title}`}
+            accessibilityState={{ disabled: busy }}
+            disabled={busy}
+            style={action.behavior === "allow" ? styles.allow : styles.deny}
+            onPress={() => void answer(action)}
+          >
+            <Text style={action.behavior === "allow" ? styles.allowText : styles.denyText}>{action.label}</Text>
+          </Pressable>
+        ))}
+      </View>
+      {permission.kind === "tool" ? (
+        <Text style={styles.muted}>Denying ends the reviewer's turn on some providers (e.g. kiro).</Text>
+      ) : null}
+      {error ? <Text style={styles.danger}>{error}</Text> : null}
     </View>
   );
 }

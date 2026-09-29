@@ -22,8 +22,8 @@ export default function contribute(server: PluginServerContext) {
   // Handlers only enqueue and return, keeping every hook far below the 30s hook timeout.
   server.on("agent.turn_started", (event, { paseo }) => gate.onTurnStarted(event, capture(paseo)));
   server.on("agent.turn_ended", (event, { paseo }) => gate.onTurnEnded(event, capture(paseo)));
-  server.on("agent.permission_requested", (event, { paseo }) => gate.onPermission(event, capture(paseo), true));
-  server.on("agent.permission_resolved", (event, { paseo }) => gate.onPermission(event, capture(paseo), false));
+  server.on("agent.permission_requested", (event, { paseo }) => gate.onPermission(event, capture(paseo)));
+  server.on("agent.permission_resolved", (event, { paseo }) => gate.onPermission(event, capture(paseo)));
 
   return async () => {
     if (timer) clearInterval(timer);

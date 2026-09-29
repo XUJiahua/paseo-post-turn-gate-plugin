@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { PluginHookContext, PluginLifecycleEvents } from "@getpaseo/plugin/server";
-import type { CardData, Policy, RunStatus, Verdict } from "../shared/schema.ts";
+import type { CardData, PermissionCard, Policy, RunStatus, Verdict } from "../shared/schema.ts";
 import {
   CARD_KIND,
   CARD_VERSION,
@@ -50,7 +50,7 @@ export interface GateOptions {
 export interface Gate {
   onTurnStarted(event: TurnStarted, paseo: Paseo): void;
   onTurnEnded(event: TurnEnded, paseo: Paseo): void;
-  onPermission(event: PermissionRequested | PermissionResolved, paseo: Paseo, waiting: boolean): void;
+  onPermission(event: PermissionRequested | PermissionResolved, paseo: Paseo): void;
   /** Advances unfinished runs from ledger state (startup recovery and timeouts). */
   reconcile(paseo: Paseo): void;
   /** Resolves when all queued work has finished (tests). */
@@ -81,7 +81,8 @@ export function createGate(options: GateOptions): Gate {
   };
   const log = options.log ?? ((message, detail) => console.log(`[post-turn-gate] ${message}`, detail ?? ""));
   const pending = new Map<string, Pending>();
-  const waiting = new Set<string>(); // run ids whose current child waits on a permission answer
+  // Pending permission of each run's current child, shown on the card so it can be answered there.
+  const waiting = new Map<string, PermissionCard>();
 
   // ponytail: one global queue serializes all gate work; a slow agent create delays other agents' events.
   // Upgrade path: per-source-agent queues if this ever becomes a bottleneck.
@@ -109,6 +110,7 @@ export function createGate(options: GateOptions): Gate {
       round: run.round,
       maxFixRounds: policy.review.on_fail === "fix" ? policy.review.max_fix_rounds : 0,
       waiting: waiting.has(run.run_id),
+      permission: waiting.get(run.run_id) ?? null,
       summary: verdict ? truncate(verdict.summary, 2000) : null,
       findings: shown,
       otherFindings: (verdict?.findings.length ?? 0) - shown.length,
@@ -136,6 +138,7 @@ export function createGate(options: GateOptions): Gate {
       round: 0,
       maxFixRounds: 0,
       waiting: false,
+      permission: null,
       summary: null,
       findings: [],
       otherFindings: 0,
@@ -417,12 +420,47 @@ export function createGate(options: GateOptions): Gate {
     await dispatch(paseo, ledger.get(run.run_id)!);
   }
 
-  async function handlePermission(agentId: string, paseo: Paseo, isWaiting: boolean): Promise<void> {
+  async function handlePermission(event: PermissionRequested | PermissionResolved, paseo: Paseo): Promise<void> {
+    const agentId = event.agent.id;
     const owned = ledger.child(agentId);
     if (!owned || owned.run.child_agent_id !== agentId || isTerminal(owned.run.status)) return;
-    if (isWaiting) waiting.add(owned.run.run_id);
-    else waiting.delete(owned.run.run_id);
+    const runId = owned.run.run_id;
+    if ("request" in event) {
+      waiting.set(runId, permissionCard(agentId, event.request));
+    } else if (waiting.get(runId)?.requestId === event.requestId) {
+      waiting.delete(runId);
+    } else {
+      return;
+    }
     await publishCard(paseo, owned.run);
+  }
+
+  function permissionCard(agentId: string, request: PermissionRequested["request"]): PermissionCard {
+    const detail = request.detail as { command?: unknown; filePath?: unknown } | undefined;
+    const text =
+      typeof detail?.command === "string"
+        ? detail.command
+        : typeof detail?.filePath === "string"
+          ? detail.filePath
+          : (request.description ?? null);
+    const actions = (request.actions ?? []).map((action) => ({
+      id: action.id,
+      label: action.label,
+      behavior: action.behavior,
+    }));
+    return {
+      agentId,
+      requestId: request.id,
+      kind: request.kind,
+      title: truncate(request.title ?? request.name, 300),
+      detail: text ? truncate(text, 1000) : null,
+      actions: actions.length > 0
+        ? actions
+        : [
+            { id: "", label: "Allow", behavior: "allow" },
+            { id: "", label: "Deny", behavior: "deny" },
+          ],
+    };
   }
 
   // ---------- recovery ----------
@@ -476,8 +514,7 @@ export function createGate(options: GateOptions): Gate {
   return {
     onTurnStarted: (event, paseo) => enqueue("turn_started", () => handleTurnStarted(event, paseo)),
     onTurnEnded: (event, paseo) => enqueue("turn_ended", () => handleTurnEnded(event, paseo)),
-    onPermission: (event, paseo, isWaiting) =>
-      enqueue("permission", () => handlePermission(event.agent.id, paseo, isWaiting)),
+    onPermission: (event, paseo) => enqueue("permission", () => handlePermission(event, paseo)),
     reconcile: (paseo) =>
       enqueue("reconcile", async () => {
         for (const run of ledger.active()) {

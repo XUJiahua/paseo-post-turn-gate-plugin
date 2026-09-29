@@ -81,12 +81,23 @@ export const TERMINAL_STATUSES: readonly RunStatus[] = [
 export const CARD_KIND = "post-turn-gate";
 export const CARD_VERSION = 1;
 
+export const permissionCardSchema = z.object({
+  agentId: z.string(),
+  requestId: z.string(),
+  kind: z.string(),
+  title: z.string(),
+  detail: z.string().nullable(),
+  actions: z.array(z.object({ id: z.string(), label: z.string(), behavior: z.enum(["allow", "deny"]) })),
+});
+export type PermissionCard = z.output<typeof permissionCardSchema>;
+
 export const cardSchema = z.object({
   status: runStatusSchema,
   action: z.enum(["verify", "review"]).nullable(),
   round: z.number().int(),
   maxFixRounds: z.number().int(),
   waiting: z.boolean(),
+  permission: permissionCardSchema.nullable(),
   summary: z.string().nullable(),
   findings: z.array(findingSchema),
   otherFindings: z.number().int(),

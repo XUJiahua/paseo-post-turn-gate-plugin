@@ -353,12 +353,36 @@ describe("dispatch and report", () => {
     writePolicy({ version: 1, action: "review" });
     await sourceTurn({ change: edit });
     const childId = fake.created[0].agentId;
-    gate.onPermission({ agent: hookAgent(childId, SOURCE), request: {} } as never, fake.paseo, true);
+    const request = {
+      id: "req-1",
+      name: "execute",
+      kind: "tool",
+      title: "Running: git diff --stat",
+      detail: { type: "shell", command: "git diff --stat" },
+      actions: [
+        { id: "allow_once", label: "Yes", behavior: "allow" },
+        { id: "allow_always", label: "Always", behavior: "allow" },
+        { id: "reject_once", label: "No", behavior: "deny" },
+      ],
+    };
+    gate.onPermission({ agent: hookAgent(childId, SOURCE), request } as never, fake.paseo);
     await gate.idle();
     assert.equal(onlyRun().waiting, true);
-    gate.onPermission({ agent: hookAgent(childId, SOURCE), requestId: "r", resolution: {} } as never, fake.paseo, false);
+    assert.deepEqual(onlyRun().permission, {
+      agentId: childId,
+      requestId: "req-1",
+      kind: "tool",
+      title: "Running: git diff --stat",
+      detail: "git diff --stat",
+      actions: request.actions,
+    });
+    gate.onPermission({ agent: hookAgent(childId, SOURCE), requestId: "other", resolution: {} } as never, fake.paseo);
+    await gate.idle();
+    assert.equal(onlyRun().waiting, true, "resolving a different request keeps the prompt");
+    gate.onPermission({ agent: hookAgent(childId, SOURCE), requestId: "req-1", resolution: {} } as never, fake.paseo);
     await gate.idle();
     assert.equal(onlyRun().waiting, false);
+    assert.equal(onlyRun().permission, null);
   });
 
   test("a user message during review supersedes the run and stops the reviewer", async () => {
