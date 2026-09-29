@@ -629,11 +629,11 @@ export function createGate(options: GateOptions): Gate {
     });
   }
 
-  /** Starts a review/verify of the task's changes (no-op for action "none" or an unchanged tree). */
-  async function startGate(paseo: Paseo, task: Task): Promise<void> {
+  /** Starts a review/verify of the task's changes (no-op without checks or for an unchanged tree). */
+  async function startGate(paseo: Paseo, task: Task, knownEndTree?: string): Promise<void> {
     const checks = gateChecks(task.policy);
     if (checks.length === 0) return;
-    const endTree = await snapshotTree(task.repoRoot);
+    const endTree = knownEndTree ?? (await snapshotTree(task.repoRoot));
     if (endTree === task.baseTree) return log(`skip ${task.agentId}: working tree unchanged`);
     const run = {
       run_id: randomUUID(),
@@ -664,8 +664,15 @@ export function createGate(options: GateOptions): Gate {
     if (category === "user_canceled") {
       return endChain(paseo, task.agentId, { state: "stopped", message: "You stopped the agent." });
     }
+    // A task that has not changed the working tree (a question, an explanation) is left alone:
+    // no checks, no answerer, no retry. The user is in the conversation and answers it.
+    const endTree = await snapshotTree(task.repoRoot);
+    if (endTree === task.baseTree) {
+      log(`skip ${task.agentId}: working tree unchanged (${category})`);
+      return endChain(paseo, task.agentId, { state: "resolved", message: "The task ended without changing files." });
+    }
     if (category === "done" || (category === "awaiting_user" && action === "as_done")) {
-      if (gateChecks(task.policy).length > 0) await startGate(paseo, task);
+      if (gateChecks(task.policy).length > 0) await startGate(paseo, task, endTree);
       else if (task.policy.on_outcome.done === "notify") {
         await publishChainCard(paseo, ensureChain(task), { category: "done", state: "notice", message: "The agent finished its turn." });
       }

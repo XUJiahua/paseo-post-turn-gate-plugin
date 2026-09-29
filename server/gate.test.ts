@@ -712,6 +712,16 @@ describe("turn outcomes: answers, retries, chains", () => {
     assert.equal(outcomeCard().state, "resolved");
   });
 
+  test("a turn that changed no files gets no answerer, retry or card", async () => {
+    writePolicy({ version: 2, on_outcome: { network: { retry: { max: 2, delay_seconds: 5 } } } });
+    await sourceTurn({ text: "Is the verifier like codex /goal?", reply: "Want me to build it? Your call." });
+    await sourceTurn({ messageId: "m2", outcome: { kind: "failed", error: { message: "fetch failed: ECONNRESET" } } });
+    assert.equal(answerers().length, 0);
+    assert.equal(fake.created.length, 0);
+    assert.equal(fake.cards.size, 0);
+    assert.equal(fake.sent.length, 0);
+  });
+
   test("escalation, risky answers, repeated questions and the limit go to the user", async () => {
     writePolicy({ version: 2, on_outcome: { awaiting_user: { answer: { max: 2 } } } });
     await sourceTurn({ change: edit, reply: "Should I pick A or B?", messageId: "m1" });
