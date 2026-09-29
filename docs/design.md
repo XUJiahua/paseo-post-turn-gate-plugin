@@ -49,7 +49,7 @@
 | K8 | `shell` + `allowedCommands` + `denyByDefault: true` | 名单外的命令被 kiro **直接拒绝，不弹权限请求**，模型收到 “Command not in allowed list” 后继续这一轮；`git status > pwn1.txt` 这类重定向会被拒；`git log` 正常放行 | 实测 |
 | K9 | 源 Agent 使用 `kiro_default` | 写文件时会发权限请求（本次探针自动放行） | 实测 |
 | K10 | Reviewer 完整继承源 Agent 配置 | 用 `provider: "kiro/claude-opus-4.8"`、`modeId: "kiro_default"`、`featureValues: { auto_accept: false }` 创建，子 Agent 快照中三项与源 Agent 一致 | 实测 |
-| K11 | Reviewer 等待授权 | 收到 `permission_requested` 时，`refresh()` 显示 `status: "running"`、`pendingPermissions.length === 1`、`attentionReason: null`。用户（探针模拟）延迟 2s 放行后收到 `permission_resolved`，这一轮继续完成 | 实测 |
+| K11 | Reviewer 等待授权（`permissions: "auto"` 的依据：插件调用 `respondToPermission` 放行后这一轮继续） | 收到 `permission_requested` 时，`refresh()` 显示 `status: "running"`、`pendingPermissions.length === 1`、`attentionReason: null`。用户（探针模拟）延迟 2s 放行后收到 `permission_resolved`，这一轮继续完成 | 实测 |
 | K12 | Reviewer 跑命令、改文件 | shell（`node -e …`）和 edit 均放行后执行；最后一条消息仍是可直接 `JSON.parse` 的 verdict；tree 对比得到 diffstat `reviewer-note.txt \| 1 +` | 实测 |
 | K13 | fix 轮 | Reviewer 结束后源 Agent 为 `idle`；`send(text, { messageId: "ptg:run-1:fix:1" })` 触发的新轮 `turn_ended` 中，最后一条 `user_message.messageId` 即为该值；`git diff base fix` 同时包含源 Agent 的修复和 Reviewer 的改动 | 实测 |
 
@@ -114,7 +114,8 @@
   "provider": "codex", "model": "gpt-5.5", "mode": "auto-review", "thinking": "high",
   "features": { "fast_mode": false },
   "instructions": "Also check that every public function has a test.",
-  "timeout_minutes": 45
+  "timeout_minutes": 45,
+  "permissions": "auto"
 }
 ```
 
@@ -257,7 +258,12 @@ Reviewer 不强制只读，与源 Agent 采用相同的权限模型：
 - **检测**：review 前后对比 tree（§4.4）。发生变化时，卡片显示 “Reviewer 修改了 N 个文件” 和 diffstat，verdict 照常采用（K12 已在 kiro 上实测）。
   - report 模式：改动留在工作区，由用户决定是否保留；
   - fix 模式：下一轮的 `end_tree` 在修复轮结束后重新计算，Reviewer 的改动会一起进入下一次 review 的 diff 范围，不会被遗漏。
-- **权限请求**：由用户处理（§4.2）。等待授权的时间不计入超时（§9）。
+- **权限请求**：默认自动处理（`reviewer.permissions: "auto"`）。引入 gate 的目的就是减少人工反复确认，因此：
+  - 常规工具调用（读文件、搜索、构建、跑测试、仓库内编辑）由插件以 `allow_once` 自动批准，不留长期授权；
+  - 不可逆、对外、提权、涉及凭据的请求（`rm -rf`、`git push/reset --hard`、`sudo`、发布、云/部署工具、`curl | sh`、破坏性 SQL、仓库外路径、`.env`/私钥等），以及 plan、question、mode 类请求，不自动批准，显示在卡片上，附带原因和按钮，由用户决定；
+  - 规则在 `server/permissions.ts`，是模式列表而不是 shell 解析器，用 `ponytail:` 注明了上限；
+  - `reviewer.permissions: "ask"` 可恢复为每个请求都问用户；
+  - 卡片显示已自动批准的次数。等待用户期间不计入超时（§9）。
 
 `ponytail:` 这里只能事后发现改动，不能事前阻止。需要硬约束时，可以按 provider 增加只读 mode 映射，作为后续可选项。kiro 已验证可行的做法（K7、K8）：单独建一个 agent，`tools` 中不包含 `write`；shell 设置 `allowedCommands: ["git (status|diff|log|show)( .*)?"]` 和 `denyByDefault: true`；`includeMcpJson: false`。这样做的代价是 Verify 无法再运行测试。
 
@@ -375,6 +381,7 @@ server/git.ts              # toplevel、tree 快照
 server/ledger.ts           # node:sqlite
 server/prompts.ts
 server/reviewer.ts         # 源 Agent / profile / 显式字段的分层解析
+server/permissions.ts      # 托管 Agent 权限请求的自动批准 / 上交规则
 scripts/create-agent-profiles.mjs  # 创建 reviewer/verifier agent profile（经 paseo CLI）
 client/gate-card.tsx
 server/gate.test.ts        # 真实 git + sqlite、fake paseo 的状态机测试（node:test，npm test）

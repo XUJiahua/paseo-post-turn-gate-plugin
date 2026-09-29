@@ -63,7 +63,7 @@ This creates or updates `post-turn-gate-reviewer` and `post-turn-gate-verifier` 
 
 - **Which turns are gated:** root agents, and sub-agents labelled `post-turn-gate.target=true`. A turn is gated only if it completed and changed the working tree.
 - **The reviewer agent:** it inherits the source agent's provider, model, mode, thinking and features. It runs in the same workspace as the source agent and is created as its child.
-- **Permissions:** if the reviewer asks for a permission, you answer it, the same way you would for the source agent.
+- **Permissions:** by default, routine requests from the reviewer (reading, building, testing, edits inside the repo) are approved automatically, one at a time. Risky requests (`rm -rf`, `git push`, `sudo`, publishing, deploy tools, secrets, paths outside the repo) are shown on the card with a reason and Yes/No buttons. Set `"reviewer": { "permissions": "ask" }` to answer every request yourself.
 - **Where to find reviewers:** finished reviewers are archived and can still be opened from **History**.
 - **Where state lives:** in `${PASEO_HOME:-~/.paseo}/plugin-data/post-turn-gate/ledger.sqlite`.
 

@@ -208,4 +208,4 @@ data = { category, message, suggestion, attempt, maxAttempts, nextRetryAt }
 
 - **现象**：卡片显示 “Waiting for permission”，但无法操作。Reviewer 第一条 `git diff --stat` 在 `kiro_default` 模式下需要授权；卡片上没有按钮，Reviewer 又在源 Agent 的 Subagents 里，用户不容易找到。之后用户发了新消息，run 变为 `SUPERSEDED`，Reviewer 被归档。
 - **修复**：卡片直接显示待处理的请求（标题、命令或路径），并按 provider 给出的 actions 渲染按钮（kiro 为 Yes / Always / No），点击后调用 `respondToPermission` 回答 Reviewer。Timeline renderer 运行在插件的 `PaseoApiProvider` 之下，可以使用 `usePaseo()`（源码 `app/src/plugins/timeline/view.tsx`）。拒绝会结束 kiro 这一轮（K6），卡片上有提示。运行中的卡片不再显示 “open it from History”，改为指向 Subagents。
-- **降低打扰**：reviewer / answerer profile 可以开启 `auto_accept`（`npm run profiles -- --feature auto_accept=true`），前提是接受 Reviewer 自动执行命令。命令行下也可以用 `paseo permit ls` / `paseo permit allow <agent>` 回答。
+- **降低打扰（已实现）**：托管 Agent 的权限请求默认由插件按 `server/permissions.ts` 自动处理，常规请求自动批准，高风险请求才上卡片，见 design.md §5。answerer 与 retry 触发的轮次适用同一规则。不使用 provider 的 `auto_accept`，因为它会连高风险命令一起放行。
