@@ -198,6 +198,26 @@ data = { category, message, suggestion, attempt, maxAttempts, nextRetryAt }
 5. 代答：预筛 + post-turn Agent（判定与回答合一）、escalate 规则、死循环保护、`--role answerer` profile。
 6. 端到端：用 kiro 复现 E2–E6，确认卡片、代答与重试；E6 可以在重试前撤掉代理，验证“重试后完成 → gate 使用原始基线”。
 
+## 7.1 实现状态（2026-09-29）
+
+§7 的第 1–5 项已实现：`server/outcome.ts`（分类、预筛、相似度）、`shared/schema.ts`（`on_outcome`）、`server/gate.ts`（分派、任务链、代答、重试、对账）、`server/ledger.ts`（`chains`、`chain_children` 表）、`client/outcome-card.tsx`，以及 profile 脚本的 `--role answerer`。单测 53 个，其中 E1–E6 和 S4 使用真实的 kiro payload 和措辞。
+
+真实 kiro-cli 端到端：
+
+- **代答链路**：Agent 被要求先问语言再动手 → 分类为 `awaiting_user` → answerer 回答 “Use Python — create hello.py …” → 以 `ptg:answer:<chain>:1` 发回 → 源 Agent 写出 `hello.py` → `done` → review 判 PASS。整个过程无人参与，基线取自链的第一轮。
+- **按规则转交**：策略没有 `instructions` 时，answerer 以“用户明确要求征求他本人的意见、语言属于个人偏好”为由 escalate，卡片进入 needs_user。这符合 §3.1。
+- **网络失败**：结果为 `network` 类别的 notice 卡片（包含 `dispatch failure` 原文），默认不自动重试。
+
+与设计的差异：
+
+- 结束原因卡片按任务链复用一张（id 为 `post-turn-gate:outcome:<chainId>`），不再按轮次各写一张。重试、代答、结束都在同一张卡片上原地更新。
+- 死循环保护的相似度阈值定为 0.5（字符 bigram Jaccard），宁可多转交给用户，也不要循环。
+- **修复了一个已有 bug**：被打断的场景下（E4），新一轮的 `turn_started` 比旧一轮的 `turn_ended` 先到，旧的结束事件会把新一轮的快照删掉，导致新一轮不被 review。现在 pending 带 `turnId`，只由同一个 turn 消费；并且新一轮沿用被打断那一轮的基线，保证被打断那一轮的改动也在 review 范围内。
+- answerer 的配置：`answer.profile` → 已存在的 `post-turn-gate-answerer` profile → `reviewer` 配置，逐级回退。
+- 重试时，源 Agent 状态为 `idle` 或 `error` 都允许发送：失败后的状态是 `error`（E5、E6）。
+- `action: "none"` 时 `on_outcome` 仍然生效（代答、重试、通知），只是不做 review。
+- messageId 前缀：answerer 自己的 prompt 用 `ptg:ask:`，发给源 Agent 的代答用 `ptg:answer:`，重试用 `ptg:retry:`，fix 轮保持 `ptg:<run>:fix:<n>`。
+
 ## 8. 已确认的决定（2026-09-29）
 
 - `awaiting_user` 默认由 post-turn Agent 代答（§3.1），不能代答时 escalate 给用户。
