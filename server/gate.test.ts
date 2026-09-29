@@ -38,6 +38,7 @@ function createFakePaseo() {
   const archived: string[] = [];
   const answered: Array<{ agentId: string; requestId: string; response: Record<string, unknown> }> = [];
   const cards = new Map<string, CardData>();
+  const cardAppends: Array<{ agentId: string; id: string; data: CardData }> = [];
   let failCreate = false;
   const profiles: Array<Record<string, unknown>> = [];
   const api = {
@@ -57,6 +58,7 @@ function createFakePaseo() {
         },
         timeline: {
           append: async (item: { id: string; data: CardData }) => {
+            cardAppends.push({ agentId: id, ...item });
             cards.set(item.id, item.data);
             return { seq: 0, epoch: "e" };
           },
@@ -92,6 +94,7 @@ function createFakePaseo() {
     archived,
     answered,
     cards,
+    cardAppends,
     profiles,
     setFailCreate: (value: boolean) => {
       failCreate = value;
@@ -201,8 +204,10 @@ async function childTurn(childId: string, reply: string, change?: () => void) {
 
 const onlyRun = () => {
   const runs = [...fake.cards.entries()].filter(([id]) => !id.startsWith("post-turn-gate:config:") && !id.startsWith("post-turn-gate:outcome:"));
-  assert.equal(runs.length, 1, "expected exactly one run card");
-  return runs[0][1];
+  assert.ok(runs.length > 0, "expected a run card");
+  const logicalRuns = new Set(runs.map(([id]) => id.replace(/:round:\d+$/, "")));
+  assert.equal(logicalRuns.size, 1, "expected exactly one logical gate run");
+  return runs.at(-1)![1];
 };
 
 beforeEach(() => {
@@ -567,6 +572,12 @@ describe("fix loop", () => {
     assert.equal(baseOf(fake.created[1].prompt)[1], baseOf(fake.created[0].prompt)[1], "same base tree");
     assert.notEqual(baseOf(fake.created[1].prompt)[2], baseOf(fake.created[0].prompt)[2], "new end tree");
     assert.equal(onlyRun().round, 2);
+
+    const round1CardIds = new Set(fake.cardAppends.filter((item) => item.data.round === 1).map((item) => item.id));
+    const round2CardIds = new Set(fake.cardAppends.filter((item) => item.data.round === 2).map((item) => item.id));
+    assert.equal(round1CardIds.size, 1);
+    assert.equal(round2CardIds.size, 1);
+    assert.notEqual([...round2CardIds][0], [...round1CardIds][0], "round 2 gets a new timeline card");
 
     await childTurn(fake.created[1].agentId, PASS);
     assert.equal(onlyRun().status, "PASSED");

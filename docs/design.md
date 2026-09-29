@@ -382,10 +382,12 @@ CREATE TABLE gate_children (child_agent_id TEXT PRIMARY KEY, run_id TEXT NOT NUL
 ## 10. Timeline 卡片
 
 ```ts
-timeline.append({ type: "plugin", id: "post-turn-gate:<run_id>", kind: "post-turn-gate", version: 1, data })
+timeline.append({ type: "plugin", id: "post-turn-gate:<run_id>:round:<round>", kind: "post-turn-gate", version: 1, data })
 data = { status, action, round, maxFixRounds, waiting, summary, findings, otherFindings,
          childAgentId, childTitle, reviewerChanges, error }
 ```
+
+每轮使用独立的 timeline item id：同一轮的状态原位更新，修复后的下一轮在时间线当前位置新增卡片。
 
 `findings` 只保留阻塞项（CRITICAL/HIGH），其余只给计数，保证数据小于 64 KiB。客户端用 `addTimelineRenderer` 渲染，颜色取 `theme.colors.status*`。
 

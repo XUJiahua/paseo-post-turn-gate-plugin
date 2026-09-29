@@ -203,7 +203,9 @@ export function createGate(options: GateOptions): Gate {
   async function publishCard(paseo: Paseo, run: Run): Promise<void> {
     await paseo.agents.ref(run.source_agent_id).timeline.append({
       type: "plugin",
-      id: `post-turn-gate:${run.run_id}`,
+      // Keep updates for one round in place, but start each retry round at the current timeline position.
+      // Reusing only run_id makes Paseo update round 1's old card while round 2 appears card-less.
+      id: `post-turn-gate:${run.run_id}:round:${run.round}`,
       kind: CARD_KIND,
       version: CARD_VERSION,
       data: cardData(run),
