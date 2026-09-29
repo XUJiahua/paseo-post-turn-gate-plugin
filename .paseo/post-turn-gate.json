@@ -1,7 +1,48 @@
 {
-  "version": 1,
-  "action": "review",
+  "version": 2,
   "trigger": "root_and_opt_in",
-  "review": { "on_fail": "report", "max_fix_rounds": 2 },
-  "reviewer": { "profile": "post-turn-gate-reviewer" }
+  "on_fail": {
+    "fix": {
+      "max_rounds": 2
+    }
+  },
+  "agents": {
+    "reviewer": {
+      "profile": "post-turn-gate-reviewer",
+      "instructions_file": ".paseo/post-turn-gate/reviewer.md",
+      "permissions": "auto",
+      "timeout_minutes": 30
+    },
+    "verifier": {
+      "profile": "post-turn-gate-verifier",
+      "instructions_file": ".paseo/post-turn-gate/verifier.md",
+      "permissions": "auto",
+      "timeout_minutes": 30
+    },
+    "answerer": {
+      "profile": "post-turn-gate-answerer",
+      "instructions_file": ".paseo/post-turn-gate/answerer.md",
+      "permissions": "auto",
+      "timeout_minutes": 10
+    }
+  },
+  "on_outcome": {
+    "done": [
+      "review"
+    ],
+    "awaiting_user": {
+      "answer": {
+        "max": 3
+      }
+    },
+    "refused": "notify",
+    "user_canceled": "ignore",
+    "replaced": "ignore",
+    "crashed": "notify",
+    "network": "notify",
+    "rate_limited": "notify",
+    "quota_exhausted": "notify",
+    "context_exhausted": "notify",
+    "error": "notify"
+  }
 }
