@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
@@ -216,7 +216,7 @@ beforeEach(() => {
   fake = createFakePaseo();
   fake.agents.set(SOURCE, sourceAgent());
   clock = 1_000;
-  gate = createGate({ ledger, now: () => clock, reviewTimeoutMs: 1_000, log: () => {} });
+  gate = createGate({ ledger, now: () => clock, minuteMs: 1_000 / 30, log: () => {} });
 });
 
 afterEach(() => {
@@ -237,32 +237,32 @@ describe("trigger", () => {
     assert.equal(fake.created.length, 0);
   });
 
-  test("action none, unchanged workspace, or non-completed turns do not dispatch", async () => {
-    writePolicy({ version: 1, action: "none" });
+  test("done ignore, unchanged workspace, or non-completed turns do not dispatch", async () => {
+    writePolicy({ version: 2, on_outcome: { done: "ignore" } });
     await sourceTurn({ change: edit, messageId: "a" });
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     await sourceTurn({ messageId: "b" }); // policy rewritten before turn_started, but no change during the turn
     await sourceTurn({ change: () => writeFileSync(path.join(repo, "a.txt"), "three\n"), messageId: "c", outcome: { kind: "canceled", reason: "x" } });
     assert.equal(fake.created.length, 0);
   });
 
   test("invalid policy shows a config error card and starts nothing", async () => {
-    writePolicy({ version: 1, action: "review", review: { on_fail: "retry" } });
+    writePolicy({ version: 2, on_fail: "retry" });
     await sourceTurn({ change: edit });
     assert.equal(fake.created.length, 0);
     const card = fake.cards.get(`post-turn-gate:config:${SOURCE}`);
     assert.equal(card?.status, "ERROR");
-    assert.match(card?.error ?? "", /review\.on_fail/);
+    assert.match(card?.error ?? "", /on_fail/);
   });
 
   test("the policy is frozen at turn start", async () => {
-    writePolicy({ version: 1, action: "review" });
-    await sourceTurn({ change: () => { edit(); writePolicy({ version: 1, action: "none" }); } });
+    writePolicy({ version: 2 });
+    await sourceTurn({ change: () => { edit(); writePolicy({ version: 2, on_outcome: { done: "ignore" } }); } });
     assert.equal(fake.created.length, 1);
   });
 
   test("sub-agents need the target label; managed agents never trigger", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     fake.agents.set("sub", sourceAgent({ id: "sub" }));
     await sourceTurn({ agentId: "sub", parentAgentId: SOURCE, change: edit, messageId: "s1" });
     assert.equal(fake.created.length, 0);
@@ -277,14 +277,14 @@ describe("trigger", () => {
   });
 
   test("root_only ignores labelled sub-agents", async () => {
-    writePolicy({ version: 1, action: "review", trigger: "root_only" });
+    writePolicy({ version: 2, trigger: "root_only" });
     fake.agents.set("sub", sourceAgent({ id: "sub", labels: { "post-turn-gate.target": "true" } }));
     await sourceTurn({ agentId: "sub", parentAgentId: SOURCE, change: edit });
     assert.equal(fake.created.length, 0);
   });
 
   test("the same source turn creates one run", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     await sourceTurn({ change: edit, messageId: "same" });
     await sourceTurn({ change: () => writeFileSync(path.join(repo, "a.txt"), "again\n"), messageId: "same" });
     assert.equal(fake.created.length, 1);
@@ -293,7 +293,7 @@ describe("trigger", () => {
 
 describe("dispatch and report", () => {
   test("reviewer inherits the source config, runs in its workspace, and FAIL is reported", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2, on_fail: "report" });
     await sourceTurn({ change: edit });
 
     assert.equal(fake.created.length, 1);
@@ -324,7 +324,7 @@ describe("dispatch and report", () => {
   });
 
   test("PASS and verify role", async () => {
-    writePolicy({ version: 1, action: "verify" });
+    writePolicy({ version: 2, on_outcome: { done: ["verify"] } });
     await sourceTurn({ change: edit });
     assert.equal(fake.created[0].labels["post-turn-gate.role"], "verifier");
     assert.match(fake.created[0].prompt, /VERIFIER/);
@@ -332,8 +332,91 @@ describe("dispatch and report", () => {
     assert.equal(onlyRun().status, "PASSED");
   });
 
+  test("several checks run in order; all must pass", async () => {
+    writePolicy({ version: 2, on_outcome: { done: ["verify", "review"] } });
+    await sourceTurn({ change: edit });
+    const role = (index: number) => fake.created[index].labels["post-turn-gate.role"];
+    assert.equal(role(0), "verifier");
+    await childTurn(fake.created[0].agentId, PASS);
+    assert.equal(fake.created.length, 2);
+    assert.equal(role(1), "reviewer");
+    assert.equal(onlyRun().status, "REVIEWING");
+    assert.deepEqual(onlyRun().checks.map((row) => row.state), ["PASS", "running"]);
+    await childTurn(fake.created[0].agentId, FAIL); // a late reply from the finished verifier is stale
+    assert.equal(onlyRun().status, "REVIEWING");
+    await childTurn(fake.created[1].agentId, JSON.stringify({ verdict: "INCONCLUSIVE", summary: "no tests", findings: [] }));
+    assert.equal(onlyRun().status, "INCONCLUSIVE");
+    assert.deepEqual(onlyRun().checks.map((row) => row.state), ["PASS", "INCONCLUSIVE"]);
+  });
+
+  test("the first failing check stops the round; a fix round starts again from the first check", async () => {
+    writePolicy({ version: 2, on_fail: { fix: { max_rounds: 1 } }, on_outcome: { done: ["verify", "review"] } });
+    await sourceTurn({ change: edit });
+    await childTurn(fake.created[0].agentId, FAIL);
+    assert.equal(fake.created.length, 1, "review is not started after verify failed");
+    assert.equal(onlyRun().status, "FIXING");
+    const runId = fake.sent[0].messageId!.split(":")[1];
+    await sourceTurn({ messageId: `ptg:${runId}:fix:1`, change: () => writeFileSync(path.join(repo, "a.txt"), "fixed\n") });
+    assert.equal(fake.created[1].labels["post-turn-gate.role"], "verifier");
+    assert.deepEqual(onlyRun().checks.map((row) => row.state), ["running", "pending"]);
+  });
+
+  test("a missing default profile falls back to the source agent with a note; null skips profiles", async () => {
+    writePolicy({ version: 2 });
+    await sourceTurn({ change: edit, messageId: "a" });
+    assert.match(onlyRun().note ?? "", /post-turn-gate-reviewer" does not exist/);
+    await childTurn(fake.created[0].agentId, PASS);
+    fake.cards.clear();
+    writePolicy({ version: 2, agents: { reviewer: { profile: null } } });
+    await sourceTurn({ change: () => writeFileSync(path.join(repo, "b.txt"), "b"), messageId: "b" });
+    assert.equal(onlyRun().note, null);
+  });
+
+  test("rules files in the repository are appended to the role prompt, frozen at turn start", async () => {
+    mkdirSync(path.join(repo, ".paseo/post-turn-gate"), { recursive: true });
+    writeFileSync(path.join(repo, ".paseo/post-turn-gate/reviewer.md"), "Money is always integer cents.\n");
+    writePolicy({ version: 2, agents: { reviewer: { instructions: "Also read the README." } } });
+    await sourceTurn({ change: () => { edit(); writeFileSync(path.join(repo, ".paseo/post-turn-gate/reviewer.md"), "changed mid-turn"); } });
+    assert.match(fake.created[0].prompt, /Money is always integer cents\.\n\nAlso read the README\./);
+    assert.doesNotMatch(fake.created[0].prompt, /changed mid-turn/);
+  });
+
+  test("npm run init writes rule templates that add nothing until the user writes a rule", async () => {
+    execFileSync(process.execPath, ["--experimental-strip-types", "--no-warnings", "scripts/init-policy.ts", "--dir", repo]);
+    await sourceTurn({ change: edit, messageId: "a" });
+    assert.doesNotMatch(fake.created[0].prompt, /Additional instructions/, "an untouched template is only comments");
+    await childTurn(fake.created[0].agentId, PASS);
+    const rules = path.join(repo, ".paseo/post-turn-gate/reviewer.md");
+    writeFileSync(rules, `${readFileSync(rules, "utf8")}\n- Money is integer cents.\n`);
+    await sourceTurn({ change: () => writeFileSync(path.join(repo, "b.txt"), "b"), messageId: "b" });
+    assert.match(fake.created[1].prompt, /<<<INSTRUCTIONS\n- Money is integer cents\.\nINSTRUCTIONS>>>/);
+  });
+
+  test("a named rules file must exist and stay inside the repository", async () => {
+    writePolicy({ version: 2, agents: { verifier: { instructions_file: "docs/missing.md" } } });
+    await sourceTurn({ change: edit, messageId: "a" });
+    assert.match(fake.cards.get(`post-turn-gate:config:${SOURCE}`)?.error ?? "", /agents\.verifier\.instructions_file: cannot read/);
+    writePolicy({ version: 2, agents: { verifier: { instructions_file: "../outside.md" } } });
+    await sourceTurn({ change: () => writeFileSync(path.join(repo, "b.txt"), "b"), messageId: "b" });
+    assert.match(fake.cards.get(`post-turn-gate:config:${SOURCE}`)?.error ?? "", /inside the repository/);
+    assert.equal(fake.created.length, 0);
+  });
+
+  test("each role uses its own profile when it exists and the policy names none", async () => {
+    fake.profiles.push(
+      { id: "post-turn-gate-reviewer", name: "Gate reviewer", provider: "codex", model: "gpt-5.5" },
+      { id: "post-turn-gate-verifier", name: "Gate verifier", provider: "claude", model: "opus" },
+    );
+    writePolicy({ version: 2, on_outcome: { done: ["verify"] } });
+    await sourceTurn({ change: edit, messageId: "v" });
+    assert.equal(fake.created[0].config.provider, "claude/opus");
+    writePolicy({ version: 2 });
+    await sourceTurn({ change: () => writeFileSync(path.join(repo, "b.txt"), "b"), messageId: "r" });
+    assert.equal(fake.created.at(-1)?.config.provider, "codex/gpt-5.5");
+  });
+
   test("an unparseable reply is an ERROR, never a PASS", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     await sourceTurn({ change: edit });
     await childTurn(fake.created[0].agentId, "Looks fine to me!");
     assert.equal(onlyRun().status, "ERROR");
@@ -341,7 +424,7 @@ describe("dispatch and report", () => {
   });
 
   test("workspace edits by the reviewer are reported but do not change the verdict", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     await sourceTurn({ change: edit });
     await childTurn(fake.created[0].agentId, PASS, () => writeFileSync(path.join(repo, "note.txt"), "x\n"));
     const card = onlyRun();
@@ -350,7 +433,7 @@ describe("dispatch and report", () => {
   });
 
   test("a failed create is an ERROR", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     fake.setFailCreate(true);
     await sourceTurn({ change: edit });
     assert.equal(onlyRun().status, "ERROR");
@@ -358,7 +441,7 @@ describe("dispatch and report", () => {
   });
 
   test("permission waits are shown on the card (permissions: ask)", async () => {
-    writePolicy({ version: 1, action: "review", reviewer: { permissions: "ask" } });
+    writePolicy({ version: 2, agents: { reviewer: { permissions: "ask" } } });
     await sourceTurn({ change: edit });
     const childId = fake.created[0].agentId;
     const request = {
@@ -395,7 +478,7 @@ describe("dispatch and report", () => {
   });
 
   test("routine requests are auto-approved once; risky ones are escalated with a reason", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     await sourceTurn({ change: edit });
     const childId = fake.created[0].agentId;
     const actions = [
@@ -431,7 +514,7 @@ describe("dispatch and report", () => {
   });
 
   test("a user message during review supersedes the run and stops the reviewer", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     await sourceTurn({ change: edit });
     const childId = fake.created[0].agentId;
     gate.onTurnStarted({ agent: hookAgent(SOURCE), turnId: "t2" }, fake.paseo);
@@ -450,7 +533,7 @@ describe("fix loop", () => {
   }
 
   test("FAIL sends findings back, re-reviews against the original base, and PASS ends it", async () => {
-    writePolicy({ version: 1, action: "review", review: { on_fail: "fix", max_fix_rounds: 2 } });
+    writePolicy({ version: 2, on_fail: { fix: { max_rounds: 2 } } });
     await sourceTurn({ change: edit });
     await childTurn(fake.created[0].agentId, FAIL);
 
@@ -472,7 +555,7 @@ describe("fix loop", () => {
   });
 
   test("the round limit ends in NEEDS_HUMAN", async () => {
-    writePolicy({ version: 1, action: "review", review: { on_fail: "fix", max_fix_rounds: 1 } });
+    writePolicy({ version: 2, on_fail: { fix: { max_rounds: 1 } } });
     await sourceTurn({ change: edit });
     await childTurn(fake.created[0].agentId, FAIL);
     await fixTurn(1, () => writeFileSync(path.join(repo, "a.txt"), "fixed\n"));
@@ -482,7 +565,7 @@ describe("fix loop", () => {
   });
 
   test("a busy source is never interrupted", async () => {
-    writePolicy({ version: 1, action: "review", review: { on_fail: "fix", max_fix_rounds: 2 } });
+    writePolicy({ version: 2, on_fail: { fix: { max_rounds: 2 } } });
     await sourceTurn({ change: edit });
     fake.agents.set(SOURCE, sourceAgent({ status: "running" }));
     await childTurn(fake.created[0].agentId, FAIL);
@@ -491,7 +574,7 @@ describe("fix loop", () => {
   });
 
   test("a canceled fix turn supersedes the run", async () => {
-    writePolicy({ version: 1, action: "review", review: { on_fail: "fix", max_fix_rounds: 2 } });
+    writePolicy({ version: 2, on_fail: { fix: { max_rounds: 2 } } });
     await sourceTurn({ change: edit });
     await childTurn(fake.created[0].agentId, FAIL);
     const runId = fake.sent[0].messageId!.split(":")[1];
@@ -501,8 +584,25 @@ describe("fix loop", () => {
 });
 
 describe("recovery", () => {
+  test("a crash between two checks dispatches the next check once, instead of re-reading the old verdict", async () => {
+    writePolicy({ version: 2, on_outcome: { done: ["verify", "review"] } });
+    await sourceTurn({ change: edit });
+    const verifier = fake.created[0].agentId;
+    const runId = fake.created[0].labels["post-turn-gate.run-id"];
+    // The state finalizeReview writes right before dispatching the next check; the plugin dies here.
+    ledger.update(runId, { step: 1, status: "DISPATCHING", dispatch_json: null, child_agent_id: null }, clock);
+    fake.agents.get(verifier)!.status = "idle";
+    fake.timelines.set(verifier, [{ type: "assistant_message", text: PASS }]);
+    const restarted = createGate({ ledger, now: () => clock, minuteMs: 1_000 / 30, log: () => {} });
+    restarted.reconcile(fake.paseo);
+    await restarted.idle();
+    assert.equal(fake.created.length, 2);
+    assert.equal(fake.created[1].labels["post-turn-gate.role"], "reviewer");
+    assert.equal(ledger.get(runId)?.step, 1);
+  });
+
   test("a crashed dispatch replays the recorded create; an idle reviewer is finalized from its timeline", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     fake.setFailCreate(true);
     await sourceTurn({ change: edit });
     // Simulate "create failed ambiguously and the plugin died": put the run back to DISPATCHING.
@@ -510,7 +610,7 @@ describe("recovery", () => {
     ledger.update(runId, { status: "DISPATCHING", error: null }, clock);
     fake.setFailCreate(false);
 
-    const restarted = createGate({ ledger, now: () => clock, reviewTimeoutMs: 1_000, log: () => {} });
+    const restarted = createGate({ ledger, now: () => clock, minuteMs: 1_000 / 30, log: () => {} });
     restarted.reconcile(fake.paseo);
     await restarted.idle();
     assert.equal(fake.created.length, 2);
@@ -530,7 +630,7 @@ describe("recovery", () => {
   });
 
   test("a running reviewer times out, even while it waits for a permission answer", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     await sourceTurn({ change: edit });
     const child = fake.agents.get(fake.created[0].agentId)!;
     child.pendingPermissions = [{}];
@@ -548,7 +648,7 @@ describe("recovery", () => {
   });
 
   test("a FIXING run whose fix message never landed is re-sent with the same messageId", async () => {
-    writePolicy({ version: 1, action: "review", review: { on_fail: "fix", max_fix_rounds: 2 } });
+    writePolicy({ version: 2, on_fail: { fix: { max_rounds: 2 } } });
     await sourceTurn({ change: edit });
     await childTurn(fake.created[0].agentId, FAIL);
     fake.timelines.set(SOURCE, [{ type: "user_message", text: "Implement feature X", messageId: "msg-1" }]);
@@ -583,7 +683,7 @@ describe("turn outcomes: answers, retries, chains", () => {
   const baseOf = (prompt: string) => /diff ([0-9a-f]{40}) ([0-9a-f]{40})/.exec(prompt)![1];
 
   test("a question is answered by the answerer; the follow-up turn is gated against the chain's first baseline", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     fake.profiles.push({ id: "post-turn-gate-answerer", name: "Gate answerer", provider: "codex", model: "gpt-5.5" });
     await sourceTurn({ change: edit, reply: "Which language should I use for the script?" });
     assert.equal(reviewers().length, 0, "no review while the agent waits");
@@ -613,7 +713,7 @@ describe("turn outcomes: answers, retries, chains", () => {
   });
 
   test("escalation, risky answers, repeated questions and the limit go to the user", async () => {
-    writePolicy({ version: 1, action: "review", on_outcome: { awaiting_user: { answer: { max: 2 } } } });
+    writePolicy({ version: 2, on_outcome: { awaiting_user: { answer: { max: 2 } } } });
     await sourceTurn({ change: edit, reply: "Should I pick A or B?", messageId: "m1" });
     await childTurn(answerers()[0].agentId, ANSWER("", { decision: "escalate", reason: "product decision" }));
     assert.equal(outcomeCard().state, "needs_user");
@@ -639,7 +739,7 @@ describe("turn outcomes: answers, retries, chains", () => {
   });
 
   test("the answer limit and stop button stop auto-answering", async () => {
-    writePolicy({ version: 1, action: "review", on_outcome: { awaiting_user: { answer: { max: 1 } } } });
+    writePolicy({ version: 2, on_outcome: { awaiting_user: { answer: { max: 1 } } } });
     await sourceTurn({ change: edit, reply: "Which language?" });
     await childTurn(answerers()[0].agentId, ANSWER("TypeScript"));
     await sourceTurn({ messageId: fake.sent[0].messageId, text: fake.sent[0].text, reply: "And which test runner?" });
@@ -652,15 +752,23 @@ describe("turn outcomes: answers, retries, chains", () => {
   });
 
   test("the answerer can say the agent was done: gate runs, nothing is sent", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     await sourceTurn({ change: edit, reply: "Implemented. Let me know if you need anything else." });
     await childTurn(answerers()[0].agentId, JSON.stringify({ state: "done", decision: "answer" }));
     assert.equal(fake.sent.length, 0);
     assert.equal(reviewers().length, 1);
   });
 
+  test("awaiting_user as_done skips the answerer and applies done (verify)", async () => {
+    writePolicy({ version: 2, on_outcome: { done: ["verify"], awaiting_user: "as_done" } });
+    await sourceTurn({ change: edit, reply: "Should I also update the docs?" });
+    assert.equal(answerers().length, 0);
+    assert.equal(fake.created.length, 1);
+    assert.equal(fake.created[0].labels["post-turn-gate.role"], "verifier");
+  });
+
   test("a user reply while the answerer runs cancels it and continues the chain", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     await sourceTurn({ change: edit, reply: "Which language?" });
     const ask = answerers()[0];
     gate.onTurnStarted({ agent: hookAgent(SOURCE), turnId: "u" }, fake.paseo);
@@ -677,7 +785,7 @@ describe("turn outcomes: answers, retries, chains", () => {
       error: { message: "Internal error", code: "-32603" },
     };
     const reply = '[System Error] Internal error | code=-32603 | data="An unknown error occurred: dispatch failure"';
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     await sourceTurn({ change: edit, outcome: networkFailure, reply, messageId: "n1" });
     assert.equal(outcomeCard().category, "network");
     assert.equal(outcomeCard().state, "notice");
@@ -689,7 +797,7 @@ describe("turn outcomes: answers, retries, chains", () => {
     const manualBase = baseOf(reviewers()[0].prompt);
 
     fake.cards.clear();
-    writePolicy({ version: 1, action: "review", on_outcome: { network: { retry: { max: 1, delay_seconds: 30, message: "Retry please." } } } });
+    writePolicy({ version: 2, on_outcome: { network: { retry: { max: 1, delay_seconds: 30, message: "Retry please." } } } });
     await sourceTurn({ change: () => writeFileSync(path.join(repo, "c.txt"), "c"), outcome: networkFailure, reply, messageId: "n3" });
     assert.equal(outcomeCard().state, "retry_scheduled");
     gate.reconcile(fake.paseo);
@@ -709,7 +817,7 @@ describe("turn outcomes: answers, retries, chains", () => {
   });
 
   test("a refusal found by the answerer becomes a notice, nothing is sent", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     await sourceTurn({ change: edit, reply: "I'm sorry, but I can't help with that." });
     assert.match(answerers()[0].prompt, /starts like a refusal/);
     await childTurn(answerers()[0].agentId, JSON.stringify({ state: "refused", decision: "answer", reason: "policy" }));
@@ -719,7 +827,7 @@ describe("turn outcomes: answers, retries, chains", () => {
   });
 
   test("a truncated reply is continued; your own reply resolves a needs-user card", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     await sourceTurn({ change: edit, reply: "Here is the file:\n```ts\nexport function a() {" });
     assert.match(answerers()[0].prompt, /unclosed code block/);
     await childTurn(answerers()[0].agentId, JSON.stringify({ state: "incomplete", decision: "answer" }));
@@ -735,9 +843,9 @@ describe("turn outcomes: answers, retries, chains", () => {
   });
 
   test("the answerer times out quickly and hands the question over", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     await sourceTurn({ change: edit, reply: "Which language?" });
-    clock += 5_000; // test default timeout is 1s
+    clock += 5_000; // answerer default of 10 minutes is 1/3 s here
     gate.reconcile(fake.paseo);
     await gate.idle();
     assert.equal(outcomeCard().state, "needs_user");
@@ -745,13 +853,13 @@ describe("turn outcomes: answers, retries, chains", () => {
   });
 
   test("quota errors cannot be configured to retry", async () => {
-    writePolicy({ version: 1, action: "review", on_outcome: { quota_exhausted: { retry: { max: 1, delay_seconds: 30 } } } });
+    writePolicy({ version: 2, on_outcome: { quota_exhausted: { retry: { max: 1, delay_seconds: 30 } } } });
     await sourceTurn({ change: edit });
     assert.match(fake.cards.get(`post-turn-gate:config:${SOURCE}`)?.error ?? "", /on_outcome\.quota_exhausted/);
   });
 
   test("a user stop drops the chain; a replaced turn keeps its baseline for the next turn", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     const agent = hookAgent(SOURCE);
     gate.onTurnStarted({ agent, turnId: "t1" }, fake.paseo);
     await gate.idle();
@@ -776,7 +884,7 @@ describe("turn outcomes: answers, retries, chains", () => {
   });
 
   test("answerer permissions follow the same auto-approval rules", async () => {
-    writePolicy({ version: 1, action: "review" });
+    writePolicy({ version: 2 });
     await sourceTurn({ change: edit, reply: "Which language?" });
     const childId = answerers()[0].agentId;
     const request = (id: string, command: string) => ({
@@ -872,12 +980,12 @@ describe("reviewer config", () => {
     const dup = resolveReviewer(source, { profile: "Dup" }, profiles);
     assert.ok(!dup.ok && /ambiguous/.test(dup.error));
     const noModel = resolveReviewer(source, { provider: "claude" }, profiles);
-    assert.ok(!noModel.ok && /set reviewer\.model/.test(noModel.error));
+    assert.ok(!noModel.ok && /set model/.test(noModel.error));
   });
 
   test("dispatch uses the profile, appends instructions, and a missing profile is an ERROR card", async () => {
     fake.profiles.push({ id: "p-review", name: "Review", provider: "codex", model: "gpt-5.5", modeId: "auto-review" });
-    writePolicy({ version: 1, action: "review", reviewer: { profile: "Review", instructions: "Check the README too." } });
+    writePolicy({ version: 2, agents: { reviewer: { profile: "Review", instructions: "Check the README too." } } });
     await sourceTurn({ change: edit, messageId: "m1" });
     assert.deepEqual(fake.created[0].config, { provider: "codex/gpt-5.5", modeId: "auto-review" });
     assert.match(fake.created[0].prompt, /Check the README too\./);
@@ -892,16 +1000,16 @@ describe("reviewer config", () => {
   });
 
   test("an unknown reviewer key is a config error", async () => {
-    writePolicy({ version: 1, action: "review", reviewer: { profiel: "Review" } });
+    writePolicy({ version: 2, agents: { reviewer: { profiel: "Review" } } });
     await sourceTurn({ change: edit });
     assert.equal(fake.created.length, 0);
     assert.match(fake.cards.get(`post-turn-gate:config:${SOURCE}`)?.error ?? "", /profiel/);
   });
 
   test("timeout_minutes overrides the default deadline", async () => {
-    writePolicy({ version: 1, action: "review", reviewer: { timeout_minutes: 60 } });
+    writePolicy({ version: 2, agents: { reviewer: { timeout_minutes: 240 } } });
     await sourceTurn({ change: edit });
-    clock += 5_000; // past the 1s test default, well inside 60 minutes
+    clock += 5_000; // past the 30-minute default (1s here), well inside 240 minutes (8s here)
     gate.reconcile(fake.paseo);
     await gate.idle();
     assert.equal(onlyRun().status, "REVIEWING");

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Creates or updates the Paseo agent profiles used by the post-turn gate
-// (reviewer and/or verifier), then reloads the daemon so they take effect.
+// (reviewer, verifier and answerer), then reloads the daemon so they take effect.
 //
 //   node scripts/create-agent-profiles.mjs --provider kiro --model claude-opus-4.8 [options]
 //
@@ -166,7 +166,7 @@ if (!values["no-reload"]) paseo(["daemon", "reload", ...homeArgs], { json: false
 for (const { role, profile, action } of written) {
   console.log(`${action} ${role} profile "${profile.name}" (id: ${profile.id}) → ${profile.provider}/${profile.model}`);
 }
-const example = written.find((entry) => entry.role === "reviewer") ?? written[0];
+const example = written[0];
 console.log(`
-Use it from .paseo/post-turn-gate.json:
-  "reviewer": { "profile": "${example.profile.id}" }`);
+The default policy uses these profiles by id. To pick another one, set it in .paseo/post-turn-gate.json:
+  "agents": { "${example.role}": { "profile": "<id or name>" } }`);

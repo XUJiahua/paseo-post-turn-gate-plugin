@@ -1,4 +1,4 @@
-import type { ReviewerSpec } from "../shared/schema.ts";
+import type { AgentSpec } from "../shared/schema.ts";
 
 /** The provider-scoped launch settings shared by agents, profiles, and policy overrides. */
 export interface LaunchConfig {
@@ -20,7 +20,7 @@ export interface AgentProfileLike {
 }
 
 export type ResolvedReviewer =
-  | { ok: true; config: LaunchConfig & { model: string }; source: string }
+  | { ok: true; config: LaunchConfig & { model: string }; source: string; note?: string }
   | { ok: false; error: string };
 
 function findProfile(profiles: readonly AgentProfileLike[], ref: string): AgentProfileLike | string {
@@ -41,7 +41,7 @@ function findProfile(profiles: readonly AgentProfileLike[], ref: string): AgentP
  */
 export function resolveReviewer(
   source: LaunchConfig,
-  spec: Partial<ReviewerSpec>,
+  spec: Partial<Omit<AgentSpec, "profile">> & { profile?: string | null },
   profiles: readonly AgentProfileLike[],
 ): ResolvedReviewer {
   const layers: Array<{ label: string; config: Partial<LaunchConfig> }> = [];
@@ -57,7 +57,7 @@ export function resolveReviewer(
     ...(spec.thinking ? { thinkingOptionId: spec.thinking } : {}),
     ...(spec.features ? { featureValues: spec.features } : {}),
   };
-  if (Object.keys(explicit).length > 0) layers.push({ label: "policy reviewer", config: explicit });
+  if (Object.keys(explicit).length > 0) layers.push({ label: "policy fields", config: explicit });
 
   let config: LaunchConfig = { ...source };
   let label = "source agent";
@@ -77,7 +77,26 @@ export function resolveReviewer(
     label = layer.label;
   }
   if (!config.model) {
-    return { ok: false, error: `no model resolved for provider "${config.provider}" (from ${label}); set reviewer.model` };
+    return { ok: false, error: `no model resolved for provider "${config.provider}" (from ${label}); set model` };
   }
   return { ok: true, config: { ...config, model: config.model }, source: label };
+}
+
+/**
+ * Resolves a role's launch config. The role's default profile (created by `npm run profiles`) is optional:
+ * when it does not exist the role inherits the source agent, with a note. Any other profile must exist.
+ */
+export function resolveRole(
+  source: LaunchConfig,
+  spec: Partial<Omit<AgentSpec, "profile">> & { profile?: string | null },
+  defaultProfile: string,
+  profiles: readonly AgentProfileLike[],
+): ResolvedReviewer {
+  const missingDefault = spec.profile === defaultProfile && !profiles.some((profile) => profile.id === defaultProfile);
+  const resolved = resolveReviewer(source, { ...spec, profile: missingDefault ? null : spec.profile }, profiles);
+  if (!resolved.ok || !missingDefault) return resolved;
+  return {
+    ...resolved,
+    note: `profile "${defaultProfile}" does not exist, so the source agent's settings were used; create it with npm run profiles`,
+  };
 }

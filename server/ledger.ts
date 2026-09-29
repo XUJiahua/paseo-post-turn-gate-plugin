@@ -6,6 +6,7 @@ import { TERMINAL_STATUSES } from "../shared/schema.ts";
 
 export interface RoundRecord {
   round: number;
+  check: "review" | "verify";
   childAgentId: string;
   verdict: Verdict["verdict"] | null;
   summary: string | null;
@@ -24,6 +25,7 @@ export interface Run {
   end_tree: string;
   status: RunStatus;
   round: number;
+  step: number; // index into the policy's checks for the current round
   child_agent_id: string | null;
   dispatch_json: string | null; // exact create payload, replayed on recovery
   deadline_at: number | null;
@@ -106,6 +108,7 @@ const COLUMNS = [
   "end_tree",
   "status",
   "round",
+  "step",
   "child_agent_id",
   "dispatch_json",
   "deadline_at",
@@ -144,6 +147,7 @@ export class Ledger {
         end_tree TEXT NOT NULL,
         status TEXT NOT NULL,
         round INTEGER NOT NULL,
+        step INTEGER NOT NULL DEFAULT 0,
         child_agent_id TEXT,
         dispatch_json TEXT,
         deadline_at INTEGER,
@@ -190,6 +194,11 @@ export class Ledger {
         round INTEGER NOT NULL
       );
     `);
+    // Ledgers created before multi-check runs lack `step`.
+    const columns = this.db.prepare("PRAGMA table_info(gate_runs)").all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === "step")) {
+      this.db.exec("ALTER TABLE gate_runs ADD COLUMN step INTEGER NOT NULL DEFAULT 0");
+    }
   }
 
   /** Records a reviewer/verifier agent id before it is created, so its events are never mistaken for a source. */

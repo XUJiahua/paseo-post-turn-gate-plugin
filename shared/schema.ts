@@ -4,23 +4,57 @@ import { z } from "zod";
 // Repository policy: <git toplevel>/.paseo/post-turn-gate.json
 export const POLICY_PATH = ".paseo/post-turn-gate.json";
 
-export const reviewerSchema = z
+export type Role = "reviewer" | "verifier" | "answerer";
+export type Check = "review" | "verify";
+export const ROLE_OF: Record<Check, Role> = { review: "reviewer", verify: "verifier" };
+/** Profile ids created by `npm run profiles`; each role's default profile. */
+export const ROLE_PROFILE: Record<Role, string> = {
+  reviewer: "post-turn-gate-reviewer",
+  verifier: "post-turn-gate-verifier",
+  answerer: "post-turn-gate-answerer",
+};
+
+/** Maximum length of a role's rules (file plus inline instructions). */
+export const INSTRUCTIONS_LIMIT = 20000;
+export const defaultInstructionsFile = (role: Role) => `.paseo/post-turn-gate/${role}.md`;
+
+function agentSchema(role: Role, timeoutMinutes: number) {
+  return z
+    .object({
+      /**
+       * Paseo agent profile, matched by id first, then by exact name. null: no profile, inherit the source agent.
+       * The role's default profile falls back to the source agent when it does not exist; any other name must exist.
+       */
+      profile: z.string().min(1).nullable().default(ROLE_PROFILE[role]),
+      provider: z.string().min(1).optional(),
+      model: z.string().min(1).optional(),
+      mode: z.string().min(1).optional(),
+      thinking: z.string().min(1).optional(),
+      features: z.record(z.string(), z.unknown()).optional(),
+      /**
+       * Rules for this role kept in the repository, relative to the git root. The default path is optional
+       * (a missing file means no rules); any other path must exist. null: no file.
+       */
+      instructions_file: z.string().min(1).nullable().default(defaultInstructionsFile(role)),
+      /** Appended to the built-in role prompt after the file's rules; cannot replace the reply contract. */
+      instructions: z.string().max(INSTRUCTIONS_LIMIT).optional(),
+      /** auto: approve routine tool use, escalate risky requests to the card; ask: every request goes to the user. */
+      permissions: z.enum(["auto", "ask"]).default("auto"),
+      timeout_minutes: z.number().int().min(1).max(240).default(timeoutMinutes),
+    })
+    .strict()
+    .prefault({});
+}
+export type AgentSpec = z.output<ReturnType<typeof agentSchema>>;
+
+export const agentsSchema = z
   .object({
-    /** Paseo agent profile, matched by id first, then by exact name. */
-    profile: z.string().min(1).optional(),
-    provider: z.string().min(1).optional(),
-    model: z.string().min(1).optional(),
-    mode: z.string().min(1).optional(),
-    thinking: z.string().min(1).optional(),
-    features: z.record(z.string(), z.unknown()).optional(),
-    /** Appended to the built-in role prompt; cannot replace the verdict contract. */
-    instructions: z.string().max(4000).optional(),
-    /** auto: approve routine tool use, escalate risky requests to the card; ask: every request goes to the user. */
-    permissions: z.enum(["auto", "ask"]).default("auto"),
-    timeout_minutes: z.number().int().min(1).max(240).optional(),
+    reviewer: agentSchema("reviewer", 30),
+    verifier: agentSchema("verifier", 30),
+    answerer: agentSchema("answerer", 10),
   })
-  .strict();
-export type ReviewerSpec = z.output<typeof reviewerSchema>;
+  .strict()
+  .prefault({});
 
 // ---------- turn outcomes (docs/turn-outcomes.md) ----------
 
@@ -57,9 +91,6 @@ const answerActionSchema = z
     answer: z
       .object({
         max: z.number().int().min(1).max(10).default(3),
-        instructions: z.string().max(4000).optional(),
-        /** Agent profile for the answerer; defaults to post-turn-gate-answerer when it exists, else the reviewer config. */
-        profile: z.string().min(1).optional(),
       })
       .strict(),
   })
@@ -70,8 +101,18 @@ const retryable = z.union([passive, retryActionSchema]);
 // Retry is only accepted where waiting can help; quota and context exhaustion never recover by retrying.
 export const onOutcomeSchema = z
   .object({
-    done: z.enum(["gate", "notify", "ignore"]).default("gate"),
-    awaiting_user: z.union([z.enum(["gate", "notify", "ignore"]), answerActionSchema]).default({ answer: { max: 3 } }),
+    /** Checks a finished task gets, run in order until one fails; or a notice, or nothing. */
+    done: z
+      .union([
+        z
+          .array(z.enum(["review", "verify"]))
+          .min(1)
+          .refine((checks) => new Set(checks).size === checks.length, "each check may appear once"),
+        z.enum(["notify", "ignore"]),
+      ])
+      .default(["review"]),
+    /** as_done: treat the stop as finished and apply `done`. */
+    awaiting_user: z.union([z.enum(["as_done", "notify", "ignore"]), answerActionSchema]).default({ answer: { max: 3 } }),
     refused: passive.default("notify"),
     user_canceled: passive.default("ignore"),
     replaced: passive.default("ignore"),
@@ -98,21 +139,30 @@ export const ANSWER_JSON_SCHEMA = z.toJSONSchema(answerReplySchema) as Record<st
 
 export const policySchema = z
   .object({
-    version: z.literal(1),
-    action: z.enum(["none", "verify", "review"]),
+    version: z.literal(2),
     trigger: z.enum(["root_only", "root_and_opt_in", "all"]).default("root_and_opt_in"),
-    review: z
-      .object({
-        on_fail: z.enum(["report", "fix"]).default("report"),
-        max_fix_rounds: z.number().int().min(0).max(5).default(2),
-      })
-      .strict()
-      .default({ on_fail: "report", max_fix_rounds: 2 }),
-    reviewer: reviewerSchema.default({ permissions: "auto" }),
+    /** A failed review or verify: report it, or send the findings back to the agent for up to max_rounds fixes. */
+    on_fail: z
+      .union([
+        z.literal("report"),
+        z.object({ fix: z.object({ max_rounds: z.number().int().min(1).max(5).default(2) }).strict() }).strict(),
+      ])
+      // The gate exists to let the agent loop until its work passes, so fixing is the default.
+      .default({ fix: { max_rounds: 2 } }),
+    agents: agentsSchema,
     on_outcome: onOutcomeSchema.prefault({}),
   })
   .strict();
 export type Policy = z.output<typeof policySchema>;
+
+/** The checks a finished task gets, in order; empty when `done` does not gate. */
+export function gateChecks(policy: Policy): Check[] {
+  const done = policy.on_outcome.done;
+  return Array.isArray(done) ? done : [];
+}
+
+/** Fix rounds allowed after a failed gate; 0 means report only. */
+export const maxFixRounds = (policy: Policy) => (policy.on_fail === "report" ? 0 : policy.on_fail.fix.max_rounds);
 
 export const severitySchema = z.enum(["CRITICAL", "HIGH", "MEDIUM", "LOW"]);
 
@@ -186,6 +236,18 @@ export const cardSchema = z.object({
   childTitle: z.string().nullable(),
   reviewerChanges: z.string().nullable(),
   error: z.string().nullable(),
+  /** One row per configured check of the current round. Optional so cards written before it still render. */
+  checks: z
+    .array(
+      z.object({
+        check: z.enum(["review", "verify"]),
+        state: z.enum(["pending", "running", "PASS", "FAIL", "INCONCLUSIVE", "skipped"]),
+        summary: z.string().nullable(),
+      }),
+    )
+    .default([]),
+  /** Informational, e.g. a role profile that does not exist yet. */
+  note: z.string().nullable().default(null),
 });
 export type CardData = z.output<typeof cardSchema>;
 

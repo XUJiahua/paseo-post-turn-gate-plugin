@@ -22,6 +22,12 @@ import {
   POLICY_PATH,
   TERMINAL_STATUSES,
   VERDICT_JSON_SCHEMA,
+  INSTRUCTIONS_LIMIT,
+  ROLE_OF,
+  ROLE_PROFILE,
+  defaultInstructionsFile,
+  gateChecks,
+  maxFixRounds,
   policySchema,
 } from "../shared/schema.ts";
 import { diffStat, snapshotTree, toplevel } from "./git.ts";
@@ -37,7 +43,7 @@ import {
   parseVerdict,
 } from "./prompts.ts";
 import { answerRisk, decideAutoApproval } from "./permissions.ts";
-import { resolveReviewer } from "./reviewer.ts";
+import { resolveRole } from "./reviewer.ts";
 
 export type Paseo = PluginHookContext["paseo"];
 type TurnStarted = PluginLifecycleEvents["agent.turn_started"];
@@ -87,7 +93,8 @@ type AnswerConfig = Extract<OnOutcome["awaiting_user"], { answer: unknown }>["an
 export interface GateOptions {
   ledger: Ledger;
   now?: () => number;
-  reviewTimeoutMs?: number;
+  /** Length of one policy minute in ms (tests shrink it); timeouts come from agents.<role>.timeout_minutes. */
+  minuteMs?: number;
   log?: (message: string, detail?: unknown) => void;
 }
 
@@ -122,12 +129,25 @@ function truncate(text: string, limit: number): string {
 export function createGate(options: GateOptions): Gate {
   const { ledger } = options;
   const now = options.now ?? Date.now;
-  const defaultTimeoutMs = options.reviewTimeoutMs ?? 30 * 60 * 1000;
-  const timeoutOf = (run: Run) => {
-    const minutes = (JSON.parse(run.policy_json) as Policy).reviewer?.timeout_minutes;
-    return minutes ? minutes * 60 * 1000 : defaultTimeoutMs;
-  };
+  const minuteMs = options.minuteMs ?? 60 * 1000;
+  /** The check the run is on (review/verify); runs always have at least one. */
+  const checkOf = (run: Run) => gateChecks(JSON.parse(run.policy_json) as Policy)[run.step] ?? "review";
+  const specOf = (run: Run) => (JSON.parse(run.policy_json) as Policy).agents[ROLE_OF[checkOf(run)]];
+  const timeoutOf = (run: Run) => specOf(run).timeout_minutes * minuteMs;
   const log = options.log ?? ((message, detail) => console.log(`[post-turn-gate] ${message}`, detail ?? ""));
+  // Unfinished runs and chains store the policy frozen at their first turn; retire any in an older format.
+  for (const run of ledger.active()) {
+    if (!policySchema.safeParse(JSON.parse(run.policy_json)).success) {
+      log(`retiring run ${run.run_id}: stored policy is in an old format`);
+      ledger.update(run.run_id, { status: "ERROR", error: "stored policy is in an old format (plugin upgraded mid-run)" }, now());
+    }
+  }
+  for (const chain of ledger.chains()) {
+    if (!policySchema.safeParse(JSON.parse(chain.policy_json)).success) {
+      log(`dropping chain ${chain.chain_id}: stored policy is in an old format`);
+      ledger.deleteChain(chain.agent_id);
+    }
+  }
   const pending = new Map<string, Pending>();
   // Pending permission of each run's current child, shown on the card so it can be answered there.
   const waiting = new Map<string, PermissionCard>();
@@ -152,12 +172,21 @@ export function createGate(options: GateOptions): Gate {
       evidence: truncate(f.evidence, 1000),
       suggested_fix: truncate(f.suggested_fix, 1000),
     }));
-    const dispatch = run.dispatch_json ? (JSON.parse(run.dispatch_json) as { title?: string }) : null;
+    const dispatch = run.dispatch_json ? (JSON.parse(run.dispatch_json) as { title?: string; note?: string }) : null;
+    const records = (JSON.parse(run.rounds_json) as RoundRecord[]).filter((record) => record.round === run.round);
+    const checks = gateChecks(policy).map((check, index) => {
+      const record = records.find((entry) => entry.check === check);
+      if (record?.verdict) return { check, state: record.verdict, summary: record.summary ? truncate(record.summary, 1000) : null };
+      const state = isTerminal(run.status) ? ("skipped" as const) : index === run.step ? ("running" as const) : ("pending" as const);
+      return { check, state, summary: null };
+    });
     return {
       status: run.status,
-      action: policy.action === "none" ? null : policy.action,
+      action: checkOf(run),
+      checks,
+      note: dispatch?.note ? truncate(dispatch.note, 500) : null,
       round: run.round,
-      maxFixRounds: policy.review.on_fail === "fix" ? policy.review.max_fix_rounds : 0,
+      maxFixRounds: maxFixRounds(policy),
       waiting: waiting.has(run.run_id),
       permission: waiting.get(run.run_id) ?? null,
       autoApproved: autoApproved.get(run.run_id) ?? 0,
@@ -197,6 +226,8 @@ export function createGate(options: GateOptions): Gate {
       childTitle: null,
       reviewerChanges: null,
       error: truncate(`${POLICY_PATH}: ${error}`, 2000),
+      checks: [],
+      note: null,
     };
     await paseo.agents.ref(agentId).timeline.append({
       type: "plugin",
@@ -255,9 +286,37 @@ export function createGate(options: GateOptions): Gate {
       return { ...base, policy: null, policyJson: raw, error, baseTree: null };
     }
     const policy = parsed.data;
-    // Always taken: on_outcome (answers, retries) works even when action is "none".
+    const rulesError = await loadRules(repoRoot, policy);
+    if (rulesError) return { ...base, policy: null, policyJson: raw, error: rulesError, baseTree: null };
+    // Always taken: on_outcome (answers, retries) works even when `done` does not gate.
     const baseTree = await snapshotTree(repoRoot);
     return { ...base, policy, policyJson: JSON.stringify(policy), error: null, baseTree };
+  }
+
+  /**
+   * Reads each role's instructions_file into its instructions, so the rules are frozen with the policy at
+   * turn start (the agent may edit them during the turn). Returns an error message for a bad file.
+   */
+  async function loadRules(repoRoot: string, policy: Policy): Promise<string | null> {
+    for (const role of ["reviewer", "verifier", "answerer"] as const) {
+      const spec = policy.agents[role];
+      if (!spec.instructions_file) continue;
+      const field = `agents.${role}.instructions_file`;
+      const file = path.resolve(repoRoot, spec.instructions_file);
+      if (file !== repoRoot && !file.startsWith(`${repoRoot}${path.sep}`)) return `${field}: must be inside the repository`;
+      let text: string;
+      try {
+        // HTML comments are guidance for the person editing the file (npm run init writes them), not rules.
+        text = (await readFile(file, "utf8")).replace(/<!--[\s\S]*?-->/g, "").trim();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT" && spec.instructions_file === defaultInstructionsFile(role)) continue;
+        return `${field}: cannot read ${spec.instructions_file}: ${(error as Error).message}`;
+      }
+      const combined = [text, spec.instructions?.trim()].filter(Boolean).join("\n\n");
+      if (combined.length > INSTRUCTIONS_LIMIT) return `${field}: rules are longer than ${INSTRUCTIONS_LIMIT} characters`;
+      spec.instructions = combined || undefined;
+    }
+    return null;
   }
 
   function triggers(policy: Policy, agent: AgentSnapshot, isRoot: boolean): boolean {
@@ -285,35 +344,37 @@ export function createGate(options: GateOptions): Gate {
 
   async function dispatch(paseo: Paseo, run: Run): Promise<void> {
     const policy = JSON.parse(run.policy_json) as Policy;
-    if (policy.action === "none") return;
+    if (gateChecks(policy).length === 0) return;
+    const action = checkOf(run);
+    const role = ROLE_OF[action];
+    const spec = policy.agents[role];
     const source = await refreshAgent(paseo, run.source_agent_id);
     if (!source) return fail(paseo, run, "source agent no longer exists");
-    // Profiles are daemon config; only read them when the policy names one.
-    const profiles = policy.reviewer.profile ? ((await paseo.config.get()).config.agentProfiles ?? []) : [];
-    const resolved = resolveReviewer(inheritedConfig(source), policy.reviewer, profiles);
-    if (!resolved.ok) return fail(paseo, run, resolved.error);
+    const profiles = (await paseo.config.get()).config.agentProfiles ?? [];
+    const resolved = resolveRole(inheritedConfig(source), spec, ROLE_PROFILE[role], profiles);
+    if (!resolved.ok) return fail(paseo, run, `agents.${role}: ${resolved.error}`);
     const { model, ...launch } = resolved.config;
     const childAgentId = randomUUID();
-    const key = `${FIX_PREFIX}${run.run_id}:${run.round}`;
+    const key = `${FIX_PREFIX}${run.run_id}:${run.round}:${run.step}`;
     const payload = {
       agentId: childAgentId,
       idempotencyKey: key,
       parent: run.source_agent_id,
       config: { ...launch, provider: `${launch.provider}/${model}` },
-      title: `Gate ${policy.action} #${run.round} · ${source.title ?? run.source_agent_id.slice(0, 8)}`,
+      title: `Gate ${action} #${run.round} · ${source.title ?? run.source_agent_id.slice(0, 8)}`,
       prompt: buildGatePrompt({
-        action: policy.action,
+        action,
         requestText: run.request_text,
         repoRoot: run.repo_root,
         baseTree: run.base_tree,
         endTree: run.end_tree,
-        instructions: policy.reviewer.instructions,
+        instructions: spec.instructions,
       }),
       clientMessageId: key,
       outputSchema: VERDICT_JSON_SCHEMA,
       labels: {
         [MANAGED_LABEL]: "true",
-        "post-turn-gate.role": policy.action === "verify" ? "verifier" : "reviewer",
+        "post-turn-gate.role": role,
         "post-turn-gate.run-id": run.run_id,
       },
     };
@@ -321,7 +382,7 @@ export function createGate(options: GateOptions): Gate {
     const claimed = await transition(paseo, run, {
       status: "DISPATCHING",
       child_agent_id: childAgentId,
-      dispatch_json: JSON.stringify({ workspaceId: run.workspace_id, ...payload }),
+      dispatch_json: JSON.stringify({ workspaceId: run.workspace_id, ...(resolved.note ? { note: resolved.note } : {}), ...payload }),
       deadline_at: now() + timeoutOf(run),
       reviewer_changes: null,
     });
@@ -330,7 +391,7 @@ export function createGate(options: GateOptions): Gate {
 
   /** Creates (or idempotently re-creates) the child recorded in dispatch_json. */
   async function createChild(paseo: Paseo, run: Run): Promise<void> {
-    const { workspaceId, ...payload } = JSON.parse(run.dispatch_json ?? "{}");
+    const { workspaceId, note: _note, ...payload } = JSON.parse(run.dispatch_json ?? "{}");
     try {
       await paseo.workspaces.ref(workspaceId).agents.create(payload);
     } catch (error) {
@@ -346,12 +407,14 @@ export function createGate(options: GateOptions): Gate {
   async function finalizeReview(
     paseo: Paseo,
     run: Run,
-    round: number,
+    childAgentId: string,
     outcome: TurnEnded["outcome"],
     timeline: readonly TimelineItem[],
   ): Promise<void> {
-    if (isTerminal(run.status) || run.status !== "REVIEWING" || run.round !== round) return;
-    const childAgentId = run.child_agent_id;
+    // Only the run's current child counts; earlier rounds' or checks' children are stale.
+    if (run.status !== "REVIEWING" || run.child_agent_id !== childAgentId) return;
+    const round = run.round;
+    const check = checkOf(run);
     if (outcome.kind !== "completed") {
       const reason = outcome.kind === "failed" ? outcome.error.message : outcome.reason;
       return fail(paseo, run, `reviewer turn ${outcome.kind}: ${reason}`);
@@ -363,7 +426,7 @@ export function createGate(options: GateOptions): Gate {
       return fail(paseo, run, "reviewer reply is not a valid verdict JSON", { reviewer_changes: reviewerChanges });
     }
     const rounds = JSON.parse(run.rounds_json) as RoundRecord[];
-    rounds.push({ round, childAgentId: childAgentId ?? "", verdict: verdict.verdict, summary: verdict.summary });
+    rounds.push({ round, check, childAgentId, verdict: verdict.verdict, summary: verdict.summary });
     const policy = JSON.parse(run.policy_json) as Policy;
     const base = {
       verdict: verdict.verdict,
@@ -372,13 +435,20 @@ export function createGate(options: GateOptions): Gate {
       rounds_json: JSON.stringify(rounds),
     };
     await archiveChild(paseo, childAgentId);
-    if (verdict.verdict === "PASS") {
-      await transition(paseo, run, { ...base, status: "PASSED" });
-    } else if (verdict.verdict === "INCONCLUSIVE") {
-      await transition(paseo, run, { ...base, status: "INCONCLUSIVE" });
-    } else if (policy.review.on_fail === "report") {
+    if (verdict.verdict !== "FAIL") {
+      // Checks run in order until one fails; INCONCLUSIVE does not block the next check.
+      const next = run.step + 1;
+      if (next < gateChecks(policy).length) {
+        // DISPATCHING without a payload: after a crash here, reconcile dispatches the next check instead of
+        // re-reading the finished child's verdict and advancing twice.
+        const advanced = { ...base, step: next, status: "DISPATCHING" as const, dispatch_json: null, child_agent_id: null };
+        return dispatch(paseo, ledger.update(run.run_id, advanced, now()));
+      }
+      const inconclusive = rounds.some((record) => record.round === round && record.verdict === "INCONCLUSIVE");
+      await transition(paseo, run, { ...base, status: inconclusive ? "INCONCLUSIVE" : "PASSED" });
+    } else if (maxFixRounds(policy) === 0) {
       await transition(paseo, run, { ...base, status: "FAILED" });
-    } else if (round - 1 >= policy.review.max_fix_rounds) {
+    } else if (round - 1 >= maxFixRounds(policy)) {
       await transition(paseo, run, { ...base, status: "NEEDS_HUMAN" });
     } else {
       await sendFix(paseo, ledger.update(run.run_id, base, now()), verdict, policy);
@@ -392,7 +462,7 @@ export function createGate(options: GateOptions): Gate {
       return;
     }
     const fixing = await transition(paseo, run, { status: "FIXING", deadline_at: now() + timeoutOf(run) });
-    await paseo.agents.ref(run.source_agent_id).send(buildFixPrompt(verdict, run.round, policy.review.max_fix_rounds), {
+    await paseo.agents.ref(run.source_agent_id).send(buildFixPrompt(verdict, run.round, maxFixRounds(policy)), {
       messageId: fixMessageId(fixing),
     });
   }
@@ -406,18 +476,21 @@ export function createGate(options: GateOptions): Gate {
       return;
     }
     const endTree = await snapshotTree(run.repo_root);
-    const next = ledger.update(run.run_id, { end_tree: endTree, round: run.round + 1 }, now());
+    // A fix can break a check that passed earlier, so the next round starts from the first check.
+    // Leaves FIXING in the same write, so a crash here cannot count the fix turn twice on recovery.
+    const next = ledger.update(
+      run.run_id,
+      { end_tree: endTree, round: run.round + 1, step: 0, status: "DISPATCHING", dispatch_json: null, child_agent_id: null },
+      now(),
+    );
     await dispatch(paseo, next);
   }
 
   // ---------- task chains, answers and retries (docs/turn-outcomes.md) ----------
 
   const CHAIN_TTL_MS = 24 * 60 * 60 * 1000;
-  const ANSWERER_PROFILE = "post-turn-gate-answerer";
   // Errs towards escalating: a false match hands the question to the user, a miss can loop.
   const SAME_QUESTION = 0.5;
-  // The answerer only reads and decides; if it takes longer than this, hand the question to the user.
-  const ANSWER_TIMEOUT_MS = 10 * 60 * 1000;
   const retryTimers = new Set<ReturnType<typeof setTimeout>>();
   const sendable = (status: string | undefined) => status === "idle" || status === "error";
 
@@ -558,7 +631,8 @@ export function createGate(options: GateOptions): Gate {
 
   /** Starts a review/verify of the task's changes (no-op for action "none" or an unchanged tree). */
   async function startGate(paseo: Paseo, task: Task): Promise<void> {
-    if (task.policy.action === "none") return;
+    const checks = gateChecks(task.policy);
+    if (checks.length === 0) return;
     const endTree = await snapshotTree(task.repoRoot);
     if (endTree === task.baseTree) return log(`skip ${task.agentId}: working tree unchanged`);
     const run = {
@@ -574,7 +648,7 @@ export function createGate(options: GateOptions): Gate {
       end_tree: endTree,
     };
     if (!ledger.claim(run, now())) return log(`skip ${task.agentId}: run already exists for this turn`);
-    log(`gate ${run.run_id} for ${task.agentId}: ${task.policy.action}`);
+    log(`gate ${run.run_id} for ${task.agentId}: ${checks.join(" → ")}`);
     await dispatch(paseo, ledger.get(run.run_id)!);
   }
 
@@ -590,10 +664,10 @@ export function createGate(options: GateOptions): Gate {
     if (category === "user_canceled") {
       return endChain(paseo, task.agentId, { state: "stopped", message: "You stopped the agent." });
     }
-    if (category === "done" || (category === "awaiting_user" && action === "gate")) {
-      if (action === "gate") await startGate(paseo, task);
-      else if (action === "notify") {
-        await publishChainCard(paseo, ensureChain(task), { category, state: "notice", message: "The agent finished its turn." });
+    if (category === "done" || (category === "awaiting_user" && action === "as_done")) {
+      if (gateChecks(task.policy).length > 0) await startGate(paseo, task);
+      else if (task.policy.on_outcome.done === "notify") {
+        await publishChainCard(paseo, ensureChain(task), { category: "done", state: "notice", message: "The agent finished its turn." });
       }
       return endChain(paseo, task.agentId, { state: "resolved", message: "The task continued and finished." });
     }
@@ -687,10 +761,9 @@ export function createGate(options: GateOptions): Gate {
     const policy = JSON.parse(chain.policy_json) as Policy;
     const source = await refreshAgent(paseo, chain.agent_id);
     if (!source) return;
+    const spec = policy.agents.answerer;
     const profiles = (await paseo.config.get()).config.agentProfiles ?? [];
-    const profile =
-      cfg.profile ?? (profiles.some((candidate) => candidate.id === ANSWERER_PROFILE) ? ANSWERER_PROFILE : policy.reviewer.profile);
-    const resolved = resolveReviewer(inheritedConfig(source), { ...policy.reviewer, profile }, profiles);
+    const resolved = resolveRole(inheritedConfig(source), spec, ROLE_PROFILE.answerer, profiles);
     if (!resolved.ok) return needsUser(paseo, chain, reply.slice(-600), `cannot start the answerer: ${resolved.error}`);
     const { model, ...launch } = resolved.config;
     const endTree = await snapshotTree(chain.repo_root);
@@ -711,7 +784,7 @@ export function createGate(options: GateOptions): Gate {
         agentReply: truncate(reply, 6000),
         previousQuestion: chain.last_question,
         signal,
-        instructions: cfg.instructions,
+        instructions: spec.instructions,
       }),
       clientMessageId: key,
       outputSchema: ANSWER_JSON_SCHEMA,
@@ -727,7 +800,7 @@ export function createGate(options: GateOptions): Gate {
       {
         answer_child_id: childAgentId,
         answer_dispatch_json: JSON.stringify({ workspaceId: chain.workspace_id, ...payload }),
-        answer_deadline_at: now() + Math.min(defaultTimeoutMs, ANSWER_TIMEOUT_MS),
+        answer_deadline_at: now() + spec.timeout_minutes * minuteMs,
       },
       now(),
     )!;
@@ -736,7 +809,7 @@ export function createGate(options: GateOptions): Gate {
       state: "answering",
       question: truncate(reply.slice(-600), 2000),
       answer: null,
-      message: null,
+      message: resolved.note ?? null,
       suggestion: null,
       attempt,
       maxAttempts: cfg.max,
@@ -919,7 +992,7 @@ export function createGate(options: GateOptions): Gate {
   async function handleTurnEnded(event: TurnEnded, paseo: Paseo): Promise<void> {
     const agentId = event.agent.id;
     const owned = ledger.child(agentId);
-    if (owned) return finalizeReview(paseo, owned.run, owned.round, event.outcome, event.timeline);
+    if (owned) return finalizeReview(paseo, owned.run, agentId, event.outcome, event.timeline);
     const answerer = ledger.chainChild(agentId);
     if (answerer) return finalizeAnswer(paseo, agentId, answerer, event.outcome, event.timeline);
 
@@ -972,10 +1045,10 @@ export function createGate(options: GateOptions): Gate {
     paseo: Paseo,
     agentId: string,
     request: PermissionRequested["request"],
-    policy: Policy,
+    permissions: "auto" | "ask",
     repoRoot: string,
   ): Promise<{ approved: true } | { approved: false; reason: string | null }> {
-    if (policy.reviewer.permissions === "ask") return { approved: false, reason: null };
+    if (permissions === "ask") return { approved: false, reason: null };
     const decision = decideAutoApproval(request, repoRoot);
     if (!decision.approve) {
       log(`escalated to user for ${agentId}: ${decision.reason}`);
@@ -1001,7 +1074,7 @@ export function createGate(options: GateOptions): Gate {
       const chain = ledger.chain(answerer.agentId);
       if (!chain || chain.answer_child_id !== agentId) return;
       if ("request" in event) {
-        const result = await autoApprove(paseo, agentId, event.request, JSON.parse(chain.policy_json) as Policy, chain.repo_root);
+        const result = await autoApprove(paseo, agentId, event.request, (JSON.parse(chain.policy_json) as Policy).agents.answerer.permissions, chain.repo_root);
         if (!result.approved) await publishChainCard(paseo, chain, { permission: permissionCard(agentId, event.request, result.reason) });
       } else if (chainCard(chain).permission?.requestId === event.requestId) {
         await publishChainCard(paseo, chain, { permission: null });
@@ -1012,8 +1085,7 @@ export function createGate(options: GateOptions): Gate {
     if (!owned || owned.run.child_agent_id !== agentId || isTerminal(owned.run.status)) return;
     const runId = owned.run.run_id;
     if ("request" in event) {
-      const policy = JSON.parse(owned.run.policy_json) as Policy;
-      const result = await autoApprove(paseo, agentId, event.request, policy, owned.run.repo_root);
+      const result = await autoApprove(paseo, agentId, event.request, specOf(owned.run).permissions, owned.run.repo_root);
       if (result.approved) {
         autoApproved.set(runId, (autoApproved.get(runId) ?? 0) + 1);
         return;
@@ -1081,7 +1153,7 @@ export function createGate(options: GateOptions): Gate {
     const items = page.entries.map((entry) => entry.item) as TimelineItem[];
     if (run.status === "REVIEWING") {
       if (agent.status === "error") return fail(paseo, run, `reviewer failed: ${agent.lastError ?? "unknown error"}`);
-      return finalizeReview(paseo, run, run.round, { kind: "completed" }, items);
+      return finalizeReview(paseo, run, watched, { kind: "completed" }, items);
     }
     // FIXING: find our fix message; anything the user sent after it supersedes the run.
     const expected = fixMessageId(run);
@@ -1091,7 +1163,7 @@ export function createGate(options: GateOptions): Gate {
       const verdict = JSON.parse(run.result_json ?? "null") as Verdict | null;
       if (!verdict) return fail(paseo, run, "fix round lost its findings");
       const policy = JSON.parse(run.policy_json) as Policy;
-      await paseo.agents.ref(run.source_agent_id).send(buildFixPrompt(verdict, run.round, policy.review.max_fix_rounds), {
+      await paseo.agents.ref(run.source_agent_id).send(buildFixPrompt(verdict, run.round, maxFixRounds(policy)), {
         messageId: expected,
       });
       return;

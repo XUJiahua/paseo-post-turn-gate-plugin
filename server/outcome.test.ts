@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { describe, test } from "node:test";
 import { classify, currentTurnItems, looksLikeQuestion, similarity, stopSignal } from "./outcome.ts";
 import { answerRisk } from "./permissions.ts";
-import { policySchema } from "../shared/schema.ts";
+import { gateChecks, maxFixRounds, policySchema } from "../shared/schema.ts";
 
 const user = (text: string) => ({ type: "user_message", text });
 const says = (text: string) => ({ type: "assistant_message", text });
@@ -113,12 +114,52 @@ describe("answer guards", () => {
 
 describe("on_outcome schema", () => {
   test("defaults and restrictions", () => {
-    const policy = policySchema.parse({ version: 1, action: "review" });
+    const policy = policySchema.parse({ version: 2 });
     assert.deepEqual(policy.on_outcome.awaiting_user, { answer: { max: 3 } });
     assert.equal(policy.on_outcome.network, "notify");
-    assert.equal(policySchema.safeParse({ version: 1, action: "review", on_outcome: { network: { retry: { max: 2, delay_seconds: 30 } } } }).success, true);
-    assert.equal(policySchema.safeParse({ version: 1, action: "review", on_outcome: { quota_exhausted: { retry: { max: 1, delay_seconds: 30 } } } }).success, false);
-    assert.equal(policySchema.safeParse({ version: 1, action: "review", on_outcome: { network: { answer: {} } } }).success, false);
-    assert.equal(policySchema.safeParse({ version: 1, action: "review", on_outcome: { bogus: "ignore" } }).success, false);
+    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { network: { retry: { max: 2, delay_seconds: 30 } } } }).success, true);
+    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { quota_exhausted: { retry: { max: 1, delay_seconds: 30 } } } }).success, false);
+    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { network: { answer: {} } } }).success, false);
+    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { bogus: "ignore" } }).success, false);
+  });
+
+  test("done lists the checks, on_fail picks fix rounds, each role has a default profile, v1 fields are rejected", () => {
+    const policy = policySchema.parse({ version: 2 });
+    assert.deepEqual(gateChecks(policy), ["review"]);
+    assert.equal(maxFixRounds(policy), 2, "fix is the default");
+    assert.equal(maxFixRounds(policySchema.parse({ version: 2, on_fail: "report" })), 0);
+    assert.deepEqual(gateChecks(policySchema.parse({ version: 2, on_outcome: { done: ["verify", "review"] } })), ["verify", "review"]);
+    assert.deepEqual(gateChecks(policySchema.parse({ version: 2, on_outcome: { done: "notify" } })), []);
+    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { done: [] } }).success, false);
+    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { done: ["review", "review"] } }).success, false);
+    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { done: "review" } }).success, false);
+    assert.deepEqual(
+      [policy.agents.reviewer.profile, policy.agents.verifier.profile, policy.agents.answerer.profile],
+      ["post-turn-gate-reviewer", "post-turn-gate-verifier", "post-turn-gate-answerer"],
+    );
+    assert.equal(policy.agents.answerer.timeout_minutes, 10);
+    assert.equal(policySchema.parse({ version: 2, agents: { verifier: { profile: null } } }).agents.verifier.profile, null);
+    assert.equal(policySchema.safeParse({ version: 2, reviewer: {} }).success, false);
+    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { awaiting_user: { answer: { profile: "x" } } } }).success, false);
+    assert.equal(maxFixRounds(policySchema.parse({ version: 2, on_fail: { fix: {} } })), 2);
+    assert.equal(policySchema.safeParse({ version: 2, on_fail: { fix: { max_rounds: 0 } } }).success, false);
+    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { awaiting_user: "gate" } }).success, false);
+    assert.equal(policySchema.safeParse({ version: 1, action: "review" }).success, false);
+    assert.equal(policySchema.safeParse({ version: 2, action: "review" }).success, false);
+  });
+
+  test("npm run init writes every field with its default, plus the chosen options", () => {
+    const run = (...args: string[]) =>
+      JSON.parse(execFileSync(process.execPath, ["--experimental-strip-types", "--no-warnings", "scripts/init-policy.ts", "--stdout", ...args], { encoding: "utf8" }));
+    const defaults = run();
+    assert.deepEqual(defaults, policySchema.parse({ version: 2 }));
+    assert.deepEqual(defaults.on_fail, { fix: { max_rounds: 2 } });
+    assert.equal(run("--report").on_fail, "report");
+    assert.deepEqual(defaults.on_outcome.done, ["review"]);
+    assert.equal(defaults.agents.verifier.profile, "post-turn-gate-verifier");
+    const chosen = run("--check", "verify,review", "--fix", "3");
+    assert.deepEqual(chosen.on_fail, { fix: { max_rounds: 3 } });
+    assert.deepEqual(chosen.on_outcome.done, ["verify", "review"]);
+    assert.equal(chosen.on_outcome.network, "notify", "other fields keep their defaults");
   });
 });
