@@ -13,7 +13,8 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --no-warnings --test server/*.test.ts"
+    "test": "node --experimental-strip-types --no-warnings --test server/*.test.ts",
+    "profiles": "node scripts/create-agent-profiles.mjs"
   },
   "devDependencies": {
     "@getpaseo/plugin": "0.10.1",

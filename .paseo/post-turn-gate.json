@@ -2,5 +2,6 @@
   "version": 1,
   "action": "review",
   "trigger": "root_and_opt_in",
-  "review": { "on_fail": "report", "max_fix_rounds": 2 }
+  "review": { "on_fail": "report", "max_fix_rounds": 2 },
+  "reviewer": { "profile": "post-turn-gate-reviewer" }
 }

@@ -3,7 +3,7 @@
 基于 Paseo lifecycle hook 的纯插件实现：Agent 完成一轮后，按仓库策略启动独立 Verifier / Reviewer，结果回写原 Agent timeline，可选自动修复。原始方案见 [issue #1](https://github.com/XUJiahua/paseo-post-turn-gate-plugin/issues/1)，本文按源码与实测结果对其做了修正。
 
 - 目标 Paseo 版本：`>=0.10.0`。验证基于 paseo `3b4118360`（server 0.10.0）和本机 Paseo Desktop 0.10.1。
-- 对 provider 不做限制：Reviewer 完整继承源 Agent 的配置（含 mode），不强制只读。已在真实环境验证的只有 **kiro-cli**（2.25.0），codex / claude 的验证项见 §15。
+- 对 provider 不做限制：Reviewer 默认继承源 Agent 的配置（含 mode），也可以通过 Paseo agent profile 或显式字段覆盖（§3.1）；不强制只读。已在真实环境验证的只有 **kiro-cli**（2.25.0），codex / claude 的验证项见 §15。
 
 ## 1. 已验证的平台行为
 
@@ -97,6 +97,7 @@
 | `trigger` | `root_only` / `root_and_opt_in` / `all` | `root_and_opt_in` |
 | `review.on_fail` | `report` / `fix` | `report` |
 | `review.max_fix_rounds` | 0..5 | 2 |
+| `reviewer` | 见 §3.1 | `{}`（完全继承源 Agent） |
 
 `review` 这一节同时作用于 verify。
 
@@ -104,6 +105,45 @@
 - `JSON.parse` 或 zod 校验失败：不创建子 Agent，在源 timeline 写一张 `ERROR` 卡片，并附上具体错误。
 - 策略在 `turn_started` 时读取并冻结；本轮内对它的修改只影响后续轮次。fix 轮沿用原 run 的快照。
 - 这是质量流程，不是安全边界：Agent 可以改写策略文件，关掉后续轮次的 Gate。
+
+### 3.1 Reviewer 配置
+
+```json
+"reviewer": {
+  "profile": "post-turn-gate-reviewer",
+  "provider": "codex", "model": "gpt-5.5", "mode": "auto-review", "thinking": "high",
+  "features": { "fast_mode": false },
+  "instructions": "Also check that every public function has a test.",
+  "timeout_minutes": 45
+}
+```
+
+所有字段都可选；写错字段名会作为配置错误显示在卡片上（`.strict()`）。
+
+- **分层**：源 Agent → agent profile → 显式字段，上层覆盖下层。
+- **切换 provider 时清空**：model、mode、thinking、features 都是 provider 专属的。某一层换了 provider，就丢弃从下层继承来的这些字段，不做混用。例如源 Agent 是 kiro，profile 是 codex：只用 profile 里的值，不会把 kiro 的 mode 带过去。
+- **缺 model 即报错**：最终没有 model（例如只写了 `"provider": "claude"`）→ `ERROR`，提示设置 `reviewer.model`。Paseo 创建时要求 `provider/model` 格式（V12）。
+- **profile 引用**：先按 id 精确匹配，再按 name 精确匹配；name 重名 → `ERROR`，要求改用 id。profile 不存在 → `ERROR`，并列出现有 profile。
+  - profile 存在 daemon 配置的 `daemon.agentProfiles` 里，插件在每次 dispatch 时用 `paseo.config.get()` 读取。已用测试 daemon 实测：插件会话有读取权限，profile（claude / `bypassPermissions`）会原样用于创建 Verifier。
+  - profile 不带 `systemPrompt`（Paseo 有意如此），角色 prompt 仍由插件提供。
+- **`instructions`**：追加在内置角色 prompt 之后、JSON 输出约束之前，不能替换结论格式。
+- **`timeout_minutes`**：覆盖默认的 30 分钟。
+
+#### 创建 profile 的脚本
+
+`scripts/create-agent-profiles.mjs`（`npm run profiles -- …`）会创建或更新两个 profile：`post-turn-gate-reviewer`（Gate reviewer）和 `post-turn-gate-verifier`（Gate verifier），id 固定。
+
+```bash
+npm run profiles -- --provider kiro --model claude-opus-4.8 --mode kiro_default
+npm run profiles -- --provider codex --model gpt-5.5 --role reviewer --thinking high
+```
+
+- 通过 `paseo provider ls/models --json` 校验 provider、model、mode、thinking 是否存在；
+- 通过 `paseo daemon config get/set daemon.agentProfiles` 按 id upsert：只替换脚本负责的字段，保留用户在 Settings 里改过的其他字段（如 color）；
+- 最后执行 `paseo daemon reload`（`daemon.agentProfiles` 支持热加载）；
+- 支持 `--dry-run`、`--no-reload`、`--home`；只作用于本地 daemon。
+
+`ponytail:` 写入方式是整个数组读出、修改、写回。如果恰好同时在 Settings 里保存 profile，可能丢失一次修改；更好的做法是 daemon 提供单条 upsert 的 RPC。
 
 ## 4. 流程
 
@@ -153,7 +193,7 @@ dispatch(run, round):
   ledger: status=REVIEWING
 ```
 
-- 完整继承源 Agent 的 provider、model、mode、thinking、features（K3 已在 kiro 上验证），`src.model` 为 null → `ERROR`。
+- 配置按 §3.1 分层解析：默认完整继承源 Agent 的 provider、model、mode、thinking、features（K3、K10 已在 kiro 上验证）；解析失败（profile 不存在、缺 model）→ `ERROR`。
 - `outputSchema` 一律传入：codex、opencode 和插件 provider 会生效；ACP（kiro）会忽略它（K4，已实测）；claude provider 的源码中也没有处理它，因此仍然依赖文本解析兜底。
 - prompt 由插件内置（verify / review 两个角色），包含：
   - 原始需求（源 turn 的 `user_message` 文本，保存在 ledger 中）；
@@ -334,6 +374,8 @@ server/gate.ts             # 串行队列、状态机、dispatch/finalize/fix、
 server/git.ts              # toplevel、tree 快照
 server/ledger.ts           # node:sqlite
 server/prompts.ts
+server/reviewer.ts         # 源 Agent / profile / 显式字段的分层解析
+scripts/create-agent-profiles.mjs  # 创建 reviewer/verifier agent profile（经 paseo CLI）
 client/gate-card.tsx
 server/gate.test.ts        # 真实 git + sqlite、fake paseo 的状态机测试（node:test，npm test）
 ```
@@ -346,7 +388,8 @@ server/gate.test.ts        # 真实 git + sqlite、fake paseo 的状态机测试
 - [ ] `turn_started` 冻结策略和基线 tree。
 - [ ] 支持 `none / verify / review`；只处理 `completed` 且有改动的 turn。
 - [ ] 默认只触发根 Agent，以及带 `post-turn-gate.target=true` 的子 Agent；`managed=true` 永远不触发。
-- [ ] Reviewer 与源 Agent 在同一 workspace，以源 Agent 为 parent；完整继承 provider/model/mode/thinking/features。
+- [ ] Reviewer 与源 Agent 在同一 workspace，以源 Agent 为 parent；默认继承 provider/model/mode/thinking/features，可用 agent profile 或显式字段覆盖。
+- [ ] `scripts/create-agent-profiles.mjs` 能创建、更新 reviewer/verifier profile 并热加载。
 - [ ] Reviewer 改动工作区时，卡片显示警告和 diffstat；解析失败 → ERROR；Reviewer 等待授权时，卡片显示“等待授权”，且不因此超时。
 - [ ] 卡片按 `post-turn-gate:<run_id>` 原地更新；run 到终态后归档子 Agent，并且可以在“历史”页找到。
 - [ ] `report` 只报告；`fix` 在源 Agent 空闲时发送 findings，修复后按原基线重新 review；轮次用尽 → NEEDS_HUMAN。

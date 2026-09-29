@@ -16,9 +16,13 @@ export function buildGatePrompt(input: {
   repoRoot: string;
   baseTree: string;
   endTree: string;
+  instructions?: string;
 }): string {
+  const extra = input.instructions?.trim()
+    ? `\nAdditional instructions from the repository policy:\n<<<INSTRUCTIONS\n${input.instructions.trim()}\nINSTRUCTIONS>>>\n`
+    : "";
   return `${ROLE[input.action]}
-
+${extra}
 Repository: ${input.repoRoot}
 Inspect the change with: git -C ${JSON.stringify(input.repoRoot)} diff ${input.baseTree} ${input.endTree}
 (The two shas are tree snapshots of the working directory before and after the change, including uncommitted files.)

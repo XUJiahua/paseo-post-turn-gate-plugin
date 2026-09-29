@@ -14,6 +14,7 @@ import {
 import { diffStat, snapshotTree, toplevel } from "./git.ts";
 import type { Ledger, RoundRecord, Run } from "./ledger.ts";
 import { buildFixPrompt, buildGatePrompt, latestAssistantText, parseVerdict } from "./prompts.ts";
+import { resolveReviewer } from "./reviewer.ts";
 
 export type Paseo = PluginHookContext["paseo"];
 type TurnStarted = PluginLifecycleEvents["agent.turn_started"];
@@ -73,7 +74,11 @@ function truncate(text: string, limit: number): string {
 export function createGate(options: GateOptions): Gate {
   const { ledger } = options;
   const now = options.now ?? Date.now;
-  const reviewTimeoutMs = options.reviewTimeoutMs ?? 30 * 60 * 1000;
+  const defaultTimeoutMs = options.reviewTimeoutMs ?? 30 * 60 * 1000;
+  const timeoutOf = (run: Run) => {
+    const minutes = (JSON.parse(run.policy_json) as Policy).reviewer?.timeout_minutes;
+    return minutes ? minutes * 60 * 1000 : defaultTimeoutMs;
+  };
   const log = options.log ?? ((message, detail) => console.log(`[post-turn-gate] ${message}`, detail ?? ""));
   const pending = new Map<string, Pending>();
   const waiting = new Set<string>(); // run ids whose current child waits on a permission answer
@@ -215,19 +220,25 @@ export function createGate(options: GateOptions): Gate {
     if (policy.action === "none") return;
     const source = await refreshAgent(paseo, run.source_agent_id);
     if (!source) return fail(paseo, run, "source agent no longer exists");
-    if (!source.model) return fail(paseo, run, "source agent has no resolved model to inherit");
+    const inherited = {
+      provider: source.provider,
+      ...(source.model ? { model: source.model } : {}),
+      ...(source.currentModeId ? { modeId: source.currentModeId } : {}),
+      ...(source.thinkingOptionId ? { thinkingOptionId: source.thinkingOptionId } : {}),
+      featureValues: Object.fromEntries((source.features ?? []).map((feature) => [feature.id, feature.value])),
+    };
+    // Profiles are daemon config; only read them when the policy names one.
+    const profiles = policy.reviewer.profile ? ((await paseo.config.get()).config.agentProfiles ?? []) : [];
+    const resolved = resolveReviewer(inherited, policy.reviewer, profiles);
+    if (!resolved.ok) return fail(paseo, run, resolved.error);
+    const { model, ...launch } = resolved.config;
     const childAgentId = randomUUID();
     const key = `${FIX_PREFIX}${run.run_id}:${run.round}`;
     const payload = {
       agentId: childAgentId,
       idempotencyKey: key,
       parent: run.source_agent_id,
-      config: {
-        provider: `${source.provider}/${source.model}`,
-        ...(source.currentModeId ? { modeId: source.currentModeId } : {}),
-        ...(source.thinkingOptionId ? { thinkingOptionId: source.thinkingOptionId } : {}),
-        featureValues: Object.fromEntries((source.features ?? []).map((feature) => [feature.id, feature.value])),
-      },
+      config: { ...launch, provider: `${launch.provider}/${model}` },
       title: `Gate ${policy.action} #${run.round} · ${source.title ?? run.source_agent_id.slice(0, 8)}`,
       prompt: buildGatePrompt({
         action: policy.action,
@@ -235,6 +246,7 @@ export function createGate(options: GateOptions): Gate {
         repoRoot: run.repo_root,
         baseTree: run.base_tree,
         endTree: run.end_tree,
+        instructions: policy.reviewer.instructions,
       }),
       clientMessageId: key,
       outputSchema: VERDICT_JSON_SCHEMA,
@@ -249,7 +261,7 @@ export function createGate(options: GateOptions): Gate {
       status: "DISPATCHING",
       child_agent_id: childAgentId,
       dispatch_json: JSON.stringify({ workspaceId: run.workspace_id, ...payload }),
-      deadline_at: now() + reviewTimeoutMs,
+      deadline_at: now() + timeoutOf(run),
       reviewer_changes: null,
     });
     await createChild(paseo, claimed);
@@ -318,7 +330,7 @@ export function createGate(options: GateOptions): Gate {
       await transition(paseo, run, { status: "SUPERSEDED" });
       return;
     }
-    const fixing = await transition(paseo, run, { status: "FIXING", deadline_at: now() + reviewTimeoutMs });
+    const fixing = await transition(paseo, run, { status: "FIXING", deadline_at: now() + timeoutOf(run) });
     await paseo.agents.ref(run.source_agent_id).send(buildFixPrompt(verdict, run.round, policy.review.max_fix_rounds), {
       messageId: fixMessageId(fixing),
     });
@@ -373,17 +385,20 @@ export function createGate(options: GateOptions): Gate {
 
     const snapshot = pending.get(agentId);
     pending.delete(agentId);
-    if (!snapshot || event.outcome.kind !== "completed") return;
+    const skip = (reason: string) => log(`skip ${agentId}: ${reason}`);
+    if (!snapshot) return skip("no policy snapshot from turn start (no policy file, not a git repo, or plugin started mid-turn)");
+    if (event.outcome.kind !== "completed") return skip(`turn ${event.outcome.kind}`);
     if (snapshot.error) return publishConfigError(paseo, agentId, snapshot.error);
     const policy = snapshot.policy;
-    if (!policy || policy.action === "none" || !snapshot.baseTree) return;
+    if (!policy || policy.action === "none" || !snapshot.baseTree) return skip("action none");
 
     const source = await refreshAgent(paseo, agentId);
-    if (!source || !triggers(policy, source, event.agent.parentAgentId === null)) return;
+    if (!source) return skip("agent not found");
+    if (!triggers(policy, source, event.agent.parentAgentId === null)) return skip(`not a trigger target (${policy.trigger})`);
     const workspaceId = source.workspaceId ?? event.agent.workspaceId;
-    if (!workspaceId) return;
+    if (!workspaceId) return skip("agent has no workspace");
     const endTree = await snapshotTree(snapshot.repoRoot);
-    if (endTree === snapshot.baseTree) return;
+    if (endTree === snapshot.baseTree) return skip("working tree unchanged");
 
     const run = {
       run_id: randomUUID(),
@@ -397,7 +412,8 @@ export function createGate(options: GateOptions): Gate {
       base_tree: snapshot.baseTree,
       end_tree: endTree,
     };
-    if (!ledger.claim(run, now())) return;
+    if (!ledger.claim(run, now())) return skip("run already exists for this turn");
+    log(`gate ${run.run_id} for ${agentId}: ${policy.action}`);
     await dispatch(paseo, ledger.get(run.run_id)!);
   }
 
@@ -422,9 +438,9 @@ export function createGate(options: GateOptions): Gate {
     if (!agent) return fail(paseo, run, `agent ${watched} no longer exists`);
     if (agent.status === "running" || agent.status === "initializing") {
       if (agent.pendingPermissions.length > 0) {
-        ledger.update(run.run_id, { deadline_at: now() + reviewTimeoutMs }, now());
+        ledger.update(run.run_id, { deadline_at: now() + timeoutOf(run) }, now());
       } else if (run.deadline_at !== null && now() > run.deadline_at) {
-        return fail(paseo, run, `timed out after ${Math.round(reviewTimeoutMs / 60000)} minutes`);
+        return fail(paseo, run, `timed out after ${Math.round(timeoutOf(run) / 60000)} minutes`);
       }
       return;
     }

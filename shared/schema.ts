@@ -3,6 +3,22 @@ import { z } from "zod";
 // Repository policy: <git toplevel>/.paseo/post-turn-gate.json
 export const POLICY_PATH = ".paseo/post-turn-gate.json";
 
+export const reviewerSchema = z
+  .object({
+    /** Paseo agent profile, matched by id first, then by exact name. */
+    profile: z.string().min(1).optional(),
+    provider: z.string().min(1).optional(),
+    model: z.string().min(1).optional(),
+    mode: z.string().min(1).optional(),
+    thinking: z.string().min(1).optional(),
+    features: z.record(z.string(), z.unknown()).optional(),
+    /** Appended to the built-in role prompt; cannot replace the verdict contract. */
+    instructions: z.string().max(4000).optional(),
+    timeout_minutes: z.number().int().min(1).max(240).optional(),
+  })
+  .strict();
+export type ReviewerSpec = z.output<typeof reviewerSchema>;
+
 export const policySchema = z
   .object({
     version: z.literal(1),
@@ -15,6 +31,7 @@ export const policySchema = z
       })
       .strict()
       .default({ on_fail: "report", max_fix_rounds: 2 }),
+    reviewer: reviewerSchema.default({}),
   })
   .strict();
 export type Policy = z.output<typeof policySchema>;

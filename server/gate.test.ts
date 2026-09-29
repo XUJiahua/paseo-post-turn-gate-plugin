@@ -8,6 +8,7 @@ import type { CardData } from "../shared/schema.ts";
 import { createGate, type Gate, type Paseo } from "./gate.ts";
 import { Ledger } from "./ledger.ts";
 import { parseVerdict } from "./prompts.ts";
+import { resolveReviewer } from "./reviewer.ts";
 
 // ---------- fixtures ----------
 
@@ -36,7 +37,9 @@ function createFakePaseo() {
   const archived: string[] = [];
   const cards = new Map<string, CardData>();
   let failCreate = false;
+  const profiles: Array<Record<string, unknown>> = [];
   const api = {
+    config: { get: async () => ({ requestId: "r", config: { agentProfiles: profiles } }) },
     agents: {
       ref: (id: string) => ({
         refresh: async () => (agents.has(id) ? { agent: agents.get(id), project: null } : null),
@@ -83,6 +86,7 @@ function createFakePaseo() {
     sent,
     archived,
     cards,
+    profiles,
     setFailCreate: (value: boolean) => {
       failCreate = value;
     },
@@ -505,5 +509,90 @@ describe("parseVerdict", () => {
     assert.equal(parseVerdict('{"verdict":"MAYBE","summary":"","findings":[]}'), null);
     assert.equal(parseVerdict("PASS"), null);
     assert.equal(parseVerdict(""), null);
+  });
+});
+
+describe("reviewer config", () => {
+  const source = {
+    provider: "kiro",
+    model: "claude-opus-4.8",
+    modeId: "kiro_default",
+    featureValues: { auto_accept: false },
+  };
+  const profiles = [
+    { id: "p-review", name: "Review", provider: "codex", model: "gpt-5.5", modeId: "auto-review" },
+    { id: "p-kiro", name: "Kiro planner", provider: "kiro", modeId: "kiro_planner" },
+    { id: "dup-1", name: "Dup", provider: "kiro" },
+    { id: "dup-2", name: "Dup", provider: "kiro" },
+  ];
+
+  test("inherits the source by default", () => {
+    assert.deepEqual(resolveReviewer(source, {}, []), { ok: true, config: source, source: "source agent" });
+  });
+
+  test("a profile on another provider drops every inherited provider-specific field", () => {
+    const resolved = resolveReviewer(source, { profile: "Review" }, profiles);
+    assert.deepEqual(resolved, {
+      ok: true,
+      config: { provider: "codex", model: "gpt-5.5", modeId: "auto-review" },
+      source: 'profile "Review"',
+    });
+  });
+
+  test("a profile on the same provider keeps inherited fields it does not set", () => {
+    const resolved = resolveReviewer(source, { profile: "p-kiro" }, profiles);
+    assert.ok(resolved.ok);
+    assert.deepEqual(resolved.config, { ...source, modeId: "kiro_planner" });
+  });
+
+  test("explicit fields win over the profile", () => {
+    const resolved = resolveReviewer(source, { profile: "Review", model: "gpt-5.4-mini", thinking: "high" }, profiles);
+    assert.ok(resolved.ok);
+    assert.deepEqual(resolved.config, {
+      provider: "codex",
+      model: "gpt-5.4-mini",
+      modeId: "auto-review",
+      thinkingOptionId: "high",
+    });
+  });
+
+  test("errors: unknown or ambiguous profile, provider switch without a model", () => {
+    const missing = resolveReviewer(source, { profile: "nope" }, profiles);
+    assert.ok(!missing.ok && /not found.*"Review" \(p-review\)/.test(missing.error));
+    const dup = resolveReviewer(source, { profile: "Dup" }, profiles);
+    assert.ok(!dup.ok && /ambiguous/.test(dup.error));
+    const noModel = resolveReviewer(source, { provider: "claude" }, profiles);
+    assert.ok(!noModel.ok && /set reviewer\.model/.test(noModel.error));
+  });
+
+  test("dispatch uses the profile, appends instructions, and a missing profile is an ERROR card", async () => {
+    fake.profiles.push({ id: "p-review", name: "Review", provider: "codex", model: "gpt-5.5", modeId: "auto-review" });
+    writePolicy({ version: 1, action: "review", reviewer: { profile: "Review", instructions: "Check the README too." } });
+    await sourceTurn({ change: edit, messageId: "m1" });
+    assert.deepEqual(fake.created[0].config, { provider: "codex/gpt-5.5", modeId: "auto-review" });
+    assert.match(fake.created[0].prompt, /Check the README too\./);
+    assert.match(fake.created[0].prompt, /Reply with ONLY one JSON object/, "contract stays after instructions");
+
+    fake.profiles.length = 0;
+    await sourceTurn({ change: () => writeFileSync(path.join(repo, "b.txt"), "b"), messageId: "m2" });
+    assert.equal(fake.created.length, 1);
+    const errorCard = [...fake.cards.values()].find((card) => card.status === "ERROR");
+    assert.match(errorCard?.error ?? "", /agent profile "Review" not found/);
+  });
+
+  test("an unknown reviewer key is a config error", async () => {
+    writePolicy({ version: 1, action: "review", reviewer: { profiel: "Review" } });
+    await sourceTurn({ change: edit });
+    assert.equal(fake.created.length, 0);
+    assert.match(fake.cards.get(`post-turn-gate:config:${SOURCE}`)?.error ?? "", /profiel/);
+  });
+
+  test("timeout_minutes overrides the default deadline", async () => {
+    writePolicy({ version: 1, action: "review", reviewer: { timeout_minutes: 60 } });
+    await sourceTurn({ change: edit });
+    clock += 5_000; // past the 1s test default, well inside 60 minutes
+    gate.reconcile(fake.paseo);
+    await gate.idle();
+    assert.equal(onlyRun().status, "REVIEWING");
   });
 });
