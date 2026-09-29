@@ -130,7 +130,7 @@
 
 ### 3.1 代答（answer）
 
-post-turn Agent 与 Reviewer 的创建方式相同：同一 workspace、以源 Agent 为 parent、`managed` 标签、配置按 design.md §3.1 分层解析。默认 profile 为 `post-turn-gate-answerer`，由 `npm run profiles -- --role answerer` 创建。
+post-turn Agent 与 Reviewer 的创建方式相同：同一 workspace、以源 Agent 为 parent、`managed` 标签、配置按 design.md §3.1 分层解析。默认不使用 profile，继承源 Agent 的启动配置，并加载仓库里的 `.paseo/post-turn-gate/answerer.md` 规则。
 
 prompt 包含：
 

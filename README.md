@@ -6,6 +6,18 @@ Design and verified platform behavior: [docs/design.md](docs/design.md). Workflo
 
 ## Install
 
+Install directly from GitHub; Paseo keeps a managed checkout and can update it later with `paseo plugin update post-turn-gate`:
+
+```bash
+paseo plugin install XUJiahua/paseo-post-turn-gate-plugin
+# Equivalent full URL:
+paseo plugin install https://github.com/XUJiahua/paseo-post-turn-gate-plugin.git
+```
+
+Paseo plugins are trusted, unsandboxed code. Review the repository before installing it. Use `--ref <tag-or-commit>` to pin the initial revision.
+
+For development, install this checkout instead:
+
 ```bash
 npm install            # devDependencies only, for typecheck/tests
 paseo plugin install "$PWD"
@@ -15,7 +27,14 @@ Requires Paseo >= 0.10.0 with plugins enabled (Settings → Plugins).
 
 ## Enable it for a repository
 
-Generate `.paseo/post-turn-gate.json` at the git root, edit the values you want to change, and commit it:
+Generate `.paseo/post-turn-gate.json` and the role rule templates at the target repository's git root. This can also run directly from the Git repository without cloning it:
+
+```bash
+npx --yes --package=git+https://github.com/XUJiahua/paseo-post-turn-gate-plugin.git \
+  post-turn-gate-init --dir /path/to/repo
+```
+
+This downloads and runs the repository's initializer, so review or pin the source when needed (for example, append `#<tag-or-commit>` to the Git URL). From a local checkout, the equivalent commands are:
 
 ```bash
 npm run init -- --dir /path/to/repo                            # every field with its default
@@ -24,18 +43,18 @@ npm run init -- --dir /path/to/repo --report                   # report failures
 npm run init -- --stdout                                       # print the policy instead of writing
 ```
 
-`init` writes four files:
+The initializer writes four files:
 
-- `.paseo/post-turn-gate.json`: every field with its default value. It is built from the plugin's schema, so it always matches the current format. A field you delete falls back to the same default.
-- `.paseo/post-turn-gate/reviewer.md`, `verifier.md`, `answerer.md`: a rules template per role, with examples inside an HTML comment. The plugin ignores comments, so an untouched template adds no rules; write your own below the comment. See [Choosing the agents](#choosing-the-agents).
+- `.paseo/post-turn-gate.json`: every field with its default value. Tests keep the initializer output aligned with the plugin schema. A field you delete falls back to the same default.
+- `.paseo/post-turn-gate/reviewer.md`, `verifier.md`, `answerer.md`: active repository instructions for each role. The short HTML comment is editing guidance and is ignored; the Markdown below it is included in every role prompt. Customize and commit these files with the project. See [Choosing the agents](#choosing-the-agents).
 
-It refuses to overwrite any of them unless you pass `--force`; `npm run init -- --help` lists all options.
+It refuses to overwrite any of them unless you pass `--force`; `post-turn-gate-init --help` or `npm run init -- --help` lists all options.
 
 | Field | Values | Default |
 |---|---|---|
 | `trigger` | `root_only`, `root_and_opt_in`, `all` | `root_and_opt_in` |
 | `on_fail` | `{ "fix": { "max_rounds": 1–5 } }`: send a failed check's findings back to the agent and check again, so the agent loops until its work passes. `report`: only show the result | `{ "fix": { "max_rounds": 2 } }` |
-| `agents` | launch settings for the `reviewer`, `verifier` and `answerer`, see [below](#choosing-the-agents) | each role's own profile |
+| `agents` | launch settings and repository rules for the `reviewer`, `verifier` and `answerer`, see [below](#choosing-the-agents) | inherit the source agent; load each role's repository rules file |
 | `on_outcome` | what to do for each way a turn ends, see [below](#what-happens-when-a-turn-ends) | `done: ["review"]` |
 
 ### Review, verify, or both
@@ -65,14 +84,14 @@ Each role has its own block under `agents`:
 
 ```json
 "agents": {
-  "reviewer": { "profile": "post-turn-gate-reviewer", "permissions": "auto", "timeout_minutes": 30 },
-  "verifier": { "profile": "post-turn-gate-verifier", "permissions": "auto", "timeout_minutes": 30,
+  "reviewer": { "profile": null, "permissions": "auto", "timeout_minutes": 30 },
+  "verifier": { "profile": null, "permissions": "auto", "timeout_minutes": 30,
                 "instructions": "Also run the e2e suite." },
-  "answerer": { "profile": "post-turn-gate-answerer", "permissions": "auto", "timeout_minutes": 10 }
+  "answerer": { "profile": null, "permissions": "auto", "timeout_minutes": 10 }
 }
 ```
 
-- `profile` defaults to the role's own profile, created by `npm run profiles`. If that profile does not exist yet, the role uses the source agent's settings and the card says so. A profile you name yourself must exist, otherwise the card shows an error. `null` means no profile.
+- `profile` defaults to `null`: the role inherits the source agent's launch settings and does not read a Paseo profile. Set an id or exact name only when this project deliberately opts into a shared profile. A named profile must exist, otherwise the card shows an error. Policies generated by an older release may still contain `post-turn-gate-<role>`; change those values to `null` to adopt the new default.
 - Settings are layered: source agent, then `profile`, then explicit fields (`provider`, `model`, `mode`, `thinking`, `features`). If a layer switches to another provider, nothing provider-specific is carried over from the layers below it.
 - `profile` is matched by id first, then by exact name.
 - `instructions_file` holds the role's rules for this repository, relative to the git root, so they are versioned and reviewed like code. It defaults to `.paseo/post-turn-gate/<role>.md` (`reviewer.md`, `verifier.md`, `answerer.md`); a missing file at the default path means no rules. A path you name yourself must exist and stay inside the repository. `null` turns it off.
@@ -81,16 +100,18 @@ Each role has its own block under `agents`:
 - `timeout_minutes` includes time spent waiting for a permission answer. A reviewer or verifier that times out is an ERROR; an answerer that times out hands the question to you.
 - The agents write card text (summary, findings, questions, answers) in the language of the original request. To fix a language, say so in `instructions`, for example `"Write all text in English."`.
 
+The role prompt is always built by this plugin: its built-in job and JSON contract, followed by the project-specific `instructions_file` and `instructions`. Paseo profiles only provide launch settings; they never provide or replace these prompts.
+
 For the `codex` provider, managed reviewer, verifier and answerer agents inherit the source model, mode, thinking level and Fast setting. The plugin always turns Codex Plan mode off for those child agents: a Plan-mode turn ends with a plan-approval request, while a gate role must finish with its structured JSON result. Explicitly setting `agents.<role>.features.plan_mode` to `true` is therefore also overridden.
 
-To create the profiles, run:
+Profiles are optional. To create shared launch profiles and then opt a project into one, run:
 
 ```bash
 npm run profiles -- --provider kiro --model claude-opus-4.8 --mode kiro_default
 npm run profiles -- --provider codex --model gpt-5.5 --role reviewer --dry-run
 ```
 
-This creates or updates `post-turn-gate-reviewer`, `post-turn-gate-verifier` and `post-turn-gate-answerer` in the local daemon; the default policy picks them up by id. Use `--role` to create only one of them. The script checks the provider, model, mode and thinking level before writing anything, then reloads the daemon. Run it with `--help` to see all options.
+This creates or updates `post-turn-gate-reviewer`, `post-turn-gate-verifier` and `post-turn-gate-answerer` in the local daemon. It does not change repository policy: set `agents.<role>.profile` to the desired id or name to opt in. Use `--role` to create only one profile. The script checks the provider, model, mode and thinking level before writing anything, then reloads the daemon. Run it with `--help` to see all options.
 
 ### What happens when a turn ends
 

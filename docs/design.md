@@ -103,14 +103,14 @@
 }
 ```
 
-完整的默认值用 `npm run init` 生成；它同时为每个角色生成规则模版 `.paseo/post-turn-gate/<role>.md`，示例写在 HTML 注释里。插件读取规则文件时去掉 HTML 注释，所以未修改的模版不添加任何规则。
+完整的默认值用 `npm run init` 生成；它同时为每个角色生成可直接生效的仓库规则 `.paseo/post-turn-gate/<role>.md`。文件开头的 HTML 注释只是编辑说明，插件会忽略；注释后的 Markdown 是实际提示词，默认强调先读取本仓库的文档、配置、测试和既有约定，可以按项目继续修改并提交。
 
 | 字段 | 取值 | 默认 |
 |---|---|---|
 | `trigger` | `root_only` / `root_and_opt_in` / `all` | `root_and_opt_in` |
 | `on_fail` | `{ "fix": { "max_rounds": 1..5 } }` / `report` | `{ "fix": { "max_rounds": 2 } }`：插件的目的是让 agent 自动循环到通过 |
 | `on_outcome.done` | 检查列表（`review`、`verify` 的非空、不重复的有序组合）/ `notify` / `ignore` | `["review"]` |
-| `agents.reviewer` / `agents.verifier` / `agents.answerer` | 见 §3.1 | 各自的默认 profile |
+| `agents.reviewer` / `agents.verifier` / `agents.answerer` | 见 §3.1 | 不使用 profile，继承源 Agent 启动配置并加载各自的仓库规则文件 |
 
 做哪些检查只由 `on_outcome.done` 决定，其余情况（例如 `awaiting_user: "as_done"`、answerer 判断其实已完成）都归到 `done` 再处理，所以不存在"要检查却没有检查项"的组合。
 
@@ -133,7 +133,7 @@
 ```json
 "agents": {
   "reviewer": {
-    "profile": "post-turn-gate-reviewer",
+    "profile": null,
     "provider": "codex", "model": "gpt-5.5", "mode": "auto-review", "thinking": "high",
     "features": { "fast_mode": false },
     "instructions": "Also check that every public function has a test.",
@@ -145,7 +145,7 @@
 
 | 字段 | 默认 |
 |---|---|
-| `profile` | 角色自己的 profile：`post-turn-gate-reviewer` / `-verifier` / `-answerer`；`null` 表示不用 profile |
+| `profile` | `null`：不用 profile，继承源 Agent 的启动配置 |
 | `permissions` | `auto` |
 | `timeout_minutes` | reviewer、verifier 30；answerer 10 |
 | `instructions_file` | `.paseo/post-turn-gate/<role>.md`（不存在则忽略） |
@@ -154,13 +154,13 @@
 写错字段名会作为配置错误显示在卡片上（`.strict()`）。
 
 - **分层**：源 Agent → agent profile → 显式字段，上层覆盖下层。
-- **默认 profile 可以不存在**：`profile` 等于角色默认 id 而 daemon 里没有这个 profile 时，改为继承源 Agent，并在卡片上提示运行 `npm run profiles`。这样没建过 profile 也能直接用。用户自己写的其他 profile 必须存在，否则 `ERROR`。
+- **profile 默认关闭**：初始化策略写入 `null`，因此默认路径不读取 Paseo profile。只有项目显式填写 id 或 name 时才使用共享 profile。旧版本生成的 `post-turn-gate-<role>` 引用在 profile 不存在时仍回退到源 Agent 并提示改为 `null`，用于兼容迁移。
 - **切换 provider 时清空**：model、mode、thinking、features 都是 provider 专属的。某一层换了 provider，就丢弃从下层继承来的这些字段，不做混用。例如源 Agent 是 kiro，profile 是 codex：只用 profile 里的值，不会把 kiro 的 mode 带过去。
 - **Codex Plan mode 例外**：Gate 托管的三个角色都必须输出结构化结果，因此最终 provider 为 `codex` 且存在 `plan_mode` 时会强制设为 `false`；Fast 等其他 feature 保持分层后的值。
 - **缺 model 即报错**：最终没有 model（例如只写了 `"provider": "claude"`）→ `ERROR`，提示设置 `model`。Paseo 创建时要求 `provider/model` 格式（V12）。
 - **profile 引用**：先按 id 精确匹配，再按 name 精确匹配；name 重名 → `ERROR`，要求改用 id。profile 不存在 → `ERROR`，并列出现有 profile。
   - profile 存在 daemon 配置的 `daemon.agentProfiles` 里，插件在每次 dispatch 时用 `paseo.config.get()` 读取。已用测试 daemon 实测：插件会话有读取权限，profile（claude / `bypassPermissions`）会原样用于创建 Verifier。
-  - profile 不带 `systemPrompt`（Paseo 有意如此），角色 prompt 仍由插件提供。
+  - profile 只提供启动设置，不带 `systemPrompt`。角色 prompt 始终由插件的内置职责/JSON 契约与仓库中的 `instructions_file` / `instructions` 组成。
 - **`instructions_file`**：仓库里的规则文件（相对 git 根目录），默认 `.paseo/post-turn-gate/<role>.md`。默认路径不存在时视为没有规则；自己写的路径必须存在且在仓库内，否则配置错误。`null` 关闭。
 - **`instructions`**：内联规则，接在文件内容之后。两者合计不超过 20000 字符，追加在内置角色 prompt 之后、JSON 输出约束之前，不能替换结论格式。
 - 规则文件在 `turn_started` 时和策略一起读取并冻结到 run/chain 里：Agent 在本轮改规则文件，不影响对本轮的检查。
@@ -168,7 +168,7 @@
 
 #### 创建 profile 的脚本
 
-`scripts/create-agent-profiles.mjs`（`npm run profiles -- …`）会创建或更新三个 profile：`post-turn-gate-reviewer`（Gate reviewer）、`post-turn-gate-verifier`（Gate verifier）和 `post-turn-gate-answerer`（Gate answerer），id 固定，插件按 id 自动使用。
+`scripts/create-agent-profiles.mjs`（`npm run profiles -- …`）可选地创建或更新三个共享启动 profile：`post-turn-gate-reviewer`（Gate reviewer）、`post-turn-gate-verifier`（Gate verifier）和 `post-turn-gate-answerer`（Gate answerer）。创建后仍需在目标项目的 `agents.<role>.profile` 中显式填写 id 或 name 才会使用。
 
 ```bash
 npm run profiles -- --provider kiro --model claude-opus-4.8 --mode kiro_default

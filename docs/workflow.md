@@ -90,7 +90,7 @@ sequenceDiagram
 - 修了 `max_rounds` 轮还是 FAIL，卡片变成 NEEDS_HUMAN，交给你处理。
 - 修复期间你自己发了消息，这次审查标为 SUPERSEDED，以你的消息为准。
 
-每个仓库的审查规则可以写在 `.paseo/post-turn-gate/reviewer.md` 里（`npm run init` 会生成带示例的模版，示例在 HTML 注释里，不会生效），和代码一起提交，例如"金额一律用整数分"、"新接口必须有集成测试"。reviewer 会把它当作额外规则。verifier、answerer 分别对应 `verifier.md`、`answerer.md`。
+每个仓库的审查规则写在 `.paseo/post-turn-gate/reviewer.md` 里。`npm run init` 会生成一份立即生效的默认规则：HTML 注释只是编辑说明，注释后的 Markdown 会加入提示词。继续按项目补充并和代码一起提交，例如"金额一律用整数分"、"新接口必须有集成测试"。verifier、answerer 分别对应 `verifier.md`、`answerer.md`。
 
 ## 场景 2b：按需求逐项核对（verify）
 
@@ -111,7 +111,7 @@ sequenceDiagram
   G-->>你: 卡片 Verify · FAILED（或按 on_fail 发回修复）
 ```
 
-verifier 和 reviewer 的区别只在于问的问题：reviewer 问"代码对不对、好不好维护"，verifier 问"要的东西是不是都有了"。verifier 用 `agents.verifier` 的配置，默认 profile 是 `post-turn-gate-verifier`；这个 profile 还没建时继承开发 agent 的配置，卡片上会提示。
+verifier 和 reviewer 的区别只在于问的问题：reviewer 问"代码对不对、好不好维护"，verifier 问"要的东西是不是都有了"。verifier 用 `agents.verifier` 的配置；默认不使用 profile，继承开发 agent 的启动配置，并加载仓库里的 `.paseo/post-turn-gate/verifier.md` 规则。
 
 ## 场景 2c：先核对需求，再审代码
 
