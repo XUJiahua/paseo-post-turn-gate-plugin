@@ -436,7 +436,6 @@ export function createGate(options: GateOptions): Gate {
       reviewer_changes: reviewerChanges,
       rounds_json: JSON.stringify(rounds),
     };
-    await archiveChild(paseo, childAgentId);
     if (verdict.verdict !== "FAIL") {
       // Checks run in order until one fails; INCONCLUSIVE does not block the next check.
       const next = run.step + 1;
@@ -444,7 +443,9 @@ export function createGate(options: GateOptions): Gate {
         // DISPATCHING without a payload: after a crash here, reconcile dispatches the next check instead of
         // re-reading the finished child's verdict and advancing twice.
         const advanced = { ...base, step: next, status: "DISPATCHING" as const, dispatch_json: null, child_agent_id: null };
-        return dispatch(paseo, ledger.update(run.run_id, advanced, now()));
+        const dispatching = await transition(paseo, run, advanced);
+        await archiveChild(paseo, childAgentId);
+        return dispatch(paseo, dispatching);
       }
       const inconclusive = rounds.some((record) => record.round === round && record.verdict === "INCONCLUSIVE");
       await transition(paseo, run, { ...base, status: inconclusive ? "INCONCLUSIVE" : "PASSED" });
@@ -453,17 +454,23 @@ export function createGate(options: GateOptions): Gate {
     } else if (round - 1 >= maxFixRounds(policy)) {
       await transition(paseo, run, { ...base, status: "NEEDS_HUMAN" });
     } else {
-      await sendFix(paseo, ledger.update(run.run_id, base, now()), verdict, policy);
+      try {
+        await sendFix(paseo, ledger.update(run.run_id, base, now()), verdict, policy);
+      } finally {
+        await archiveChild(paseo, childAgentId);
+      }
+      return;
     }
+    await archiveChild(paseo, childAgentId);
   }
 
   async function sendFix(paseo: Paseo, run: Run, verdict: Verdict, policy: Policy): Promise<void> {
+    const fixing = await transition(paseo, run, { status: "FIXING", deadline_at: now() + timeoutOf(run) });
     const source = await refreshAgent(paseo, run.source_agent_id);
     if (!source || source.status !== "idle") {
-      await transition(paseo, run, { status: "SUPERSEDED" });
+      await transition(paseo, fixing, { status: "SUPERSEDED" });
       return;
     }
-    const fixing = await transition(paseo, run, { status: "FIXING", deadline_at: now() + timeoutOf(run) });
     await paseo.agents.ref(run.source_agent_id).send(buildFixPrompt(verdict, run.round, maxFixRounds(policy)), {
       messageId: fixMessageId(fixing),
     });

@@ -36,6 +36,7 @@ function createFakePaseo() {
   const created: Array<Record<string, any>> = [];
   const sent: Array<{ agentId: string; text: string; messageId?: string }> = [];
   const archived: string[] = [];
+  const cardsAtArchive: Array<{ agentId: string; status: CardData["status"] | null }> = [];
   const answered: Array<{ agentId: string; requestId: string; response: Record<string, unknown> }> = [];
   const cards = new Map<string, CardData>();
   const cardAppends: Array<{ agentId: string; id: string; data: CardData }> = [];
@@ -53,6 +54,8 @@ function createFakePaseo() {
           answered.push({ agentId: id, ...options });
         },
         archive: async () => {
+          const card = [...cards.values()].reverse().find((candidate) => candidate.childAgentId === id);
+          cardsAtArchive.push({ agentId: id, status: card?.status ?? null });
           archived.push(id);
           return { archivedAt: new Date().toISOString() };
         },
@@ -92,6 +95,7 @@ function createFakePaseo() {
     created,
     sent,
     archived,
+    cardsAtArchive,
     answered,
     cards,
     cardAppends,
@@ -358,6 +362,9 @@ describe("dispatch and report", () => {
     assert.match(fake.created[0].prompt, /VERIFIER/);
     await childTurn(fake.created[0].agentId, PASS);
     assert.equal(onlyRun().status, "PASSED");
+    assert.deepEqual(fake.cardsAtArchive, [
+      { agentId: fake.created[0].agentId, status: "PASSED" },
+    ], "publish the terminal card before the reviewer disappears from Subagents");
   });
 
   test("several checks run in order; all must pass", async () => {
