@@ -87,10 +87,9 @@
 
 ```json
 {
-  "version": 1,
-  "action": "review",
+  "version": 2,
   "on_outcome": {
-    "awaiting_user": { "answer": { "max": 3, "instructions": "Prefer the simplest option; never approve deleting data." } },
+    "awaiting_user": { "answer": { "max": 3 } },
     "network": { "retry": { "max": 2, "delay_seconds": 30, "message": "The connection dropped. Continue from where you left off." } },
     "rate_limited": { "retry": { "max": 1, "delay_seconds": 120 } }
   }
@@ -101,17 +100,18 @@
 
 | 动作 | 含义 |
 |---|---|
-| `gate` | 执行 `action`（review/verify）：现有逻辑，仍然要求工作区有改动 |
+| `["review"]` / `["verify"]` / `["verify", "review"]` 等 | 只用于 `done`：按顺序检查任务的改动（review 看代码质量，verify 核对需求是否交付），仍然要求工作区有改动 |
+| `as_done` | 只用于 `awaiting_user`：当作已完成，按 `done` 处理 |
 | `notify` | 在原 Agent 的 timeline 写一张“结束原因”卡片：类别、错误摘要、建议的下一步 |
 | `ignore` | 只记日志 |
 | `{ "retry": { "max": 1-3, "delay_seconds": 5-3600, "message"? } }` | 延迟后向原 Agent 发一条“继续”消息；超过次数后按 `notify` 处理。`message` 默认为 `Continue from where you left off.` |
-| `{ "answer": { "max": 1-10, "instructions"?, "profile"? } }` | 由 post-turn Agent 代替用户回答（§3.1）；超过次数或它选择 `escalate` 时按 `notify` 处理。只对 `awaiting_user` 有效 |
+| `{ "answer": { "max": 1-10 } }` | 由 post-turn Agent 代替用户回答（§3.1）；超过次数或它选择 `escalate` 时按 `notify` 处理。只对 `awaiting_user` 有效 |
 
 默认值（保守，不做任何自动重试）：
 
 | 类别 | 默认 | 可配置为 retry | 卡片上的建议 |
 |---|---|---|---|
-| `done` | `gate` | 否 | — |
+| `done` | `["review"]` | 否 | — |
 | `awaiting_user` | `answer`，`max: 3` | 否（用 `answer`） | 放弃代答时：“Agent 在等你回答：<question>（原因：<reason>）” |
 | `user_canceled`、`replaced` | `ignore` | 否 | — |
 | `crashed` | `notify` | 是 | “Agent 进程退出。可以发消息让它继续，Paseo 会重新拉起会话。” |
@@ -213,9 +213,9 @@ data = { category, message, suggestion, attempt, maxAttempts, nextRetryAt }
 - 结束原因卡片按任务链复用一张（id 为 `post-turn-gate:outcome:<chainId>`），不再按轮次各写一张。重试、代答、结束都在同一张卡片上原地更新。
 - 死循环保护的相似度阈值定为 0.5（字符 bigram Jaccard），宁可多转交给用户，也不要循环。
 - **修复了一个已有 bug**：被打断的场景下（E4），新一轮的 `turn_started` 比旧一轮的 `turn_ended` 先到，旧的结束事件会把新一轮的快照删掉，导致新一轮不被 review。现在 pending 带 `turnId`，只由同一个 turn 消费；并且新一轮沿用被打断那一轮的基线，保证被打断那一轮的改动也在 review 范围内。
-- answerer 的配置：`answer.profile` → 已存在的 `post-turn-gate-answerer` profile → `reviewer` 配置，逐级回退。
+- answerer 的 profile、instructions、权限和超时都在 `agents.answerer`（design.md §3.1），`answer` 里只有次数上限。
 - 重试时，源 Agent 状态为 `idle` 或 `error` 都允许发送：失败后的状态是 `error`（E5、E6）。
-- `action: "none"` 时 `on_outcome` 仍然生效（代答、重试、通知），只是不做 review。
+- `done` 为 `notify` 或 `ignore` 时 `on_outcome` 的其余部分仍然生效（代答、重试、通知），只是不做检查。
 - messageId 前缀：answerer 自己的 prompt 用 `ptg:ask:`，发给源 Agent 的代答用 `ptg:answer:`，重试用 `ptg:retry:`，fix 轮保持 `ptg:<run>:fix:<n>`。
 
 ## 7.2 截断、拒答的启发式识别（第 1 类，已实现）
@@ -238,8 +238,8 @@ Paseo 不传 `stopReason`（S1），所以粗筛额外加入以下信号，命�
 
 原则：插件自己**永远不会无限等待**。只有真正需要人来判断的事才交给人；交出去时，卡片会写明该怎么继续。
 
-- **Reviewer / Verifier**：超时（默认 30 分钟）也包括等待授权的时间，不再因为有待处理的权限请求而顺延。超时后判 `ERROR`，写明 “a permission request was not answered”，并归档 Reviewer。常规请求本来就会自动批准（design.md §5），会等待的只剩高风险请求。
-- **answerer**：超时 10 分钟；超时后把问题交给用户。
+- **Reviewer / Verifier**：超时（`agents.<role>.timeout_minutes`，默认 30 分钟）也包括等待授权的时间，不再因为有待处理的权限请求而顺延。超时后判 `ERROR`，写明 “a permission request was not answered”，并归档 Reviewer。常规请求本来就会自动批准（design.md §5），会等待的只剩高风险请求。
+- **answerer**：超时（`agents.answerer.timeout_minutes`，默认 10 分钟）；超时后把问题交给用户。
 - **needs_user**：这是 Agent 本身停下来等人，并不是插件卡住。卡片提示 “Reply in the chat to continue”。你一回复，卡片立即变为 “You replied; the task continues”，这条任务链之后的轮次照常代答、review。
 - **answerer 更敢答**：Agent 自己给出了推荐选项，而且该选项可逆、在仓库内、没有超出原需求范围时，answerer 回复 “Go with your recommendation.”。超出原需求范围的（例如用户只要分析，Agent 提议动手实现）仍然转交给用户。线上第一次 needs_user 就属于这种情况，按规则转交是对的。
 

@@ -84,55 +84,79 @@
 
 ```json
 {
-  "version": 1,
-  "action": "review",
+  "version": 2,
   "trigger": "root_and_opt_in",
-  "review": { "on_fail": "report", "max_fix_rounds": 2 }
+  "on_fail": { "fix": { "max_rounds": 2 } },
+  "agents": { "reviewer": {}, "verifier": {}, "answerer": {} },
+  "on_outcome": { "done": ["review"] }
 }
 ```
 
+完整的默认值用 `npm run init` 生成；它同时为每个角色生成规则模版 `.paseo/post-turn-gate/<role>.md`，示例写在 HTML 注释里。插件读取规则文件时去掉 HTML 注释，所以未修改的模版不添加任何规则。
+
 | 字段 | 取值 | 默认 |
 |---|---|---|
-| `action` | `none` / `verify` / `review` | 必填 |
 | `trigger` | `root_only` / `root_and_opt_in` / `all` | `root_and_opt_in` |
-| `review.on_fail` | `report` / `fix` | `report` |
-| `review.max_fix_rounds` | 0..5 | 2 |
-| `reviewer` | 见 §3.1 | `{}`（完全继承源 Agent） |
+| `on_fail` | `{ "fix": { "max_rounds": 1..5 } }` / `report` | `{ "fix": { "max_rounds": 2 } }`：插件的目的是让 agent 自动循环到通过 |
+| `on_outcome.done` | 检查列表（`review`、`verify` 的非空、不重复的有序组合）/ `notify` / `ignore` | `["review"]` |
+| `agents.reviewer` / `agents.verifier` / `agents.answerer` | 见 §3.1 | 各自的默认 profile |
 
-`review` 这一节同时作用于 verify。
+做哪些检查只由 `on_outcome.done` 决定，其余情况（例如 `awaiting_user: "as_done"`、answerer 判断其实已完成）都归到 `done` 再处理，所以不存在"要检查却没有检查项"的组合。
+
+多个检查按列表顺序串行执行：
+
+- 第一个 FAIL 结束本轮；全部 PASS 才是 PASSED；有 INCONCLUSIVE 时继续后面的检查，最终为 INCONCLUSIVE。
+- `on_fail` 为 fix 时只把失败那一项的 findings 发回；修复轮从第一项重新开始（修复可能破坏已通过的检查）。`max_rounds` 按整个任务计。
+- run 用 `step` 记录当前检查项，`rounds_json` 每条带 `check`。只有 run 当前的子 Agent（`child_agent_id`）的结果有效，早先检查项的迟到回复会被忽略。
+- 不并行：两个子 Agent 在同一工作区跑构建和测试会互相干扰，两份 findings 也难合并成一个修复提示。
 
 - 不在 git 仓库里，或文件不存在：不执行 Gate。
 - `JSON.parse` 或 zod 校验失败：不创建子 Agent，在源 timeline 写一张 `ERROR` 卡片，并附上具体错误。
 - 策略在 `turn_started` 时读取并冻结；本轮内对它的修改只影响后续轮次。fix 轮沿用原 run 的快照。
 - 这是质量流程，不是安全边界：Agent 可以改写策略文件，关掉后续轮次的 Gate。
 
-### 3.1 Reviewer 配置
+### 3.1 子 Agent 配置（`agents`）
+
+每个角色一节，字段相同：
 
 ```json
-"reviewer": {
-  "profile": "post-turn-gate-reviewer",
-  "provider": "codex", "model": "gpt-5.5", "mode": "auto-review", "thinking": "high",
-  "features": { "fast_mode": false },
-  "instructions": "Also check that every public function has a test.",
-  "timeout_minutes": 45,
-  "permissions": "auto"
+"agents": {
+  "reviewer": {
+    "profile": "post-turn-gate-reviewer",
+    "provider": "codex", "model": "gpt-5.5", "mode": "auto-review", "thinking": "high",
+    "features": { "fast_mode": false },
+    "instructions": "Also check that every public function has a test.",
+    "timeout_minutes": 45,
+    "permissions": "auto"
+  }
 }
 ```
 
-所有字段都可选；写错字段名会作为配置错误显示在卡片上（`.strict()`）。
+| 字段 | 默认 |
+|---|---|
+| `profile` | 角色自己的 profile：`post-turn-gate-reviewer` / `-verifier` / `-answerer`；`null` 表示不用 profile |
+| `permissions` | `auto` |
+| `timeout_minutes` | reviewer、verifier 30；answerer 10 |
+| `instructions_file` | `.paseo/post-turn-gate/<role>.md`（不存在则忽略） |
+| `provider`、`model`、`mode`、`thinking`、`features`、`instructions` | 无 |
+
+写错字段名会作为配置错误显示在卡片上（`.strict()`）。
 
 - **分层**：源 Agent → agent profile → 显式字段，上层覆盖下层。
+- **默认 profile 可以不存在**：`profile` 等于角色默认 id 而 daemon 里没有这个 profile 时，改为继承源 Agent，并在卡片上提示运行 `npm run profiles`。这样没建过 profile 也能直接用。用户自己写的其他 profile 必须存在，否则 `ERROR`。
 - **切换 provider 时清空**：model、mode、thinking、features 都是 provider 专属的。某一层换了 provider，就丢弃从下层继承来的这些字段，不做混用。例如源 Agent 是 kiro，profile 是 codex：只用 profile 里的值，不会把 kiro 的 mode 带过去。
-- **缺 model 即报错**：最终没有 model（例如只写了 `"provider": "claude"`）→ `ERROR`，提示设置 `reviewer.model`。Paseo 创建时要求 `provider/model` 格式（V12）。
+- **缺 model 即报错**：最终没有 model（例如只写了 `"provider": "claude"`）→ `ERROR`，提示设置 `model`。Paseo 创建时要求 `provider/model` 格式（V12）。
 - **profile 引用**：先按 id 精确匹配，再按 name 精确匹配；name 重名 → `ERROR`，要求改用 id。profile 不存在 → `ERROR`，并列出现有 profile。
   - profile 存在 daemon 配置的 `daemon.agentProfiles` 里，插件在每次 dispatch 时用 `paseo.config.get()` 读取。已用测试 daemon 实测：插件会话有读取权限，profile（claude / `bypassPermissions`）会原样用于创建 Verifier。
   - profile 不带 `systemPrompt`（Paseo 有意如此），角色 prompt 仍由插件提供。
-- **`instructions`**：追加在内置角色 prompt 之后、JSON 输出约束之前，不能替换结论格式。
-- **`timeout_minutes`**：覆盖默认的 30 分钟。
+- **`instructions_file`**：仓库里的规则文件（相对 git 根目录），默认 `.paseo/post-turn-gate/<role>.md`。默认路径不存在时视为没有规则；自己写的路径必须存在且在仓库内，否则配置错误。`null` 关闭。
+- **`instructions`**：内联规则，接在文件内容之后。两者合计不超过 20000 字符，追加在内置角色 prompt 之后、JSON 输出约束之前，不能替换结论格式。
+- 规则文件在 `turn_started` 时和策略一起读取并冻结到 run/chain 里：Agent 在本轮改规则文件，不影响对本轮的检查。
+- **`timeout_minutes`**：包括等待授权的时间。reviewer / verifier 超时判 `ERROR`；answerer 超时把问题交给用户。
 
 #### 创建 profile 的脚本
 
-`scripts/create-agent-profiles.mjs`（`npm run profiles -- …`）会创建或更新两个 profile：`post-turn-gate-reviewer`（Gate reviewer）和 `post-turn-gate-verifier`（Gate verifier），id 固定。
+`scripts/create-agent-profiles.mjs`（`npm run profiles -- …`）会创建或更新三个 profile：`post-turn-gate-reviewer`（Gate reviewer）、`post-turn-gate-verifier`（Gate verifier）和 `post-turn-gate-answerer`（Gate answerer），id 固定，插件按 id 自动使用。
 
 ```bash
 npm run profiles -- --provider kiro --model claude-opus-4.8 --mode kiro_default
@@ -217,7 +241,7 @@ finalizeReview(run, outcome, childTimeline):
   INCONCLUSIVE → INCONCLUSIVE
   FAIL:
     report → FAILED
-    fix 且 round-1 < max_fix_rounds → sendFix
+    fix 且 round-1 < fix.max_rounds → sendFix
     否则 → NEEDS_HUMAN
   每次状态变化后：更新卡片；状态为终态 → 归档子 Agent（§6）
 ```
@@ -258,11 +282,11 @@ Reviewer 不强制只读，与源 Agent 采用相同的权限模型：
 - **检测**：review 前后对比 tree（§4.4）。发生变化时，卡片显示 “Reviewer 修改了 N 个文件” 和 diffstat，verdict 照常采用（K12 已在 kiro 上实测）。
   - report 模式：改动留在工作区，由用户决定是否保留；
   - fix 模式：下一轮的 `end_tree` 在修复轮结束后重新计算，Reviewer 的改动会一起进入下一次 review 的 diff 范围，不会被遗漏。
-- **权限请求**：默认自动处理（`reviewer.permissions: "auto"`）。引入 gate 的目的就是减少人工反复确认，因此：
+- **权限请求**：默认自动处理（`agents.<role>.permissions: "auto"`）。引入 gate 的目的就是减少人工反复确认，因此：
   - 常规工具调用（读文件、搜索、构建、跑测试、仓库内编辑）由插件以 `allow_once` 自动批准，不留长期授权；
   - 不可逆、对外、提权、涉及凭据的请求（`rm -rf`、`git push/reset --hard`、`sudo`、发布、云/部署工具、`curl | sh`、破坏性 SQL、仓库外路径、`.env`/私钥等），以及 plan、question、mode 类请求，不自动批准，显示在卡片上，附带原因和按钮，由用户决定；
   - 规则在 `server/permissions.ts`，是模式列表而不是 shell 解析器，用 `ponytail:` 注明了上限；
-  - `reviewer.permissions: "ask"` 可恢复为每个请求都问用户；
+  - `agents.<role>.permissions: "ask"` 可恢复为每个请求都问用户；
   - 卡片显示已自动批准的次数。等待用户期间不计入超时（§9）。
 
 `ponytail:` 这里只能事后发现改动，不能事前阻止。需要硬约束时，可以按 provider 增加只读 mode 映射，作为后续可选项。kiro 已验证可行的做法（K7、K8）：单独建一个 agent，`tools` 中不包含 `write`；shell 设置 `allowedCommands: ["git (status|diff|log|show)( .*)?"]` 和 `denyByDefault: true`；`includeMcpJson: false`。这样做的代价是 Verify 无法再运行测试。
@@ -393,7 +417,7 @@ server/gate.test.ts        # 真实 git + sqlite、fake paseo 的状态机测试
 
 - [ ] 读取并校验 `.paseo/post-turn-gate.json`；无效时显示 ERROR 卡片，不创建子 Agent。
 - [ ] `turn_started` 冻结策略和基线 tree。
-- [ ] 支持 `none / verify / review`；只处理 `completed` 且有改动的 turn。
+- [ ] 支持 `done` 检查列表（review、verify，按顺序）；只处理 `completed` 且有改动的 turn。
 - [ ] 默认只触发根 Agent，以及带 `post-turn-gate.target=true` 的子 Agent；`managed=true` 永远不触发。
 - [ ] Reviewer 与源 Agent 在同一 workspace，以源 Agent 为 parent；默认继承 provider/model/mode/thinking/features，可用 agent profile 或显式字段覆盖。
 - [ ] `scripts/create-agent-profiles.mjs` 能创建、更新 reviewer/verifier profile 并热加载。

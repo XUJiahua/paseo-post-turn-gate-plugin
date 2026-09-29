@@ -2,13 +2,12 @@
 
 下面每个场景都是一次真实会发生的对话：你对 agent 说了什么，插件在背后做了什么，时间线上出现什么卡片。实现细节见 [design.md](design.md) 和 [turn-outcomes.md](turn-outcomes.md)。
 
-示例仓库的策略文件 `.paseo/post-turn-gate.json`：
+示例仓库的策略文件 `.paseo/post-turn-gate.json`（用 `npm run init` 生成全部默认值后改了这几项，下面只列出改过的）：
 
 ```json
 {
-  "version": 1,
-  "action": "review",
-  "review": { "on_fail": "fix", "max_fix_rounds": 2 },
+  "version": 2,
+  "on_fail": { "fix": { "max_rounds": 2 } },
   "on_outcome": {
     "awaiting_user": { "answer": { "max": 3 } },
     "network": { "retry": { "max": 2, "delay_seconds": 30 } }
@@ -23,7 +22,7 @@ flowchart TD
   A[你给 agent 发消息，agent 开始干活] --> B[插件记下工作区快照 baseTree]
   B --> C[agent 这一轮结束]
   C --> D{这一轮是怎么结束的？}
-  D -- 做完了，而且改了文件 --> R[派 reviewer 审查改动]
+  D -- 做完了，而且改了文件 --> R[派 reviewer 审查改动<br/>或 verifier 核对需求]
   D -- 做完了，但没改文件 --> N[什么都不做]
   D -- 停下来问你 / 没说完 --> Q[派 answerer 判断能不能替你回答]
   D -- 网络错误 / 限流 --> T[按配置稍后自动重试]
@@ -86,9 +85,62 @@ sequenceDiagram
   G-->>你: 卡片 PASS
 ```
 
-- `on_fail: "report"` 时只出 FAILED 卡片，不会发回去修。
-- 修了 `max_fix_rounds` 轮还是 FAIL，卡片变成 NEEDS_HUMAN，交给你处理。
+- 自动修复是默认行为（`max_rounds: 2`），目的是让 agent 自己循环到通过。设为 `"on_fail": "report"`（或 `npm run init -- --report`）时只出 FAILED 卡片，不发回去修。
+- 修了 `max_rounds` 轮还是 FAIL，卡片变成 NEEDS_HUMAN，交给你处理。
 - 修复期间你自己发了消息，这次审查标为 SUPERSEDED，以你的消息为准。
+
+每个仓库的审查规则可以写在 `.paseo/post-turn-gate/reviewer.md` 里（`npm run init` 会生成带示例的模版，示例在 HTML 注释里，不会生效），和代码一起提交，例如"金额一律用整数分"、"新接口必须有集成测试"。reviewer 会把它当作额外规则。verifier、answerer 分别对应 `verifier.md`、`answerer.md`。
+
+## 场景 2b：按需求逐项核对（verify）
+
+你说："给 /users 加分页：支持 limit 和 offset，limit 最大 100，返回 total。" 这类请求是一张需求清单，比起代码风格，你更关心每一条是否都做到了。策略里写 `"on_outcome": { "done": ["verify"] }`（或 `npm run init -- --check verify`）。
+
+```mermaid
+sequenceDiagram
+  actor 你
+  participant A as 开发 agent
+  participant G as 插件
+  participant V as verifier（子 agent）
+
+  你->>A: 分页：limit/offset，limit ≤ 100，返回 total
+  A-->>G: 完成
+  G->>V: "改动是否完整实现了原始请求？"
+  V->>V: 把每条需求对应到改动，跑构建和测试
+  V-->>G: FAIL · [HIGH] 没有返回 total
+  G-->>你: 卡片 Verify · FAILED（或按 on_fail 发回修复）
+```
+
+verifier 和 reviewer 的区别只在于问的问题：reviewer 问"代码对不对、好不好维护"，verifier 问"要的东西是不是都有了"。verifier 用 `agents.verifier` 的配置，默认 profile 是 `post-turn-gate-verifier`；这个 profile 还没建时继承开发 agent 的配置，卡片上会提示。
+
+## 场景 2c：先核对需求，再审代码
+
+同一个分页需求，你既想确认需求都做到了，也想让人看看代码质量。策略里写 `"on_outcome": { "done": ["verify", "review"] }`（或 `npm run init -- --check verify,review`），`on_fail` 保持默认的 `{ "fix": { "max_rounds": 2 } }`。
+
+```mermaid
+sequenceDiagram
+  actor 你
+  participant A as 开发 agent
+  participant G as 插件
+  participant V as verifier
+  participant R as reviewer
+
+  A-->>G: 完成
+  G->>V: 第 1 轮 · 核对需求
+  V-->>G: FAIL · [HIGH] 没有返回 total
+  Note over G,R: verify 失败，本轮不再审代码
+  G->>A: 修复 total 的问题
+  A-->>G: 修好了
+  G->>V: 第 2 轮 · 重新从 verify 开始
+  V-->>G: PASS
+  G->>R: 第 2 轮 · 审代码
+  R-->>G: PASS
+  G-->>你: 卡片 Verify → Review · PASS，每项一行
+```
+
+- 按列表顺序执行，第一个 FAIL 就停：需求没做到时审代码意义不大，修复时代码还会改。
+- 修复后从第一项重新检查，因为修复可能破坏已经通过的检查。
+- 两项都 PASS 才算 PASS；某项 INCONCLUSIVE 时后面照常检查，最终结果为 INCONCLUSIVE。
+- 不并行执行：两个 agent 在同一个工作区里同时构建、测试会互相干扰。
 
 ## 场景 3：agent 问了一个仓库能回答的问题
 
@@ -141,7 +193,7 @@ sequenceDiagram
 - 同一个问题问了第二次；
 - 自动回答次数达到 `max`；
 - 你点了 Stop auto-answering；
-- answerer 超过 10 分钟没回复。
+- answerer 超过 `agents.answerer.timeout_minutes`（默认 10 分钟）没回复。
 
 ## 场景 5：agent 话没说完就停了
 
@@ -205,7 +257,7 @@ sequenceDiagram
   你->>R: No
 ```
 
-自动批准的范围：读文件、构建、测试、在仓库内编辑。以下请求一律交给你：`rm -rf`、`git push`、`sudo`、发布、云 / 部署工具、密钥文件、仓库外的路径。如果设置了 `"reviewer": { "permissions": "ask" }`，每个请求都交给你。
+自动批准的范围：读文件、构建、测试、在仓库内编辑。以下请求一律交给你：`rm -rf`、`git push`、`sudo`、发布、云 / 部署工具、密钥文件、仓库外的路径。如果在 `agents.reviewer`（或 `verifier`、`answerer`）里设置 `"permissions": "ask"`，这个角色的每个请求都交给你。
 
 ## 场景 8：审查还没结束你就发了新消息
 
@@ -236,7 +288,7 @@ flowchart LR
   B --> C[插件拿到 SDK，开始每 60 秒巡检一次]
   C --> D{ledger 里未完成的记录}
   D -- reviewer 已跑完 --> E[读它的时间线，补出结论卡片]
-  D -- reviewer 还在跑，但超过 30 分钟 --> F[ERROR：超时]
+  D -- reviewer 还在跑，但超过 timeout_minutes --> F[ERROR：超时]
   D -- 修复提示没发出去 --> G[重新发送，按 messageId 去重]
   D -- 到点的重试 --> H[发送重试]
 ```
@@ -256,4 +308,4 @@ flowchart LR
 
 ## 卡片语言
 
-reviewer 和 answerer 会用原始请求的语言写 summary、问题、回答和 findings，你用中文提问，卡片就是中文。想固定语言，在对应的 `instructions` 里写明，例如 `"instructions": "Write all text in English."`。卡片标题、状态名，以及插件自己的提示语（例如 "You replied first"）目前固定为英文。
+reviewer 和 answerer 会用原始请求的语言写 summary、问题、回答和 findings，你用中文提问，卡片就是中文。想固定语言，在 `agents` 下对应角色的 `instructions` 里写明，例如 `"instructions": "Write all text in English."`。卡片标题、状态名，以及插件自己的提示语（例如 "You replied first"）目前固定为英文。
