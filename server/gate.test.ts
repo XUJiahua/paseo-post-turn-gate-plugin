@@ -502,7 +502,7 @@ describe("dispatch and report", () => {
       const active = readFileSync(path.join(repo, `.paseo/post-turn-gate/${role}.md`), "utf8").replace(/<!--[\s\S]*?-->/g, "").trim();
       assert.notEqual(active, "", `${role}.md must contain active instructions`);
     }
-    await sourceTurn({ change: edit, messageId: "a" });
+    await sourceTurn({ change: edit, messageId: "a", reply: "Done. Should I commit?" });
     const verifier = fake.created.find((create) => create.labels["post-turn-gate.role"] === "verifier");
     assert.ok(verifier, "the checks start at once");
     const policy = JSON.parse(readFileSync(path.join(repo, ".paseo/post-turn-gate.json"), "utf8"));
@@ -1109,31 +1109,46 @@ describe("version 3: the decider answers after every turn that did work", () => 
   const outcome = () => [...fake.cards.entries()].filter(([id]) => id.startsWith("post-turn-gate:outcome:")).at(-1)![1] as unknown as Record<string, any>;
   const PLAN = (plan: Record<string, unknown>) => JSON.stringify({ assessment: "done", workers: ["review"], reply_now: null, question: "", ...plan });
   const REPLY = (reply: Record<string, unknown>) => JSON.stringify({ kind: "send", message: "", answers_question: false, question: "", reason: "", ...reply });
+  /** A reply the pre-screen reads as a question, so the decider plans (a plain "Done." takes the checks-only path). */
+  const ASK = "Implemented it. Should I commit now?";
   const v3 = (supervision: Record<string, unknown> = {}) =>
     writePolicy({ version: 3, supervision: { checks: ["review"], reply_delay_seconds: 0, ...supervision } });
 
-  test("done with changes: checks run alongside the plan, and a PASS completes the task without a message", async () => {
+  test("a plain done with changes: only the checks run, and a PASS completes without a decider or message", async () => {
     v3();
     await sourceTurn({ change: edit });
     assert.equal(fake.cardAppends.filter((item) => !item.id.startsWith("post-turn-gate:outcome:")).length, 0, "one card per round: no check card");
     assert.match(outcome().checks, /Checks running: review…/);
-    assert.equal(role("reviewer").length, 1, "the checks start at once");
-    assert.equal(role("decider").length, 1, "the decider plans at the same time");
-    await childTurn(role("decider")[0].agentId, PLAN({}));
-    assert.equal(role("decider").length, 1, "the plan waits for the checks");
+    assert.equal(outcome().state, "answering");
+    assert.equal(role("reviewer").length, 1);
+    assert.equal(role("decider").length, 0, "no decider while the checks decide");
     await childTurn(role("reviewer")[0].agentId, PASS);
-    assert.equal(role("decider").length, 2, "the reply is written from the results");
-    assert.match(role("decider")[1].prompt, /Overall: PASSED/);
-    await childTurn(role("decider")[1].agentId, REPLY({ kind: "done" }));
+    assert.equal(role("decider").length, 0);
     assert.equal(fake.sent.length, 0);
     assert.equal(outcome().state, "resolved");
     assert.match(outcome().message, /Completed/);
     assert.equal(ledger.taskId(SOURCE), null, "the task ended");
   });
 
+  test("a plain done whose checks fail: one decider writes the fix from the results, after the grace period", async () => {
+    v3({ reply_delay_seconds: 60 });
+    await sourceTurn({ change: edit });
+    await childTurn(role("reviewer")[0].agentId, FAIL);
+    assert.equal(role("decider").length, 0, "nothing is sent within the grace period");
+    assert.equal(outcome().state, "answer_scheduled");
+    clock += 61_000;
+    gate.reconcile(fake.paseo);
+    await gate.idle();
+    assert.equal(role("decider").length, 1, "straight to the reply phase");
+    assert.match(role("decider")[0].prompt, /Results of the checks[\s\S]*Off by one/);
+    await childTurn(role("decider")[0].agentId, REPLY({ message: "Fix the off-by-one in a.txt." }));
+    assert.equal(fake.sent.length, 1);
+    assert.match(fake.sent[0].messageId!, /^pts:.+:1$/);
+  });
+
   test("a question after changes: a FAIL and the answer go back in one message", async () => {
     v3();
-    await sourceTurn({ change: edit, reply: "Implemented it. Should I commit now?" });
+    await sourceTurn({ change: edit, reply: ASK });
     await childTurn(role("decider")[0].agentId, PLAN({ assessment: "awaiting_user", question: "Should I commit now?" }));
     await childTurn(role("reviewer")[0].agentId, FAIL);
     assert.match(role("decider")[1].prompt, /Off by one/);
@@ -1163,7 +1178,7 @@ describe("version 3: the decider answers after every turn that did work", () => 
 
   test("checks that finish before the plan still lead to the reply (with the default grace period)", async () => {
     v3({ reply_delay_seconds: 60 });
-    await sourceTurn({ change: edit });
+    await sourceTurn({ change: edit, reply: ASK });
     await childTurn(role("reviewer")[0].agentId, PASS); // within the grace period
     assert.equal(role("decider").length, 0);
     clock += 61_000;
@@ -1178,7 +1193,7 @@ describe("version 3: the decider answers after every turn that did work", () => 
 
   test("a plan that says done at once waits for the running checks instead of canceling them", async () => {
     v3();
-    await sourceTurn({ change: edit });
+    await sourceTurn({ change: edit, reply: ASK });
     await childTurn(role("decider")[0].agentId, PLAN({ workers: [], reply_now: { kind: "done" } }));
     assert.equal(ledger.active().length, 1, "the checks keep running");
     assert.equal(outcome().state, "answering");
@@ -1205,7 +1220,7 @@ describe("version 3: the decider answers after every turn that did work", () => 
 
   test("your new requirement on a tree that passed: the decider can ask for the checks again", async () => {
     v3();
-    await sourceTurn({ change: edit });
+    await sourceTurn({ change: edit, reply: ASK });
     await childTurn(role("decider")[0].agentId, PLAN({}));
     await childTurn(role("reviewer")[0].agentId, PASS);
     await childTurn(role("decider")[1].agentId, REPLY({ kind: "escalate", question: "Anything else?", reason: "unsure" }));
@@ -1246,22 +1261,21 @@ describe("version 3: the decider answers after every turn that did work", () => 
   test("a dispute without changes: the decider reads the standing FAIL and cannot complete the task", async () => {
     v3();
     await sourceTurn({ change: edit });
-    await childTurn(role("decider")[0].agentId, PLAN({}));
     await childTurn(role("reviewer")[0].agentId, FAIL);
-    await childTurn(role("decider")[1].agentId, REPLY({ message: "Fix the off-by-one." }));
+    await childTurn(role("decider")[0].agentId, REPLY({ message: "Fix the off-by-one." }));
     const fix = fake.sent[0];
     await sourceTurn({ messageId: fix.messageId, text: fix.text, reply: "The off-by-one is intended by the spec." });
     assert.equal(role("reviewer").length, 1, "the same tree is not checked again");
-    assert.match(role("decider")[2].prompt, /finished \(FAILED\)/);
+    assert.match(role("decider")[1].prompt, /finished \(FAILED\)/);
     assert.doesNotMatch(role("reviewer")[0].prompt, /intended by the spec/, "the checker never sees the dispute");
-    await childTurn(role("decider")[2].agentId, PLAN({ workers: ["review"] }));
-    await childTurn(role("decider")[3].agentId, REPLY({ kind: "done" }));
+    await childTurn(role("decider")[1].agentId, PLAN({ workers: ["review"] }));
+    await childTurn(role("decider")[2].agentId, REPLY({ kind: "done" }));
     assert.equal(outcome().state, "needs_user", "only you can overrule a check");
   });
 
   test("a turn that stopped early gets 'Continue.' at once; the checks are canceled", async () => {
     v3();
-    await sourceTurn({ change: edit, reply: "Next I will add the tests." });
+    await sourceTurn({ change: edit, reply: "Here is the start:\n```js\nexport function" }); // cut off mid code block
     await childTurn(role("decider")[0].agentId, PLAN({ assessment: "incomplete", workers: [], reply_now: { kind: "send", message: "Continue." } }));
     assert.equal(fake.sent.length, 1);
     assert.match(fake.sent[0].text, /Continue\.$/);
@@ -1272,30 +1286,30 @@ describe("version 3: the decider answers after every turn that did work", () => 
   test("guardrails: done without a PASS, a risky reply, and the message budget go to you", async () => {
     v3({ budget: { max_auto_sends: 1 } });
     await sourceTurn({ change: edit });
-    await childTurn(role("decider")[0].agentId, PLAN({}));
     await childTurn(role("reviewer")[0].agentId, FAIL);
-    await childTurn(role("decider")[1].agentId, REPLY({ kind: "done" }));
+    await childTurn(role("decider")[0].agentId, REPLY({ kind: "done" }));
     assert.equal(outcome().state, "needs_user");
     assert.match(outcome().message, /checks ended FAILED/);
 
-    await sourceTurn({ text: "fix it", messageId: "u2", change: () => writeFileSync(path.join(repo, "a.txt"), "three\n") });
-    await childTurn(role("decider")[2].agentId, PLAN({ workers: [], reply_now: { kind: "send", message: "Run `git push --force` now." } }));
+    await sourceTurn({ text: "fix it", messageId: "u2", reply: ASK, change: () => writeFileSync(path.join(repo, "a.txt"), "three\n") });
+    await childTurn(role("decider")[1].agentId, PLAN({ workers: [], reply_now: { kind: "send", message: "Run `git push --force` now." } }));
     assert.equal(fake.sent.length, 0);
     assert.equal(outcome().state, "needs_user");
     assert.match(outcome().message, /not sent automatically/);
 
-    await sourceTurn({ text: "go on", messageId: "u3", change: () => writeFileSync(path.join(repo, "a.txt"), "four\n") });
-    await childTurn(role("decider")[3].agentId, PLAN({ workers: [], reply_now: { kind: "send", message: "Continue." } }));
+    await sourceTurn({ text: "go on", messageId: "u3", reply: ASK, change: () => writeFileSync(path.join(repo, "a.txt"), "four\n") });
+    await childTurn(role("decider")[2].agentId, PLAN({ workers: [], reply_now: { kind: "send", message: "Continue." } }));
     assert.equal(fake.sent.length, 1);
     await sourceTurn({ messageId: fake.sent[0].messageId, text: fake.sent[0].text, change: () => writeFileSync(path.join(repo, "a.txt"), "five\n") });
-    assert.equal(role("decider").length, 4, "the budget is used up: no decider");
+    assert.equal(role("decider").length, 3, "the budget is used up: no decider");
+    assert.equal(role("reviewer").length, 3, "and no checks");
     assert.equal(outcome().state, "needs_user");
     assert.match(outcome().message, /1 automatic messages/);
   });
 
   test("your message during the grace period cancels the round", async () => {
     v3({ reply_delay_seconds: 60 });
-    await sourceTurn({ change: edit });
+    await sourceTurn({ change: edit, reply: ASK });
     assert.equal(outcome().state, "answer_scheduled");
     assert.equal(role("decider").length, 0);
     gate.onTurnStarted({ agent: hookAgent(SOURCE), turnId: "t2" }, fake.paseo);
@@ -1311,12 +1325,12 @@ describe("version 3: the decider answers after every turn that did work", () => 
     mkdirSync(path.join(repo, ".paseo/post-turn-gate"), { recursive: true });
     writeFileSync(path.join(repo, ".paseo/post-turn-gate/answerer.md"), "ANSWERER RULE");
     v3();
-    await sourceTurn({ change: edit });
+    await sourceTurn({ change: edit, reply: ASK });
     assert.match(role("decider")[0].prompt, /ANSWERER RULE/);
     // A new task (another agent here) picks up decider.md once it exists; a running task keeps its frozen rules.
     writeFileSync(path.join(repo, ".paseo/post-turn-gate/decider.md"), "DECIDER RULE");
     fake.agents.set("second", sourceAgent({ id: "second" }));
-    await sourceTurn({ agentId: "second", change: () => writeFileSync(path.join(repo, "c.txt"), "x\n") });
+    await sourceTurn({ agentId: "second", reply: ASK, change: () => writeFileSync(path.join(repo, "c.txt"), "x\n") });
     assert.match(role("decider").at(-1)!.prompt, /DECIDER RULE/);
     assert.doesNotMatch(role("decider").at(-1)!.prompt, /ANSWERER RULE/);
   });
@@ -1325,7 +1339,6 @@ describe("version 3: the decider answers after every turn that did work", () => 
     v3();
     await sourceTurn({ change: edit });
     const reviewer = role("reviewer")[0].agentId;
-    await childTurn(role("decider")[0].agentId, PLAN({}));
     gate.onPermission(
       {
         agent: hookAgent(reviewer, SOURCE),
@@ -1341,28 +1354,27 @@ describe("version 3: the decider answers after every turn that did work", () => 
   test("Stop auto-answering during the checks ends the round: no decider, the checker is stopped", async () => {
     v3();
     await sourceTurn({ change: edit });
-    await childTurn(role("decider")[0].agentId, PLAN({}));
     assert.equal(await gate.stopAnswering(outcome().chainId, fake.paseo), true);
     await gate.idle();
     assert.ok(fake.archived.includes(role("reviewer")[0].agentId), "the checker is stopped");
-    await childTurn(role("reviewer")[0].agentId, PASS);
-    assert.equal(role("decider").length, 1, "no reply phase after you stopped it");
+    await childTurn(role("reviewer")[0].agentId, FAIL);
+    assert.equal(role("decider").length, 0, "no reply phase after you stopped it");
     assert.equal(fake.sent.length, 0);
   });
 
   test("after Stop auto-answering, turns come to you until you resume it", async () => {
     v3();
-    await sourceTurn({ change: edit });
+    await sourceTurn({ change: edit, reply: ASK });
     const chainId = outcome().chainId;
     await gate.stopAnswering(chainId, fake.paseo);
     await gate.idle();
-    await sourceTurn({ text: "more", messageId: "u2", change: () => writeFileSync(path.join(repo, "a.txt"), "x\n") });
+    await sourceTurn({ text: "more", messageId: "u2", reply: ASK, change: () => writeFileSync(path.join(repo, "a.txt"), "x\n") });
     assert.equal(role("decider").length, 1, "no decider while stopped");
     assert.equal(outcome().state, "needs_user");
     assert.equal(outcome().canResume, true);
     await gate.stopAnswering(chainId, fake.paseo, true);
     await gate.idle();
-    await sourceTurn({ text: "go", messageId: "u3", change: () => writeFileSync(path.join(repo, "a.txt"), "y\n") });
+    await sourceTurn({ text: "go", messageId: "u3", reply: ASK, change: () => writeFileSync(path.join(repo, "a.txt"), "y\n") });
     assert.equal(role("decider").length, 2, "answered again after resuming");
   });
 
@@ -1375,18 +1387,17 @@ describe("version 3: the decider answers after every turn that did work", () => 
     assert.equal(role("reviewer").length, 0);
     await sourceTurn({ text: "go on", messageId: "u2" });
     assert.equal(role("reviewer").length, 1, "the stopped turn's changes are checked with the next one");
-    await childTurn(role("decider")[0].agentId, PLAN({}));
     await childTurn(role("reviewer")[0].agentId, FAIL);
-    await childTurn(role("decider")[1].agentId, REPLY({ message: "Fix the off-by-one." }));
+    await childTurn(role("decider")[0].agentId, REPLY({ message: "Fix the off-by-one." }));
     // The plugin's fix turn, stopped by you.
     await sourceTurn({ messageId: fake.sent[0].messageId, text: fake.sent[0].text, change: () => writeFileSync(path.join(repo, "a.txt"), "half\n"), outcome: canceled });
-    assert.equal(role("decider").length, 2, "no decider after a stop");
+    assert.equal(role("decider").length, 1, "no decider after a stop");
     assert.equal(outcome().state, "stopped");
     assert.equal(outcome().canStopAnswering, true, "you can still stop auto-answering");
     await gate.stopAnswering(outcome().chainId, fake.paseo);
     await gate.idle();
     await sourceTurn({ text: "do it my way", messageId: "u3", change: () => writeFileSync(path.join(repo, "a.txt"), "mine\n") });
-    assert.equal(role("decider").length, 2, "stopped: your next turn is not answered for you");
+    assert.equal(role("decider").length, 1, "stopped: your next turn is not answered for you");
     assert.equal(outcome().state, "needs_user");
   });
 

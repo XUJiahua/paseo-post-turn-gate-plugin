@@ -1249,7 +1249,8 @@ export function createGate(options: GateOptions): Gate {
 
   async function startScheduledAnswer(paseo: Paseo, chain: Chain): Promise<void> {
     const current = ledger.updateChain(chain.agent_id, { answer_at: null }, now()) ?? chain;
-    if (roundOf(current)?.phase === "waiting") return dispatchDecider(paseo, current, "plan");
+    const waiting = roundOf(current);
+    if (waiting?.phase === "waiting") return dispatchDecider(paseo, current, waiting.plan ? "merge" : "plan");
     const cfg = answerConfig(JSON.parse(current.policy_json) as Policy);
     const source = await refreshAgent(paseo, current.agent_id);
     if (!source) return ledger.deleteChain(current.agent_id);
@@ -1514,6 +1515,10 @@ export function createGate(options: GateOptions): Gate {
     plan: DeciderPlan | null;
     /** A "done" without checks started them once; a second one without a PASS goes to the user. */
     rechecked: boolean;
+    /** A plain "done" on changed files: the checks decide; the decider only runs when they do not all pass. */
+    shortcut?: boolean;
+    /** Shortcut: the end of the grace period, before which nothing is sent. */
+    graceUntil?: number;
   }
 
   const roundOf = (chain: Chain): Round | null => (chain.round_json ? (JSON.parse(chain.round_json) as Round) : null);
@@ -1571,11 +1576,28 @@ export function createGate(options: GateOptions): Gate {
     // still stand and the decider reads them. After your message they may not cover what you asked, so they are not reused.
     const last = chain.last_run_id && !task.userSpoke ? ledger.get(chain.last_run_id) : null;
     let runId: string | null = last && last.end_tree === endTree && isTerminal(last.status) && last.status !== "SUPERSEDED" ? last.run_id : null;
-    if (!runId && changed && !reused && supervision.speculative_checks) {
+    // The agent says it is done and asks nothing: whether it is done is the checks' call, so a PASS completes the
+    // task without a decider (the most common round costs no extra model call). Anything else goes to the decider.
+    const shortcut = category === "done" && changed && !reused && !runId;
+    if (!runId && changed && !reused && (supervision.speculative_checks || shortcut)) {
       runId = await startGate(paseo, { ...task, turnKey: `${task.turnKey}:round:${seq}` }, endTree);
       if (runId) chain = ledger.updateChain(task.agentId, { last_run_id: runId }, now()) ?? chain;
     }
     const round: Round = { seq, phase: "waiting", runId, reused, userSpoke: task.userSpoke ?? false, changed, endTree, reply, signal, plan: null, rechecked: false };
+    if (shortcut && runId) {
+      const checking: Round = {
+        ...round,
+        phase: "checking",
+        shortcut: true,
+        graceUntil: now() + supervision.reply_delay_seconds * 1000,
+        plan: { assessment: "done", workers: gateChecks(task.policy), reply_now: null, question: "" },
+      };
+      chain = saveRound(ledger.chain(task.agentId) ?? chain, checking);
+      await publishChainCard(paseo, chain, { ...roundCard(chain, checking), state: "answering", canStopAnswering: true });
+      const run = ledger.get(runId);
+      if (run && isTerminal(run.status)) await settleRound(paseo, ledger.chain(task.agentId) ?? chain, run);
+      return;
+    }
     chain = saveRound(ledger.chain(task.agentId) ?? chain, round);
     if (supervision.reply_delay_seconds === 0) return dispatchDecider(paseo, chain, "plan");
     const at = now() + supervision.reply_delay_seconds * 1000;
@@ -1797,6 +1819,24 @@ export function createGate(options: GateOptions): Gate {
       if (chain.answer_child_id) await archiveChild(paseo, chain.answer_child_id);
       const current = ledger.updateChain(chain.agent_id, { answer_child_id: null, answer_dispatch_json: null, answer_deadline_at: null, answer_at: null }, now()) ?? chain;
       return roundNeedsUser(paseo, current, replyTail(round.reply), run.error ?? `the checks ended ${run.status}`);
+    }
+    if (round.phase === "checking" && round.shortcut) {
+      if (run.status === "PASSED" && run.end_tree === round.endTree) {
+        return endRound(paseo, ledger.updateChain(chain.agent_id, { passed_tree: run.end_tree }, now()) ?? chain, {
+          state: "resolved",
+          category: "done",
+          question: null,
+          message: "Completed: the checks passed.",
+        });
+      }
+      // Not a clean PASS: the decider writes the reply, after the grace period (a reply from you cancels it).
+      if (round.graceUntil && round.graceUntil > now()) {
+        const waiting = saveRound(chain, { ...round, phase: "waiting" });
+        const current = ledger.updateChain(chain.agent_id, { answer_at: round.graceUntil }, now()) ?? waiting;
+        await publishChainCard(paseo, current, { ...roundCard(current, round), state: "answer_scheduled", nextRetryAt: round.graceUntil, canStopAnswering: true });
+        return wakeAt(paseo, round.graceUntil);
+      }
+      return dispatchDecider(paseo, chain, "merge");
     }
     if (round.phase === "checking") return dispatchDecider(paseo, chain, "merge");
     // waiting / planning: the plan decides what happens with the result.

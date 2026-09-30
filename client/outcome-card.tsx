@@ -26,7 +26,7 @@ function stateLabel(data: OutcomeCardData): string {
       case "answer_scheduled":
         return "Deciding soon";
       case "answering":
-        return "Deciding…";
+        return data.childAgentId ? "Deciding…" : "Checking…";
       case "answered":
         return `Replied for you (${data.attempt}/${data.maxAttempts})`;
       case "resolved":
