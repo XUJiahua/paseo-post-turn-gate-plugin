@@ -1,326 +1,63 @@
-# 工作流程（按场景）
+# 工作流程（当前 v3）
 
-下面每个场景都是一次真实会发生的对话：你对 agent 说了什么，插件在背后做了什么，时间线上出现什么卡片。实现细节见 [design.md](design.md) 和 [turn-outcomes.md](turn-outcomes.md)。
+最小策略是 `{ "version": 3 }`：默认按 verify、review 串行检查，decider 有 60 秒宽限期，总自动消息最多 12 次。只支持 v3，没有模板修复或只报告模式。角色规则在 `.paseo/post-turn-gate/{verifier,reviewer,decider}.md`。
 
-示例仓库的策略文件 `.paseo/post-turn-gate.json`（用 `npm run init` 生成全部默认值后改了这几项，下面只列出改过的）：
-
-```json
-{
-  "version": 2,
-  "on_fail": { "fix": { "max_rounds": 2 } },
-  "on_outcome": {
-    "awaiting_user": { "answer": { "max": 3, "delay_seconds": 60 } },
-    "network": { "retry": { "max": 2, "delay_seconds": 30 } }
-  }
-}
-```
-
-## 先看全貌：一轮结束后插件怎么决定
+## 普通完成
 
 ```mermaid
 flowchart TD
-  A[你给 agent 发消息，agent 开始干活] --> B[插件记下工作区快照 baseTree]
-  B --> C[agent 这一轮结束]
-  C --> D{这一轮是怎么结束的？}
-  D -- 网络错误 / 限流 --> T[按配置稍后自动重试<br/>不管改没改文件]
-  D -- 额度用完 / 上下文满 / 崩溃 --> X[只发一张说明卡片<br/>不管改没改文件]
-  D -- 你点了停止 --> S[结束，不打扰你]
-  D -- 做完了 --> C1{任务改了文件？}
-  C1 -- 没改 --> N[什么都不做]
-  C1 -- 改了 --> R[派 reviewer 审查改动<br/>或 verifier 核对需求]
-  D -- 停下来问你 / 没说完 --> C2{"改了文件，或者<br/>已经读过代码、跑过命令？"}
-  C2 -- 纯聊天 --> N
-  C2 -- 是 --> W[等 60 秒，你没回复]
-  W --> Q[派 answerer 判断能不能替你回答]
-  R --> V{结论}
-  V -- PASS --> P[卡片：PASS]
-  V -- FAIL --> F[把问题发回 agent 修，修完再审]
-  Q -- 能安全回答 --> AQ[替你回复，agent 继续]
-  Q -- 需要你决定 --> U[卡片：需要你回答]
+  E[主 Agent turn 结束] --> G{用户停止或接手?}
+  G -->|是| U[保留改动，等待用户下一轮]
+  G -->|否| C{done 且有改动，无提问或未完成信号?}
+  C -->|是| K[立即 verify / review，不等宽限期]
+  K --> P{全部 PASS?}
+  P -->|是| D[直接完成，无 decider，无消息]
+  P -->|否| H{检查需要人介入?}
+  H -->|是| U
+  H -->|否| M[宽限期后 decider 汇总检查结果]
+  M --> R[一条回复推动修复或找人]
+  C -->|否，做过工作| A[宽限期后 decider 计划，检查可先运行]
+  A --> R
 ```
 
-## 场景 1：改完代码，审查通过
+完成捷径即使 `speculative_checks=false` 也立即检查。一个 FAIL 停止本次检查，其余检查不再启动；下一次源 Agent 改树后从第一项重新检查。INCONCLUSIVE 继续后续检查，最终交给 decider 补齐证据或找人。
 
-你说："阅读代码，使用 mermaid 整理这个插件的工作流程。" agent 新建了 `docs/workflow.md`，并在 README 加了链接。
+## 做完一部分后提问
 
 ```mermaid
 sequenceDiagram
-  actor 你
-  participant A as 开发 agent
-  participant G as 插件
-  participant R as reviewer（子 agent）
-
-  你->>A: 用 mermaid 整理工作流程
-  G->>G: 快照 baseTree
-  A->>A: 读代码，写 docs/workflow.md
-  A-->>G: 这一轮完成
-  G->>G: 快照 endTree，与 baseTree 不同 → 需要审查
-  G->>R: 创建 reviewer："审查 git diff baseTree endTree"
-  G-->>你: 卡片 Review · REVIEWING
-  R->>R: 读 diff，对照源码核实图里的说法
-  R-->>G: {"verdict":"PASS","summary":"只改了文档……"}
-  G->>R: 归档（History 里还能打开）
-  G-->>你: 卡片 Review · PASS，+2 non-blocking findings
+  participant S as 主 Agent
+  participant P as 插件
+  participant K as checker
+  participant D as decider
+  S->>P: 有改动，问“要不要 commit？”
+  P->>K: 立即检查需求与代码
+  Note over P,D: 用户发消息则取消；否则宽限期后出计划
+  P->>D: 需求、回复、检查进度
+  K-->>P: PASS / FAIL / INCONCLUSIVE
+  P->>D: 汇总阶段的独立证据
+  D-->>P: 答案 + 修复要求，或找人
+  P->>S: 一条自动回复（通过护栏时）
 ```
 
-MEDIUM / LOW 级别的问题只显示为 "non-blocking findings"，不会拦住你。
+检查者不知道主 Agent 说了什么。decider 不能推翻 FAIL，也不能没有 PASS 就完成有改动的任务。模型可以把“保留当前接口”的答案与“修掉边界错误”的要求放在同一条消息中。
 
-## 场景 2：审查不通过，自动修复
+## 提前停止、失败与人类边界
 
-你说："给 /users 接口加分页。" agent 加了 `limit` / `offset`，但没校验负数。
+未闭合代码块、tool-last 或未完成 todo 等信号进入 decider，通常回复“继续”；纯聊天不启动。crash、网络、限流按 30 秒、2 分钟、8 分钟重试，再交 decider；quota、context 耗尽直接找人。拒答、未知错误、缺测试、反驳先由 decider 判断。它只能坚持修改或把反驳交给用户，不能接受辩解生成 PASS。
 
-```mermaid
-sequenceDiagram
-  actor 你
-  participant A as 开发 agent
-  participant G as 插件
-  participant R1 as reviewer #1
-  participant R2 as reviewer #2
+产品取舍、外部动作、凭据、扩大范围、同题再问、预算耗尽由护栏或 decider 交给你。检查者无法给有效结论、改了工作区、权限不足或需求不明也交给你。未接受的改动一直在任务范围内。
 
-  你->>A: 给 /users 加分页
-  A-->>G: 完成，改了 3 个文件
-  G->>R1: 审查
-  R1-->>G: FAIL · [HIGH] offset 为负数时 SQL 报错
-  G-->>你: 卡片 FIXING（第 1/2 轮）
-  G->>A: "审查没通过……修复 CRITICAL 和 HIGH 问题后停下"
-  A-->>G: 修好了，补了测试
-  G->>R2: 重新审查（仍从最初的 baseTree 算起）
-  R2-->>G: PASS
-  G-->>你: 卡片 PASS
-```
+## 用户接手与权限
 
-- 自动修复是默认行为（`max_rounds: 2`），目的是让 agent 自己循环到通过。设为 `"on_fail": "report"`（或 `npm run init -- --report`）时只出 FAILED 卡片，不发回去修。
-- 修了 `max_rounds` 轮还是 FAIL，卡片变成 NEEDS_HUMAN，交给你处理。
-- 修复期间你自己发了消息，这次审查标为 SUPERSEDED，以你的消息为准。没通过检查的改动不会被放过：你这一轮结束后，从原来的基线开始连同原始请求一起检查。
-- 修复轮没有超时：修复由开发 agent 自己完成，多慢都会在它结束后重新检查。
-- 修复轮什么都没改：不会拿同一份代码再审一遍、白用一轮。agent 是在提问时走场景 3 的代答（代答后完成的那轮照常审查，轮次接着算）；agent 是在反驳 findings 时，卡片变成 NEEDS_HUMAN 并附上它的理由，由你裁决。它的理由不会交给 reviewer，免得被检查的 Agent 说服检查者。
+你发消息会取消旧决策、归档角色并保留原始 baseline；下一轮检查整项任务。你停止主 Agent 时绝不启动 decider。停止插件发起的 turn 保留任务和 Stop/Resume 按钮；Stop auto-answering 会取消当前检查，直到 Resume 才恢复下一轮自动处理。
 
-每个仓库的审查规则写在 `.paseo/post-turn-gate/reviewer.md` 里。`npm run init` 会生成一份立即生效的默认规则：HTML 注释只是编辑说明，注释后的 Markdown 会加入提示词。继续按项目补充并和代码一起提交，例如"金额一律用整数分"、"新接口必须有集成测试"。verifier、answerer 分别对应 `verifier.md`、`answerer.md`。
+常规角色工具请求自动批准，高风险上卡。请求 5 分钟无人回答（默认）被拒绝；checker 获得一次机会给已有证据下的结论。`agents.<role>.permissions="ask"` 可让所有请求上卡。
 
-## 场景 2b：按需求逐项核对（verify）
+## 多项目与恢复
 
-你说："给 /users 加分页：支持 limit 和 offset，limit 最大 100，返回 total。" 这类请求是一张需求清单，比起代码风格，你更关心每一条是否都做到了。策略里写 `"on_outcome": { "done": ["verify"] }`（或 `npm run init -- --check verify`）。
+每个 workspace 有自己的串行队列，慢创建不会堵住其他 workspace。基线在事件到达时拍摄，Git 调用最多 120 秒。共享同一仓库目录仍会混入其他 Agent 改动，重叠信息进入角色 prompt；独立 worktree 可避免。
 
-```mermaid
-sequenceDiagram
-  actor 你
-  participant A as 开发 agent
-  participant G as 插件
-  participant V as verifier（子 agent）
+重启后首个事件触发对账，之后每 60 秒一次；未创建成功的角色按同 id/key 重放，闲置角色从 timeline 恢复结果，超时转交用户。正在运行的源 turn 保留快照。源消息尚无原子派发或完整 outbox，详见 [design.md](design.md)。
 
-  你->>A: 分页：limit/offset，limit ≤ 100，返回 total
-  A-->>G: 完成
-  G->>V: "改动是否完整实现了原始请求？"
-  V->>V: 把每条需求对应到改动，跑构建和测试
-  V-->>G: FAIL · [HIGH] 没有返回 total
-  G-->>你: 卡片 Verify · FAILED（或按 on_fail 发回修复）
-```
-
-verifier 和 reviewer 的区别只在于问的问题：reviewer 问"代码对不对、好不好维护"，verifier 问"要的东西是不是都有了"。verifier 用 `agents.verifier` 的配置；默认不使用 profile，继承开发 agent 的启动配置，并加载仓库里的 `.paseo/post-turn-gate/verifier.md` 规则。
-
-## 场景 2c：先核对需求，再审代码
-
-同一个分页需求，你既想确认需求都做到了，也想让人看看代码质量。策略里写 `"on_outcome": { "done": ["verify", "review"] }`（或 `npm run init -- --check verify,review`），`on_fail` 保持默认的 `{ "fix": { "max_rounds": 2 } }`。
-
-```mermaid
-sequenceDiagram
-  actor 你
-  participant A as 开发 agent
-  participant G as 插件
-  participant V as verifier
-  participant R as reviewer
-
-  A-->>G: 完成
-  G->>V: 第 1 轮 · 核对需求
-  V-->>G: FAIL · [HIGH] 没有返回 total
-  Note over G,R: verify 失败，本轮不再审代码
-  G->>A: 修复 total 的问题
-  A-->>G: 修好了
-  G->>V: 第 2 轮 · 重新从 verify 开始
-  V-->>G: PASS
-  G->>R: 第 2 轮 · 审代码
-  R-->>G: PASS
-  G-->>你: 卡片 Verify → Review · PASS，每项一行
-```
-
-- 按列表顺序执行，第一个 FAIL 就停：需求没做到时审代码意义不大，修复时代码还会改。
-- 修复后从第一项重新检查，因为修复可能破坏已经通过的检查。
-- 两项都 PASS 才算 PASS；某项 INCONCLUSIVE 时后面照常检查，最终结果为 INCONCLUSIVE，卡片逐项写出“Not verified: <原因>”。
-- INCONCLUSIVE 的原因决定后续：权限被拒绝或没人回答、需求本身没说清楚 → NEEDS_HUMAN；没有测试 → 默认只报告，策略里设 `"on_inconclusive": "fail"` 时发回让 agent 补测试；缺凭证或服务 → 只报告。
-- 不并行执行：两个 agent 在同一个工作区里同时构建、测试会互相干扰。
-
-## 场景 3：agent 问了一个仓库能回答的问题
-
-你说："给 outcome.ts 补测试。" agent 回复："测试用 vitest 还是 node:test？" 然后停下了。
-
-```mermaid
-sequenceDiagram
-  actor 你
-  participant A as 开发 agent
-  participant G as 插件
-  participant Q as answerer（子 agent）
-  participant R as reviewer
-
-  A-->>G: 这一轮结束，回复以问号结尾
-  G->>G: 预筛：像在提问 → awaiting_user
-  G-->>你: 卡片 "Answering for you soon"（有 Stop auto-answering 按钮）
-  Note over G: 等 answer.delay_seconds（默认 60 秒），你一回复就取消
-  G->>Q: "agent 在等用户吗？能替用户回答吗？"
-  G-->>你: 卡片 answering
-  Q->>Q: 看到 package.json 用的是 node --test
-  Q-->>G: {"state":"awaiting_user","decision":"answer","answer":"用 node:test，和现有测试保持一致"}
-  G->>A: [post-turn gate answered on your behalf]<br/>用 node:test，和现有测试保持一致
-  G-->>你: 卡片 answered（第 1/3 次）
-  A-->>G: 测试写完
-  G->>R: 审查整个任务的改动（从你第一条消息开始）
-  R-->>G: PASS
-```
-
-这几轮属于同一个任务（chain），所以审查的是整个任务的累计改动，不是最后一轮。
-
-- agent 已经读过代码、但还没改文件就问（"看完了，用 Redis 还是内存 LRU？"）也会走这个流程；纯聊天式的提问（没调用任何工具）不代答。
-- 做完后顺口一句客套（"Implemented X. Let me know if you need anything else."、"需要我再补充文档吗？"）不算提问，直接审查。
-- 第 2、3 次代答各有一张新卡片，出现在时间线当前位置；旧卡片不再有按钮。
-
-## 场景 4：问题必须由你决定
-
-agent 问："旧的 users_v1 表要不要直接删掉？" 或者 "要我 push 到 origin 吗？"
-
-```mermaid
-sequenceDiagram
-  actor 你
-  participant A as 开发 agent
-  participant G as 插件
-  participant Q as answerer
-
-  A-->>G: 停下来提问
-  G->>Q: 能替用户回答吗？
-  Q-->>G: decision = escalate（涉及删除数据）
-  G-->>你: 卡片 needs_user："旧表要不要删？"
-  你->>A: 先保留，加个迁移脚本
-  G-->>你: 卡片改为 resolved："You replied; the task continues"
-```
-
-即使 answerer 给出了答案，插件也会再用关键词检查一遍（删除、push、部署、付费、密码等），命中就改为交给你。以下情况也会交给你：
-
-- 同一个问题问了第二次；
-- 自动回答次数达到 `max`；
-- 你点了 Stop auto-answering；
-- answerer 超过 `agents.answerer.timeout_minutes`（默认 10 分钟）没回复。
-
-## 场景 5：agent 话没说完就停了
-
-agent 执行完一条命令后这一轮就结束了，没有总结；或者 todo 列表还有没勾掉的项。
-
-```mermaid
-sequenceDiagram
-  participant A as 开发 agent
-  participant G as 插件
-  participant Q as answerer
-
-  A-->>G: 这一轮最后一步是工具调用
-  G->>G: 预筛：tool_last → awaiting_user
-  G->>Q: 判断
-  Q-->>G: state = incomplete
-  G->>A: [post-turn gate answered on your behalf]<br/>Continue.
-  A-->>G: 继续做完
-```
-
-如果 answerer 判断其实已经做完（`done`），插件直接开始审查。
-
-## 场景 6：网络断了，自动重试
-
-agent 正在工作时报错 `ECONNRESET`。
-
-```mermaid
-sequenceDiagram
-  actor 你
-  participant A as 开发 agent
-  participant G as 插件
-
-  A-->>G: 这一轮失败：ECONNRESET
-  G->>G: 归类为 network，配置允许重试 2 次
-  G-->>你: 卡片 retry_scheduled：30 秒后重试（1/2）
-  Note over G: 30 秒后
-  G->>A: Continue from where you left off.
-  G-->>你: 卡片 retrying
-  A-->>G: 这次完成了
-  G->>G: 审查整个任务
-```
-
-- 30 秒内你自己发了消息，自动重试就取消，卡片显示 "You replied first"。
-- 重试次数用完后只发通知卡片。
-- 额度用完（`quota_exhausted`）和上下文满（`context_exhausted`）不允许配置重试，因为重试也不会成功，只会出一张说明卡片告诉你怎么处理。
-
-## 场景 7：reviewer 需要执行命令
-
-reviewer 在审查时想运行 `npm test`，后来又想运行 `git push`。
-
-```mermaid
-sequenceDiagram
-  actor 你
-  participant R as reviewer
-  participant G as 插件
-
-  R->>G: 权限请求：npm test
-  G->>R: 自动批准（一次性 allow_once）
-  G-->>你: 卡片上计数 "auto-approved 1"
-  R->>G: 权限请求：git push
-  G-->>你: 卡片显示请求 + 原因 "destructive or remote git operation" + Yes/No
-  你->>R: No
-```
-
-自动批准的范围：读文件、构建、测试、在仓库内编辑。以下请求一律交给你：`rm -rf`、`git push`（包括 `git -C <dir> push` 这类写法）、`sudo`、发布、云 / 部署工具、密钥文件、仓库外的路径。云工具从严判断：命令里出现 `aws`、`kubectl` 等就要你确认，不管前面加了什么前缀（`timeout 60 aws …`）；只有 `cat`、`grep`、`ls` 这类只读命令的路径或搜索词例外，所以 `cat src/aws/client.ts` 自动批准。如果在 `agents.reviewer`（或 `verifier`、`answerer`）里设置 `"permissions": "ask"`，这个角色的每个请求都交给你。
-
-你一直没回答时，请求在 `permission_wait_minutes`（默认 5 分钟）后被自动拒绝。kiro 收到拒绝会结束这一轮，插件接着让 reviewer 按已有证据给结论；通常是 INCONCLUSIVE，卡片显示 NEEDS HUMAN 和被拒绝的请求，而不是等 30 分钟后变成 ERROR。
-
-## 场景 8：审查还没结束你就发了新消息
-
-reviewer 正在审查，你又对 agent 说"顺便把日志也改一下"。
-
-```mermaid
-sequenceDiagram
-  actor 你
-  participant A as 开发 agent
-  participant G as 插件
-  participant R as reviewer
-
-  G->>R: 审查中……
-  你->>A: 顺便把日志也改一下
-  G->>R: 归档（结果已经过时）
-  G-->>你: 旧卡片 SUPERSEDED
-  A-->>G: 新一轮完成
-  G->>G: 从旧 run 的基线重新审查（含上一轮未审完的改动和原始请求）
-```
-
-## 场景 9：插件或 daemon 重启
-
-审查进行到一半时 Paseo 重启了。
-
-```mermaid
-flowchart LR
-  A[重启] --> B[任意 agent 事件到达]
-  B --> C[插件拿到 SDK，开始每 60 秒巡检一次]
-  C --> D{ledger 里未完成的记录}
-  D -- reviewer 已跑完 --> E[读它的时间线，补出结论卡片]
-  D -- reviewer 还在跑，但超过 timeout_minutes --> F[ERROR：超时]
-  D -- 修复提示没发出去 --> G[重新发送，按 messageId 去重]
-  D -- 到点的重试 --> H[发送重试]
-```
-
-重启后要等到有 agent 事件进来，巡检才会开始。
-
-## 什么时候插件不介入
-
-| 情况 | 原因 |
-|---|---|
-| agent 做完了但没改文件，或者纯聊天（没调用工具）时问了你一句 | 没有可审查的改动；你就在对话里 |
-| 仓库里没有 `.paseo/post-turn-gate.json` | 没启用 |
-| 策略文件写错了 | 不审查；改了文件的轮次出一张配置错误卡片（同一份错误只出一张，改好后标为 Fixed） |
-| 普通子 agent 的轮次 | 默认只管根 agent；子 agent 需要带 `post-turn-gate.target=true` 标签 |
-| reviewer / answerer 自己的轮次 | 插件不审查自己派出的 agent |
-| 你点了停止 | `user_canceled`，默认忽略 |
-
-## 卡片语言
-
-reviewer 和 answerer 会用原始请求的语言写 summary、问题、回答和 findings，你用中文提问，卡片就是中文。想固定语言，在 `agents` 下对应角色的 `instructions` 里写明，例如 `"instructions": "Write all text in English."`。卡片标题、状态名，以及插件自己的提示语（例如 "You replied first"）目前固定为英文。
+每个决策轮一张卡片；检查、权限和 decider 的回复在同一张里。模型自由文本跟随请求语言；插件内置状态文字固定英文。

@@ -3,47 +3,7 @@ import { usePaseo } from "@getpaseo/plugin/client";
 import { useMemo, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { copyText } from "@getpaseo/plugin/client/react-native";
-import type { CardData, PermissionCard, RunStatus } from "../shared/schema.ts";
-
-const LABELS: Record<RunStatus, string> = {
-  DISPATCHING: "Starting",
-  REVIEWING: "Running",
-  FIXING: "Fixing",
-  PASSED: "PASS",
-  INCONCLUSIVE: "INCONCLUSIVE",
-  FAILED: "FAIL",
-  NEEDS_HUMAN: "NEEDS HUMAN",
-  ERROR: "ERROR",
-  SUPERSEDED: "Superseded",
-};
-
-type CheckState = CardData["checks"][number]["state"];
-const CHECK_LABELS: Record<CheckState, string> = {
-  pending: "waiting",
-  running: "running",
-  PASS: "PASS",
-  FAIL: "FAIL",
-  INCONCLUSIVE: "INCONCLUSIVE",
-  skipped: "skipped",
-};
-const CHECK_STYLE: Record<CheckState, (styles: ReturnType<typeof cardStyles>) => object> = {
-  pending: (styles) => styles.muted,
-  running: (styles) => styles.running,
-  PASS: (styles) => styles.success,
-  FAIL: (styles) => styles.danger,
-  INCONCLUSIVE: (styles) => styles.warning,
-  skipped: (styles) => styles.muted,
-};
-
-const REASONS: Record<NonNullable<CardData["checks"][number]["reason"]>, string> = {
-  blocked_permission: "a permission it needed was denied or not answered",
-  ambiguous_request: "the request does not say what is required",
-  no_test_infra: "no tests or runnable check",
-  env_missing: "missing credentials, services or tools",
-  other: "not enough evidence",
-};
-
-const FINISHED: RunStatus[] = ["PASSED", "INCONCLUSIVE", "FAILED", "NEEDS_HUMAN", "ERROR", "SUPERSEDED"];
+import type { CardData, PermissionCard } from "../shared/schema.ts";
 
 export function cardStyles(theme: PluginTimelineItemProps["theme"]) {
   return {
@@ -93,89 +53,14 @@ export function GateCard({ item, theme }: PluginTimelineItemProps<CardData>) {
   const data = item.data;
   const styles = useMemo(() => cardStyles(theme), [theme]);
 
-  let statusStyle = styles.running;
-  if (data.status === "PASSED" || data.fixed) statusStyle = styles.success;
-  if (data.status === "INCONCLUSIVE" || data.status === "SUPERSEDED") statusStyle = styles.warning;
-  if (!data.fixed && (data.status === "FAILED" || data.status === "ERROR" || data.status === "NEEDS_HUMAN")) statusStyle = styles.danger;
-
-  const name = (check: string) => (check === "verify" ? "Verify" : "Review");
-  // Cards written before multi-check runs have no rows; fall back to the single action.
-  const role =
-    data.checks.length > 0 ? data.checks.map((row) => name(row.check)).join(" → ") : data.action ? name(data.action) : "Gate";
-  const rounds = data.maxFixRounds > 0 ? ` · round ${data.round}/${data.maxFixRounds + 1}` : "";
-  const status = data.fixed ? "Fixed" : data.waiting ? "Waiting for permission" : LABELS[data.status];
-  const unverified = data.checks.filter((row) => row.state === "INCONCLUSIVE");
-
   return (
-    <View style={styles.card} accessible accessibilityLabel={`Post-turn gate ${role}: ${status}`}>
+    <View style={styles.card} accessible accessibilityLabel={`Post-turn gate: ${data.fixed ? "Fixed" : "Error"}`}>
       <View style={styles.header}>
-        <Text style={styles.title}>
-          Post-turn gate · {role}
-          {rounds}
-        </Text>
-        <Text style={data.waiting ? styles.warning : statusStyle}>{status}</Text>
+        <Text style={styles.title}>Post-turn gate</Text>
+        <Text style={data.fixed ? styles.success : styles.danger}>{data.fixed ? "Fixed" : "Error"}</Text>
       </View>
-      {data.permission ? <PermissionPrompt permission={data.permission} styles={styles} /> : null}
-      {data.checks.length > 1 ? (
-        data.checks.map((row) => (
-          <Text key={row.check} style={styles.body}>
-            <Text style={CHECK_STYLE[row.state](styles)}>
-              {name(row.check)} · {CHECK_LABELS[row.state]}
-            </Text>
-            {row.summary ? `: ${row.summary}` : ""}
-          </Text>
-        ))
-      ) : data.summary ? (
-        <Text style={styles.body}>{data.summary}</Text>
-      ) : null}
-      {unverified.map((row) => (
-        <Text key={`unverified-${row.check}`} style={styles.warning}>
-          Not verified ({name(row.check)}): {row.reason ? REASONS[row.reason] : REASONS.other}
-        </Text>
-      ))}
-      {data.denied ? <Text style={styles.warning} selectable>Denied permission: {data.denied}</Text> : null}
-      {data.dispute ? (
-        <Text style={styles.body} selectable>
-          The agent replied without changing files:{"\n"}
-          {data.dispute}
-        </Text>
-      ) : null}
+      <Text style={styles.danger} selectable>{data.error}</Text>
       {data.note ? <Text style={styles.muted}>{data.note}</Text> : null}
-      {data.findings.map((finding, index) => (
-        <View key={`${index}-${finding.title}`} style={styles.finding}>
-          <Text style={styles.body}>
-            [{finding.severity}] {finding.title}
-          </Text>
-          <Text style={styles.muted}>{finding.evidence}</Text>
-          <Text style={styles.muted}>Fix: {finding.suggested_fix}</Text>
-        </View>
-      ))}
-      {data.autoApproved > 0 ? (
-        <Text style={styles.muted}>{data.autoApproved} routine permission request(s) approved automatically</Text>
-      ) : null}
-      {data.otherFindings > 0 ? (
-        <Text style={styles.muted}>+{data.otherFindings} non-blocking finding(s)</Text>
-      ) : null}
-      {data.reviewerChanges ? (
-        <Text style={styles.warning} selectable>
-          The working tree changed during the check:{"\n"}
-          {data.reviewerChanges}
-        </Text>
-      ) : null}
-      {data.error ? (
-        <Text style={data.fixed ? styles.muted : styles.danger} selectable>
-          {data.error}
-        </Text>
-      ) : null}
-      {data.childAgentId ? (
-        <Text style={styles.muted} selectable>
-          {data.childTitle ?? "Reviewer"} · {data.childAgentId}
-          {FINISHED.includes(data.status) ? " (open it from History)" : " (in this agent's Subagents)"}
-        </Text>
-      ) : null}
-      {data.childAgentId ? (
-        <LogsCommand agentId={data.childAgentId} follow={!FINISHED.includes(data.status)} styles={styles} />
-      ) : null}
     </View>
   );
 }
@@ -211,7 +96,6 @@ export function LogsCommand({ agentId, follow, styles }: { agentId: string; foll
 
 export type Styles = Record<"permission" | "body" | "muted" | "danger" | "actions" | "allow" | "allowText" | "deny" | "denyText" | "command" | "code", object>;
 
-/** Answers the reviewer's pending permission from the source agent's timeline. */
 export function PermissionPrompt({
   permission,
   styles,

@@ -80,7 +80,7 @@ export type PluginTurnOutcome =
 不做的事：
 
 - 不改变任何现有行为。`max_tokens` 仍然是 `completed`，只是多了原因。
-- 不在 Paseo 里做自动重试；那是插件的策略，也就是本仓库的 `on_outcome`。
+- 不在 Paseo 里做自动重试；那是插件的策略，由本仓库的 supervision 与 decider 处理。
 
 ## 4. 测试
 
@@ -100,8 +100,8 @@ export type PluginTurnOutcome =
 
 | 结构化字段 | 类别 |
 |---|---|
-| `completed.stopReason` 为 `max_tokens` 或 `max_turn_requests` | `awaiting_user`，信号为 `truncated` / `tool_last`，交给 answerer，由它回复 “Continue.” |
-| `completed.stopReason` 为 `refusal` | `refused`，不再需要 answerer 判断 |
+| `completed.stopReason` 为 `max_tokens` 或 `max_turn_requests` | `awaiting_user`，信号为 `truncated` / `tool_last`，交给 decider，由它回复 “Continue.” |
+| `completed.stopReason` 为 `refusal` | `refused`，不再需要 decider 判断 |
 | `failed.error.category` | 直接对应同名类别（`auth` 新增为 `error` 的子类，只通知不重试） |
 | `failed.error.retryAfterSeconds` | 覆盖 `retry.delay_seconds` 的下限 |
 | `canceled.cause` | `replaced` / `user_canceled`，不再依赖 `refresh()` 的时序 |

@@ -1,6 +1,6 @@
 import type { ZodType, output } from "zod";
-import type { AnswerReply, DeciderPlan, DeciderReply, Verdict } from "../shared/schema.ts";
-import { answerReplySchema, deciderPlanSchema, deciderReplySchema, verdictSchema } from "../shared/schema.ts";
+import type { DeciderPlan, DeciderReply, Verdict } from "../shared/schema.ts";
+import { deciderPlanSchema, deciderReplySchema, verdictSchema } from "../shared/schema.ts";
 
 const ROLE = {
   verify: `You are an independent VERIFIER. Answer one question: does the change fully deliver the original request?
@@ -96,38 +96,6 @@ Reply now with the verdict JSON based on the evidence you already have. If that 
 verdict INCONCLUSIVE with inconclusive_reason "blocked_permission" and say in the summary what you could not check.`;
 }
 
-export function buildFixPrompt(
-  verdict: Verdict,
-  round: number,
-  maxFixRounds: number,
-  concurrentAgents: readonly string[] = [],
-): string {
-  const findings = verdict.findings
-    .map(
-      (finding, index) =>
-        `${index + 1}. [${finding.severity}] ${finding.title}\n   Evidence: ${finding.evidence}\n   Suggested fix: ${finding.suggested_fix}`,
-    )
-    .join("\n");
-  const task =
-    verdict.verdict === "INCONCLUSIVE"
-      ? "The check could not verify the change (see the summary). Add what is missing, such as tests or a runnable check, then stop."
-      : "Fix the CRITICAL and HIGH findings, then stop.";
-  return `The post-turn gate reviewed your last change and it did not pass (fix round ${round} of ${maxFixRounds}).
-
-Summary: ${verdict.summary}
-
-Findings:
-${findings || "(none listed)"}
-
-${task} The change will be reviewed again automatically. If you believe a finding is wrong, change nothing and
-explain why in your reply.${
-    concurrentAgents.length
-      ? `\n\nOther agents were changing this repository at the same time. Fix only findings caused by your own changes;
-for a finding in someone else's work, say so instead of changing their code.`
-      : ""
-  }`;
-}
-
 /** Concatenated assistant text after the latest user message (providers may split one reply into chunks). */
 export function latestAssistantText(
   timeline: readonly { type: string; text?: unknown }[],
@@ -202,80 +170,9 @@ export function parseVerdict(text: string): Verdict | null {
   return { ...parsed, verdict, inconclusive_reason: verdict === "INCONCLUSIVE" ? parsed.inconclusive_reason : null };
 }
 
-export function parseAnswer(text: string): AnswerReply | null {
-  return parseJsonReply(text, answerReplySchema);
-}
-
 export const ANSWER_PREFIX = "[post-turn gate answered on your behalf]";
 
-export function buildAnswerPrompt(input: {
-  requestText: string;
-  repoRoot: string;
-  baseTree: string;
-  endTree: string;
-  agentReply: string;
-  previousQuestion: string | null;
-  signal?: string | null;
-  instructions?: string;
-}): string {
-  const hints: Record<string, string> = {
-    truncated: "The reply ends inside an unclosed code block; it may have been cut off.",
-    tool_last: "The turn ended right after a tool call, without a final reply; the agent may have been stopped by a turn limit.",
-    todo_pending: "The agent's todo list still has unfinished items.",
-    refused: "The reply starts like a refusal.",
-    question: "The reply looks like it asks the user something.",
-  };
-  const hint = input.signal && hints[input.signal] ? `\nThe plugin noticed: ${hints[input.signal]}\n` : "";
-  const extra = input.instructions?.trim()
-    ? `\nAdditional rules from the repository policy:\n<<<RULES\n${input.instructions.trim()}\nRULES>>>\n`
-    : "";
-  const previous = input.previousQuestion
-    ? `\nYou already answered this earlier question in the same task: ${JSON.stringify(input.previousQuestion)}\nIf the agent is asking the same thing again, escalate.\n`
-    : "";
-  return `You stand in for the user of a coding agent. The agent just stopped its turn. Decide whether it is
-waiting for the user, and if so answer on the user's behalf when that is safe, so the work can continue
-without a human.
-${extra}${previous}${hint}
-Repository: ${input.repoRoot}
-Work done so far in this task: git -C ${JSON.stringify(input.repoRoot)} diff ${input.baseTree} ${input.endTree}
-You may read files and run read-only commands to inform the answer. Do not modify the repository.
-
-Original request from the user:
-<<<REQUEST
-${input.requestText}
-REQUEST>>>
-
-The agent's last message:
-<<<AGENT
-${input.agentReply}
-AGENT>>>
-
-Classify the agent's state:
-- "awaiting_user": it asks the user a question or for a decision and stopped.
-- "incomplete": it did not ask anything but stopped before finishing (e.g. "next I will …", a reply cut off
-  mid-way, unfinished todo items, or it stopped right after a tool call).
-- "refused": it declined to do the request (a policy or safety refusal), so there is nothing to answer.
-- "done": it finished the request and is not waiting for anything.
-
-For "awaiting_user", choose decision "answer" only when the request, the repository, or common engineering
-practice clearly determines the answer. If the agent recommends one option and that option is reversible,
-stays inside this repository, and stays within the scope of the original request, answer
-"Go with your recommendation." Keep the answer short and actionable, and put any command in backticks. Choose "escalate" when:
-- it is a product or business trade-off the request does not settle (several reasonable options);
-- it involves deleting data, force-pushing, publishing, deploying, spending money, changing permissions,
-  credentials or secrets, or sending anything outside this machine;
-- it needs information only the user has (accounts, personal preferences, passwords, external context);
-- it would expand the work beyond what the user asked for (e.g. the user asked for analysis, the agent
-  offers to implement);
-- you are not confident.
-For "incomplete", "refused" and "done", use decision "answer" with an empty answer.
-${languageRule(input.requestText)}
-
-Reply with ONLY one JSON object, no prose and no code fence:
-{"state":"awaiting_user|incomplete|refused|done","question":"<the question, verbatim or summarized>","decision":"answer|escalate","answer":"<reply to send to the agent>","reason":"<one sentence>"}`;
-}
-
-// ---------- decider (version 3) ----------
+// ---------- decider ----------
 
 export function parseDeciderPlan(text: string): DeciderPlan | null {
   return parseJsonReply(text, deciderPlanSchema);

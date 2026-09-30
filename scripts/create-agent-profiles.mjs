@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Creates or updates the Paseo agent profiles used by the post-turn gate
-// (reviewer, verifier and answerer), then reloads the daemon so they take effect.
+// (reviewer, verifier and decider), then reloads the daemon so they take effect.
 //
 //   node scripts/create-agent-profiles.mjs --provider kiro --model claude-opus-4.8 [options]
 //
@@ -17,9 +17,9 @@ const ROLES = {
     notes:
       "Independent code review after an agent turn: correctness, regressions, error handling, security, tests, maintainability. Used by the post-turn-gate plugin.",
   },
-  answerer: {
-    id: "post-turn-gate-answerer",
-    name: "Gate answerer",
+  decider: {
+    id: "post-turn-gate-decider",
+    name: "Gate decider",
     icon: "compass",
     notes:
       "Answers an agent's questions on the user's behalf when the request and repository settle them; escalates product, risky or personal decisions. Used by the post-turn-gate plugin.",
@@ -41,7 +41,7 @@ Options:
   --mode <id>        Provider mode (default: provider default)
   --thinking <id>    Thinking option (default: model default)
   --feature k=v      Feature value, repeatable; v is parsed as JSON when possible
-  --role <role>      reviewer | verifier | answerer | all (default: all)
+  --role <role>      reviewer | verifier | decider | all (default: all)
   --id <id>          Profile id (only with a single --role)
   --name <name>      Profile name (only with a single --role)
   --home <path>      Local daemon home (default: ~/.paseo)
@@ -91,7 +91,7 @@ if (values.help) {
 if (!values.provider || !values.model) fail(`--provider and --model are required\n\n${USAGE}`);
 const roles =
   values.role === "all" ? Object.keys(ROLES) : values.role === "both" ? ["reviewer", "verifier"] : [values.role];
-if (!roles.every((role) => role in ROLES)) fail(`--role must be reviewer, verifier, answerer or all`);
+if (!roles.every((role) => role in ROLES)) fail(`--role must be reviewer, verifier, decider or all`);
 if ((values.id || values.name) && roles.length > 1) fail("--id and --name need a single --role");
 
 const featureValues = {};

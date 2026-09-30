@@ -134,7 +134,7 @@ function commandRisk(command: string): string | null {
   return null;
 }
 
-// Natural-language red flags for answers given on the user's behalf (second check after the answerer).
+// Natural-language red flags for answers given on the user's behalf (second check after the decider).
 const RISKY_ANSWER =
   /\bforce[- ]push|\bdeploy(ing)? to (prod|production|staging)|\bpublish(ing)? (to|on) (npm|pypi|crates|the store)|\bdrop (the )?(table|database)|\bdelete (the )?(database|data|branch|repo(sitory)?|bucket|production|user data)|\b(password|credential|secret|api[ -]?key|private key)s?\b|\b(pay|purchase|billing|credit card)\b|\bpush(ing)? (it|this|them|the (branch|changes|commits?)|to (origin|main|master|the remote|github))\b|\bdeploy(ing)? (it|this|now)\b|\bapply(ing)? (the )?(terraform|pulumi|infra(structure)?) (plan|changes)\b|\b(run|apply)(ning)? (the )?migrations? (on|against|to|in) (prod|production|staging)\b|\broll(ing)? ?out (to|on) (prod|production)\b|删除(数据|分支|仓库)|强制推送|推送到|发布到|部署到|密码|密钥|付费|付款/i;
 
@@ -157,7 +157,7 @@ function commandSpans(text: string): string[] {
 }
 
 /**
- * Why an auto-answer must go to the user instead; null when nothing risky was found. A backstop for an answerer
+ * Why an auto-answer must go to the user instead; null when nothing risky was found. A backstop for an decider
  * that misjudged its scope: the risk is an answer authorizing an irreversible or outward-facing action, so only
  * commands and action phrases count, not a tool's name in prose.
  */

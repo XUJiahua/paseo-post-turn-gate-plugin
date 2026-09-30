@@ -7,50 +7,7 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 
 const POLICY_PATH = ".paseo/post-turn-gate.json";
-const ROLES = ["reviewer", "verifier", "answerer"];
-
-const DEFAULT_POLICY = {
-  version: 2,
-  trigger: "root_and_opt_in",
-  on_fail: { fix: { max_rounds: 2 } },
-  on_inconclusive: "report",
-  agents: {
-    reviewer: {
-      profile: null,
-      instructions_file: ".paseo/post-turn-gate/reviewer.md",
-      permissions: "auto",
-      timeout_minutes: 30,
-      permission_wait_minutes: 5,
-    },
-    verifier: {
-      profile: null,
-      instructions_file: ".paseo/post-turn-gate/verifier.md",
-      permissions: "auto",
-      timeout_minutes: 30,
-      permission_wait_minutes: 5,
-    },
-    answerer: {
-      profile: null,
-      instructions_file: ".paseo/post-turn-gate/answerer.md",
-      permissions: "auto",
-      timeout_minutes: 10,
-      permission_wait_minutes: 5,
-    },
-  },
-  on_outcome: {
-    done: ["review"],
-    awaiting_user: { answer: { max: 3, delay_seconds: 60 } },
-    refused: "notify",
-    user_canceled: "ignore",
-    replaced: "ignore",
-    crashed: "notify",
-    network: "notify",
-    rate_limited: "notify",
-    quota_exhausted: "notify",
-    context_exhausted: "notify",
-    error: "notify",
-  },
-};
+const ROLES = ["reviewer", "verifier", "decider"];
 
 const role = (name, timeout) => ({
   profile: null,
@@ -60,7 +17,7 @@ const role = (name, timeout) => ({
   permission_wait_minutes: 5,
 });
 
-// Version 3 (preview): a decider agent answers for you after every turn that did work.
+// Task supervision: a decider agent answers for you after every turn that did work.
 const SUPERVISED_POLICY = {
   version: 3,
   trigger: "root_and_opt_in",
@@ -77,12 +34,7 @@ const USAGE = `Usage: post-turn-gate-init [options]
 
 Options:
   --check <list>   checks, in order, comma-separated: verify (the change delivers the request), review (code
-                   quality); default verify,review (with --v2: review)
-  --v2             write a version 2 policy: checks after a finished turn, fixed fix rounds and answer limits,
-                   instead of a decider agent that answers for you after every turn that did work
-  --fix <rounds>   --v2 only: fix rounds after a failed check, 1-5 (default: 2)
-  --report         --v2 only: report a failed check instead of sending it back to the agent
-  --supervise      the default (version 3); kept for compatibility
+                   quality); default verify,review
   --dir <path>     repository to write into (default: current directory; the git root is used)
   --force          overwrite an existing policy file (role rules files are never overwritten)
   --stdout         print the policy instead of writing files
@@ -128,18 +80,7 @@ for you after each turn; record what it may decide for this project and what mus
 - Choose the smallest reversible option that stays within the original request.
 - Escalate when the repository does not determine the answer or the choice changes product behavior.
 `,
-  answerer: `<!--
-Answerer rules for this repository (.paseo/post-turn-gate/answerer.md).
-The Markdown below is active and is appended to the built-in answerer prompt. Edit it to record decisions
-the answerer may make for this project and choices that must always be escalated to a person.
--->
-# Repository answer instructions
 
-- Base answers on repository-local guidance and the project's existing architecture and conventions.
-- Prefer existing dependencies, tools, and patterns over introducing a new project-wide choice.
-- Choose the smallest reversible option that stays within the original request.
-- Escalate when the repository does not determine the answer or the choice changes product behavior.
-`,
 };
 
 function fail(message) {
@@ -150,10 +91,6 @@ function fail(message) {
 const { values } = parseArgs({
   options: {
     check: { type: "string" },
-    supervise: { type: "boolean", default: false },
-    v2: { type: "boolean", default: false },
-    fix: { type: "string" },
-    report: { type: "boolean", default: false },
     dir: { type: "string", default: process.cwd() },
     force: { type: "boolean", default: false },
     stdout: { type: "boolean", default: false },
@@ -167,8 +104,8 @@ if (values.help) {
   process.exit(0);
 }
 if (values["agent-prompt"]) {
-  if (values.stdout || values.force || values.report || values.fix !== undefined) {
-    fail("--agent-prompt cannot be combined with --stdout, --force, --report or --fix");
+  if (values.stdout || values.force) {
+    fail("--agent-prompt cannot be combined with --stdout or --force");
   }
   const target = path.resolve(values.dir);
   if (/[\r\n]/.test(target)) fail("--dir cannot contain a newline");
@@ -182,30 +119,13 @@ if (values["agent-prompt"]) {
   process.exit(0);
 }
 
-if (values.v2 && values.supervise) fail("--v2 and --supervise exclude each other");
-const supervise = !values.v2;
-const checkText = values.check ?? (supervise ? "verify,review" : "review");
+const checkText = values.check ?? "verify,review";
 const checks = checkText.split(",").map((check) => check.trim());
 if (!checks.every((check) => check === "review" || check === "verify") || new Set(checks).size !== checks.length) {
   fail(`--check takes review and/or verify once each, got "${checkText}"\n\n${USAGE}`);
 }
-if (supervise && (values.report || values.fix !== undefined)) {
-  fail("--fix and --report need --v2: in version 3 the decider handles failed checks within the task budget");
-}
-if (values.report && values.fix !== undefined) fail("--fix and --report exclude each other");
-const rounds = values.fix === undefined ? null : Number(values.fix);
-if (rounds !== null && (!Number.isInteger(rounds) || rounds < 1 || rounds > 5)) {
-  fail(`--fix must be an integer from 1 to 5, got "${values.fix}"`);
-}
-
-const policy = JSON.parse(JSON.stringify(supervise ? SUPERVISED_POLICY : DEFAULT_POLICY));
-if (supervise) {
-  policy.supervision.checks = checks;
-} else {
-  policy.on_outcome.done = checks;
-  if (values.report) policy.on_fail = "report";
-  if (rounds !== null) policy.on_fail.fix.max_rounds = rounds;
-}
+const policy = JSON.parse(JSON.stringify(SUPERVISED_POLICY));
+policy.supervision.checks = checks;
 const text = `${JSON.stringify(policy, null, 2)}\n`;
 
 if (values.stdout) {
@@ -224,7 +144,7 @@ try {
 }
 
 const files = [[POLICY_PATH, text]];
-for (const name of supervise ? ["reviewer", "verifier", "decider"] : ROLES) {
+for (const name of ROLES) {
   files.push([policy.agents[name].instructions_file, TEMPLATES[name]]);
 }
 // Role rules are the project's own work: an existing rules file is always kept. Only the policy is

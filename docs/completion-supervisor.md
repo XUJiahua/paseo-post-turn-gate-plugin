@@ -1,6 +1,6 @@
 # 主 Agent 外部持续监督器设计（decider 模式）
 
-状态：提案，部分实现（§19.1）。现状描述按代码 `026969f` 校对；现有实现见 [design.md](design.md) 与 [turn-outcomes.md](turn-outcomes.md)。
+状态：设计与实现记录。当前仅支持 v3，PASS 捷径已实现、v2 已移除；尚未实现的协议见 §19.1。现有实现见 [design.md](design.md) 与 [turn-outcomes.md](turn-outcomes.md)。
 
 本插件的本质是**自动回答**：主 Agent 每结束一轮，由一个独立的 decider Agent 判断下一步该做什么。它可以一次安排多件事（由插件并行派出 verifier、reviewer 等子 Agent），汇总结果后给主 Agent 一条回复。插件持续这样驱动任务，直到完成契约成立；只有遇到关键决策、越过安全边界或预算耗尽时，才请人介入。
 
@@ -15,38 +15,21 @@
    - 护栏（代码）执行不能交给模型的规则：人类边界、风险动作、预算、无进展、用户优先、幂等、发送协议。decider 的每份计划和每条回复都先过护栏。
 3. **一轮一决策，一条回复，一张卡片。** 一次 turn 结束产生一个决策轮（decision round），它可以包含多项检查和一个答案，最终合成一条消息发给主 Agent，在时间线上对应一张卡片。
 4. **有界。** 任务级总预算、无进展检测和墙钟上限由代码强制，decider 无法绕过。
-5. **在同等宿主能力下至少和 v2 一样强。** 宿主能力只决定保证级别（§11.1），不决定功能有无。
+5. **宿主能力只决定保证级别。** 缺少原子发送、隔离 worktree 等原语不关闭已有自动化（§11.1）。
 
 ## 2. 现状与偏差
 
-### 2.1 现有实现
+### 2.1 当前实现
 
-| 能力 | 现有实现 |
-| --- | --- |
-| 检查 | `on_outcome.done` 的有序检查列表（`verify`、`review`），串行，第一个 FAIL 结束本轮；CRITICAL/HIGH finding 由代码强制按 FAIL |
-| 修复 | `on_fail.fix.max_rounds`（1–5，默认 2）按任务计；fix 消息由 `buildFixPrompt` 用 findings 套模板生成 |
-| 代答 | 预筛（`outcome.ts` 正则）命中提问或未完成信号时才启动 answerer；它判定 `awaiting_user / done / incomplete / refused` 并作答或转交；`answerRisk`、同题检测由代码复核；`delay_seconds` 宽限期 |
-| 重试 | 固定文本 “Continue from where you left off.”，默认不重试（`notify`） |
-| 任务状态 | `tasks` 表：每个源 Agent 一行，turn 快照、carry、任务链共用任务范围；`task_id` 贯穿检查，`gate_runs.task_id` 指回它（§19.1） |
-| 发送 | 统一派发器 `sendIfIdle`（best-effort） |
-| 决策 | `decisions.ts` 的纯函数 `decideCheck`、`decideAnswer`；`gate.ts` 只执行它们的结果 |
-| 权限 | `permissions.ts` 自动批准常规请求，高风险上卡；`permission_wait_minutes` 后代拒，并追问检查者一次结论 |
-| 检查者改动 | 检查期间 tree 变化 → verdict 作废、NEEDS_HUMAN、写 carry |
-| 恢复 | 首个事件后立即 reconcile，之后每 60 秒一次 |
-| 卡片 | 检查卡每轮一张；任务链卡每个新事件一张，旧卡关闭 |
+当前直接解析 v3 schema，以任务链串起决策轮、检查和机械重试。角色是 decider、verifier、reviewer；不再有 v2 模板修复、独立 answerer 或只报告模式。
 
-### 2.2 与本设计的偏差
+普通 `done` 且有改动时立即检查，跳过宽限期与计划；全部 PASS 不调用 decider。提问或未完成轮次由 decider 出计划、等待独立证据、写一条回复。每个决策轮一张卡片。
 
-| 偏差 | 现状 | 本设计 |
-| --- | --- | --- |
-| 谁决定下一步 | 代码：正则分类 + 纯函数决策；answerer 只在预筛命中提问时启动 | decider 对每个非平凡的 turn 结束做决策；代码只做护栏 |
-| 一次做几件事 | 一次一件：代答和检查分属两套状态机，先后进行 | 一个决策轮同时安排检查和答案，结果合成一条回复 |
-| 谁写回复 | fix 是模板，重试是固定文本，只有代答由 Agent 写 | 全部由 decider 结合证据和上下文撰写 |
-| 找人的次数 | 修复轮次用完、修复轮反驳、INCONCLUSIVE `no_test_infra`、失败默认只通知、代答 3 次上限、拒答、未知错误都直接找人 | 先交给 decider；只有 §8 的人类边界才找人 |
-| 卡片 | 检查卡与任务链卡分开，一件事可能两张 | 一个决策轮一张卡 |
-| 检查者独立性 | 检查者不看主 Agent 的辩解 | 保持不变，decider 也不能推翻 FAIL |
+`tasks` 共用 baseline、请求、turn 快照、carry 和任务预算。每个 workspace 一个串行队列，统一 `sendIfIdle` 用 best-effort 派发。权限等待、角色超时、用户停止、重叠检测和懒恢复均已实现，详见 §19.1 与 design.md。
 
-原先的 supervisor 草案（纯函数 `DecisionEngine` 决定一切）同样偏离了原则 1；本版把它改为“护栏 + decider”。
+### 2.2 尚未实现的设计
+
+本文的结构化 Requirement Revision、完整 outbox、隔离 worker worktree、严格 workspace lease、能力探测及独立 Pause/Replace 仍是目标。实际实现使用累积文本、messageId、共享目录 tree 检查和 Stop/Resume 控制，不应把提案中更强的保证视为当前能力。
 
 ## 3. 目标与非目标
 
@@ -102,7 +85,10 @@ turn_ended(source)
   ├─ 护栏：crashed / network / rate_limited 且重试预算未用完 → 退避后机械重试，不启动 decider
   ├─ 护栏：quota_exhausted / context_exhausted → 找人
   │
-  ├─ 推测性检查：工作区相对任务基线有变化 → 立即按策略默认检查列表启动 worker（§5.3）
+  ├─ PASS 捷径：done 且有改动，预筛无提问或未完成信号 → 立即检查，不等宽限期、不出计划
+  │     全部 PASS → 直接完成；非 PASS → 宽限期后只启动汇总（人类边界直接找人）
+  │
+  ├─ 其余轮次的推测性检查：有改动 → 立即按策略检查列表启动 worker（§5.3）
   ├─ 宽限期：先等 delay_seconds；期间用户发消息 → 取消本轮
   │
   ├─ decider 阶段一（计划）：输入 = 需求、本轮回复、diff 范围、任务历史、已启动的 worker、剩余预算
@@ -150,7 +136,7 @@ decider 不可以：
 - 主 Agent 的下一轮如果结束在同一棵 tree 上（例如答案只是“commit 吧”），沿用这次 verdict，不重跑。
 - decider 判定主 Agent 其实没做完（`incomplete`）时，取消推测性检查。
 
-这覆盖了原草案 §8.1 的“提问时提前检查”，并推广到所有决策轮。`supervision.speculative_checks: false` 可以关掉，改为等计划后再启动。
+这覆盖了原草案 §8.1 的“提问时提前检查”，并推广到所有决策轮。`supervision.speculative_checks: false` 可以关掉，改为等计划后再启动。普通 `done` 的 PASS 捷径始终立即检查，不受此开关影响；全部 PASS 直接完成，否则只启动汇总，自动发送仍尊重宽限期。
 
 ### 5.4 worker 由插件创建
 
@@ -317,13 +303,13 @@ tree 改变、未满足需求减少、阻断 finding 消失、出现新的有效
 | worker 工作目录 | `worktree`：隔离 worktree，可并行 | `in-place`：原目录 + 前后 tree 对比，串行 | worker 的改动会短暂出现在源目录；verdict 作废，不回滚 |
 | 同工作区排他 | `exclusive`：能列举运行中的 Agent | `plugin-only`：插件派发的动作串行，外部 turn 靠重叠检测 | 插件启动前就在运行的外部 turn 看不到 |
 
-卡片显示当前生效的级别；能力到位后自动升级，不改策略。
+这是目标行为；当前未实现能力探测与保证级别卡片，实际仍为 best-effort / in-place / plugin-only。
 
 ### 11.2 派发
 
 所有发给主 Agent 的消息经 `server/dispatch.ts` 的 `sendIfIdle`（已实现）：refresh → 确认 `idle`（重试和答案也接受 `error`）→ 同步落盘 → `send()`，中间不 await。确认失败即放弃，用户的 turn 按 revision 规则处理。宽限期（默认 60 秒）让 Agent 刚停下、用户最可能回复的那段时间里不发生自动发送。
 
-给插件自己的子 Agent 发消息（decider 阶段二、worker 权限被拒后的追问）不受此限。
+给 worker 权限被拒后的追问不受此限。当前 decider 阶段二创建另一个子 Agent。
 
 ### 11.3 共享工作区
 
@@ -333,7 +319,7 @@ tree 改变、未满足需求减少、阻断 finding 消失、出现新的有效
 
 - 首个 hook/RPC 取得 SDK handle 后立即 reconcile，之后每 60 秒一次（已实现，`server/supervisor.ts`）。
 - 子 Agent 用同 id/key 重放 create（V9、V10）；已 idle 的子 Agent 从 timeline 取回结果。
-- decider 阶段二的消息、发给主 Agent 的回复都按 messageId 对账，找不到才重发。
+- 完整 outbox 是目标；当前子 Agent create 用 id/key 对账重放，已发送源消息没有完整重发协议。
 - turn 中途重载：`tasks.turn_json` 保留基线（已实现）。
 - 存储的策略快照无法按当前 schema 解析时转 `ERROR`。
 - 冷启动无事件时不能恢复，需要 Paseo 提供 ready hook（§21）。
@@ -356,7 +342,7 @@ tree 改变、未满足需求减少、阻断 finding 消失、出现新的有效
 - 权限请求的 Yes/No（按 provider 的 actions 渲染）；
 - `Stop auto-answering`：本任务后续轮次改为找人；
 - `Pause` / `Resume`、`Stop supervision`、`Replace task`；
-- `dispatch: "assisted"` 时的 `Prepare reply`：只复制或预填，不发送。
+- 不提供只报告或 `dispatch: "assisted"` 模式。
 
 发布顺序：持久化 → 更新卡片 → 归档子 Agent。
 
@@ -372,7 +358,7 @@ tree 改变、未满足需求减少、阻断 finding 消失、出现新的有效
 
 ## 15. 策略
 
-已实现的字段（`shared/schema.ts` 的 `supervisionSchema`）；`blocking_severity`、`dispatch: "assisted"` 尚未实现：
+唯一支持的策略是 v3（`shared/schema.ts` 的 `policySchema`）。不保留 v2 兼容、只报告模式或 assisted 派发：
 
 ```json
 {
@@ -393,16 +379,16 @@ tree 改变、未满足需求减少、阻断 finding 消失、出现新的有效
 }
 ```
 
-- `agents.decider` 取代 `agents.answerer`，字段相同；仓库规则文件 `decider.md` 不存在时读取 `answerer.md`。
-- `dispatch: "auto"` 按保证级别自动发送；`"assisted"` 只准备回复，由用户提交。
-- v2 策略文件保留 v2 语义（先检查、固定模板、默认找人），不会因升级而突然更自动化；v3 需要显式迁移，`post-turn-gate-init` 对新仓库生成 v3。
-- v2 → v3 映射：`on_outcome.done` 的列表 → `checks`；`on_fail.fix.max_rounds`、`awaiting_user.answer.max`、`retry.max` 合并进 `max_auto_sends`；`delay_seconds` → `reply_delay_seconds`；`on_inconclusive` 由 decider 默认补齐取代。
+- 三个角色直接为 `agents.decider`、`agents.verifier`、`agents.reviewer`。`decider.md` 不存在时没有规则，不读取旧 `answerer.md`。
+- v2、`on_outcome`、`on_fail`、`on_inconclusive` 均被 schema 拒绝；旧配置需显式改写，没有自动迁移。
+- `post-turn-gate-init` 只生成 v3；删除 `--v2`、`--fix`、`--report`、`--supervise`。
+- `max_auto_sends` 至少为 1，不能设为 0 表示只报告。自动回复和重试共用总预算。
 
 ## 16. 测试策略
 
-- **护栏决策表**：每种 outcome、verdict、预算边界、人类边界的单测（`decisions.ts` 已有 `decideCheck`、`decideAnswer`，改作护栏函数）。
+- **护栏决策表**：每种 outcome、verdict、预算边界、人类边界的单测（`decisions.ts` 保留 `decideCheck` 和 verdict 规范化；自动回复护栏在 `gate.ts`）。
 - **决策轮集成测试**：真实临时 git 仓库和 SQLite、fake Paseo，从 `CompletionSupervisor.accept()` 驱动：
-  - 改完文件 `done` → 推测性检查 PASS → decider `done` → COMPLETED，一张卡；
+  - 改完文件 `done` → 立即检查 PASS → 直接 COMPLETED，不启动 decider，一张卡；
   - 改完文件提问 → 检查与 decider 并行 → FAIL findings 与答案合成一条消息；
   - 答案轮 tree 不变 → 沿用 verdict；
   - decider 判定 `incomplete` → 取消推测性检查，发“继续”；
@@ -415,7 +401,7 @@ tree 改变、未满足需求减少、阻断 finding 消失、出现新的有效
   - decider 输出无效或超时 → 找人；
   - worker 或 decider 改动工作区 → 结果作废、找人；
   - 每个“落盘前后、外部调用前后”的崩溃切点恢复后不重复发送。
-- **v2 回归**：v2 策略文件下现有全部测试继续通过。
+- **删除回归**：拒绝 v2 和旧字段/参数；权限、carry、恢复、并发等通用测试直接使用 v3。
 - **Provider 冒烟**：kiro、Codex、Claude 至少两个。
 
 ## 17. 验收标准
@@ -427,7 +413,7 @@ tree 改变、未满足需求减少、阻断 finding 消失、出现新的有效
 5. 用户输入永远不会被插件的消息取消（`atomic` 级别）；`best-effort` 级别下竞态窗口不大于 v2。
 6. 预算和无进展上限由代码强制，decider 无法绕过。
 7. 崩溃恢复后不重复发送，卡片不会永久显示 Running。
-8. v2 策略继续按旧语义工作。
+8. 仅支持 v3；没有模板修复、旧 answerer 或只报告模式。
 
 ## 18. 被否决的替代方案
 
@@ -443,14 +429,14 @@ tree 改变、未满足需求减少、阻断 finding 消失、出现新的有效
 ## 19. 路线图
 
 1. **seam 与存储**（已完成，§19.1）：supervisor 入口、统一派发器、护栏纯函数、`tasks` 表与任务生命周期。
-2. **decider 协议 v1**：answerer 推广为 decider；按 §5 实现计划、推测性检查、汇总与护栏复核；一轮一张卡。检查和代答拆为 `CheckRunner` 与 `DeciderRunner` 两个模块，`decision_rounds` 表取代任务链里的代答字段。v2 策略文件继续走旧路径。
+2. **decider 协议 v1**：answerer 推广为 decider；按 §5 实现计划、推测性检查、汇总与护栏复核；一轮一张卡。检查和代答拆为 `CheckRunner` 与 `DeciderRunner` 两个模块，`decision_rounds` 表取代任务链里的代答字段。当前已删除 v2 路径；模块拆分仍待评估。
 3. **收回找人点**：实现 §8.2，默认值改为自动处理；机械重试与退避。
 4. **任务级护栏**：§9 的预算、无进展、墙钟；Pause/Resume、Stop、Replace。
 5. **Requirement Revision 与 outbox**：结构化需求版本、发送 outbox、按工作区分队列、恢复加固。
 6. **v3 启用**：schema、initializer、迁移文档、provider 冒烟。
 7. **宿主能力升级**：`sendIfIdle`、worker cwd、运行中 Agent 列表、ready hook；到位后保证级别自动升级，worker 可并行。
 
-每一步保持现有测试通过；迁移完成前，旧路径和新路径不能同时拥有同一任务的发送权。
+每一步保持现有测试通过；当前只有监督器持有任务的自动发送权。
 
 ### 19.1 实现状态
 
@@ -459,18 +445,19 @@ tree 改变、未满足需求减少、阻断 finding 消失、出现新的有效
 | `24a30d3` | `server/supervisor.ts` 入口外观（`accept`、`control`，接管恢复与 reconcile 定时器）；`server/dispatch.ts` 统一派发器，fix、代答、重试、FIXING 重发都经过它；`server/decisions.ts` 的 `decideCheck`、`decideAnswer` |
 | `64fe506` | `chains`、`carries`、`turn_snapshots` 合并为 `tasks` 表；旧表启动时导入后删除 |
 | `026969f` | `task_id` 贯穿检查：run 检查期间任务存活，PASSED/INCONCLUSIVE/FAILED/ERROR 结束任务，NEEDS_HUMAN/SUPERSEDED 交给 carry 或任务链；重叠 Agent 记录持久化 |
-| 本次 | decider 协议 v1（路线图第 2 步的主体），只对 `version: 3` 策略生效 |
+| `c31536d` | 普通 done + 有改动时立即检查，全部 PASS 跳过 decider，非 PASS 只做汇总 |
+| 当前 | 删除 v2 专用路径、旧状态字段、初始化选项和规则回退；通用测试与文档改为直接使用 v3 |
 
 decider 协议 v1 的实现（`server/gate.ts` “decision rounds” 一节）：
 
-- `version: 3` 策略被规范化为内部策略形状加 `supervision`：检查只报告（`on_fail: "report"`），由 decider 写回复；`agents.decider` 即 answerer 角色，规则文件 `decider.md` 不存在时读 `answerer.md`。
+- 当前策略直接使用 v3 形状，不再规范化为 v2。decider 角色、profile、规则文件均使用自己的名称；不再读取 `answerer.md`。旧策略会报配置错误。
 - 一轮：工作区有改动时立即启动推测性检查；宽限期后 decider 出计划（`DECIDER_PLAN_JSON_SCHEMA`）；需要检查的，检查结束后由第二个 decider 子 Agent 汇总回复（`DECIDER_REPLY_JSON_SCHEMA`）；不需要的直接用 `reply_now` 并取消检查。
 - 护栏：`done` 在有改动时必须有当前 tree 上的 PASSED run（没跑过检查就补跑一次，否则找人）；`answerRisk`；同题再问；自动发送预算；墙钟；连续无进展的轮次；检查者改树、权限被拒、需求歧义、检查者失败直接找人；宽限期或决策期间用户发消息取消本轮。
 - 发送：`pts:<chain>:<n>`，经统一派发器；回复前缀沿用 `[post-turn gate answered on your behalf]`。检查通过的 tree 记为 `passed_tree`，下一轮结束在同一棵 tree 上且主 Agent 说完成时直接完成，不再检查、不再启动 decider。
 - 机械重试：crash/network/rate_limited 按 `max_retries` 退避（30s、2min、8min），计入自动发送预算。
-- 你发消息接手时，自动发送计数、无进展计数、`passed_tree` 和墙钟起点重置。
+- 你发消息接手时，自动发送计数、重试计数、无进展计数和墙钟起点重置；既有 PASS tree 保留，新的决策判断是否覆盖新需求。
 - 卡片：`outcomeCardSchema` 增加 `decider`、`checks`，客户端显示为 “Post-turn supervisor”。
-- 测试：`gate.test.ts` “version 3: the decider answers…”（8 个）。
+- 测试：`gate.test.ts` 的决策轮、权限、恢复、carry 和工作区队列测试直接使用 v3 策略。
 
 真实环境冒烟（Paseo 0.10.1、kiro `claude-opus-4.8`，`/tmp` 下的临时仓库，根 Agent）：
 
@@ -483,13 +470,15 @@ decider 协议 v1 的实现（`server/gate.ts` “decision rounds” 一节）�
 - 子 Agent（kiro，父 Agent 是另一个 kiro 会话，带 `post-turn-gate.target=true`）：“给 add.js 加 neg 并补测试”。按 `root_and_opt_in` 被选中，检查 PASS 后自动结束。
 - 语言修正之后（`9d3f6f9`）：中文请求“在 add.js 里加 pow 并补测试”，verify、review 的 summary 和 decider 的理由都是中文；检查 PASS 后任务自动结束。
 
+本次删除 v2 后的实跑（Paseo 0.10.1、codex-proxy、auto-review，独立临时仓库）：带 `post-turn-gate.target=true` 的源子 Agent 添加 `sq(a)` 和 `sq(3) === 9` 测试，`npm test` 通过。verify、review 都给出 PASS，run `f08d1a21-0e65-4918-8046-b48828cec47c` 为 PASSED，任务行被删除；没有创建 decider 或发送自动回复。插件 reload 后为 running。单测 114 个通过，类型检查通过。
+
 v1 与本设计的差异，后续步骤处理：
 
 - decider 的两个阶段是两个子 Agent，而不是同一个子 Agent 收到第二条消息：Paseo 的 `send()` 不接受 `outputSchema`，第二阶段拿不到结构化输出。代价是汇总阶段要重新读一遍上下文。
 - 一轮一张卡：v3 的检查 run 不再发布自己的卡片，决策卡显示检查进度（含检查者 id）、结论、被拒绝的请求，以及检查者上交的权限按钮；decider 运行时它自己的请求优先占用按钮位置。
 - 工作区没变化时：主 Agent 说完成就结束；停下提问但本轮和任务都没做过工作时不启动 decider（沿用 v2 预筛）。
 - 进展只比较 tree，不比较 findings（标了 `ponytail:`）。墙钟不含等待用户的时间：交给用户之后的下一轮总是由用户的消息开始，而用户消息会重置预算。
-- `post-turn-gate-init` 默认生成 v3（含 `decider.md` 模板），`--v2` 生成旧版策略；已有仓库的 v2 策略不受影响。
+- `post-turn-gate-init` 只生成 v3（含 `decider.md` 模板），旧版参数和策略不受支持。
 
 多项目：每个 workspace 一个串行队列（事件按 hook 的 `workspaceId`，对账和定时任务按 run、任务链记录的 `workspace_id`），一个 workspace 的慢操作不再推迟其他 workspace。基线在 `turn_started` 到达时立即拍摄，不排队；git 调用有 120 秒超时，拍不出基线时出卡片说明。同一仓库开了两个 workspace 时它们并行，重叠提示仍然有效（标了 `ponytail:`）。
 
@@ -528,4 +517,4 @@ v1 与本设计的差异，后续步骤处理：
 - 可靠的 Agent terminal/archived 事件；
 - card action RPC 在 daemon reload 后的稳定路由。
 
-以上都不是发布条件：缺少时沿用 v2 的做法，只影响保证级别。
+以上都不是发布条件：缺少时保留当前 best-effort 自动发送与共享目录检查，只影响保证级别。

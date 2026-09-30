@@ -4,7 +4,7 @@ import type { Ledger } from "./ledger.ts";
 
 /**
  * The single entry point of the supervisor (docs/completion-supervisor.md §19). Hooks, RPCs and recovery all arrive as events;
- * callers never assemble the workflow. The v2 gate runs behind it unchanged.
+ * callers never assemble the workflow. The gate owns decision rounds, checks and retries.
  */
 export type SupervisorEvent =
   | { type: "turn_started"; event: PluginLifecycleEvents["agent.turn_started"] }
@@ -18,7 +18,7 @@ export type SupervisorControl = { taskId: string; action: "stop_answering" | "re
 export interface CompletionSupervisor {
   /** Enqueues and returns at once, keeping every hook far below Paseo's 30s hook timeout. */
   accept(event: SupervisorEvent, paseo: Paseo): void;
-  /** Card buttons. `taskId` is the v2 chain id until decision rounds replace chains. */
+  /** Card buttons. `taskId` identifies the current task chain. */
   control(control: SupervisorControl, paseo: Paseo): Promise<boolean>;
   idle(): Promise<void>;
   close(): Promise<void>;

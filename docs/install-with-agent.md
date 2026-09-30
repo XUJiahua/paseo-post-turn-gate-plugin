@@ -18,7 +18,7 @@ plugin into the user's existing Paseo daemon.
 - Run repository initialization only from the exact installed plugin checkout. Never mix a running plugin with an
   initializer downloaded from another source, branch, tag, or commit.
 - Never use `--force`, never overwrite existing Post-turn Gate files wholesale, and do not commit or push.
-- Do not change product behavior such as `trigger`, `supervision`, `on_fail`, `on_outcome`, permissions, provider, or model
+- Do not change product behavior such as `trigger`, `supervision`, permissions, provider, or model
   unless the user explicitly requested that change. Keep a new installation's profiles set to `null`.
 
 ## 1. Preflight and installation
@@ -48,7 +48,7 @@ Inspect these four paths first:
 - `.paseo/post-turn-gate.json`
 - `.paseo/post-turn-gate/reviewer.md`
 - `.paseo/post-turn-gate/verifier.md`
-- `.paseo/post-turn-gate/decider.md` (or `answerer.md` in a version 2 setup)
+- `.paseo/post-turn-gate/decider.md`
 
 If none exists, confirm that the exact installed plugin checkout contains `bin/post-turn-gate-init.mjs`, then run
 that file directly (replace `<installed-plugin-path>` with the `path` returned by `plugin ls`):
@@ -84,7 +84,7 @@ Keep the built-in role contract intact. Edit only the repository-specific Markdo
   coverage, blocking conditions, generated files, and intentional exceptions. Avoid duplicating generic review advice.
 - `verifier.md`: authoritative acceptance sources, exact safe build/typecheck/lint/test commands, prerequisites,
   and the observable evidence required for API, UI, migration, or compatibility changes.
-- `decider.md` (`answerer.md` in a version 2 setup): conservative, reversible decisions already determined by this repository. Keep the default
+- `decider.md`: conservative, reversible decisions already determined by this repository. Keep the default
   escalation boundaries. Do not add permission to choose product behavior, publish, deploy, delete data, access
   credentials, add dependencies, or take outward-facing actions without explicit user confirmation.
 

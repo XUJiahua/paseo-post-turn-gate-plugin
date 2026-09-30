@@ -4,7 +4,7 @@ import path from "node:path";
 import { describe, test } from "node:test";
 import { classify, currentTurnItems, isCourtesyOffer, looksLikeQuestion, similarity, stopSignal } from "./outcome.ts";
 import { answerRisk } from "./permissions.ts";
-import { gateChecks, maxFixRounds, policySchema, supervisionSchema } from "../shared/schema.ts";
+import { gateChecks, policySchema, supervisionSchema } from "../shared/schema.ts";
 
 const user = (text: string) => ({ type: "user_message", text });
 const says = (text: string) => ({ type: "assistant_message", text });
@@ -180,70 +180,32 @@ describe("answer guards", () => {
   });
 });
 
-describe("on_outcome schema", () => {
-  test("defaults and restrictions", () => {
-    const policy = policySchema.parse({ version: 2 });
-    assert.deepEqual(policy.on_outcome.awaiting_user, { answer: { max: 3, delay_seconds: 60 } });
-    assert.equal(policy.on_outcome.network, "notify");
-    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { network: { retry: { max: 2, delay_seconds: 30 } } } }).success, true);
-    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { quota_exhausted: { retry: { max: 1, delay_seconds: 30 } } } }).success, false);
-    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { network: { answer: {} } } }).success, false);
-    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { bogus: "ignore" } }).success, false);
+describe("supervision policy and initialization", () => {
+  test("only v3 is accepted, with strict checks, roles and budgets", () => {
+    const policy = policySchema.parse({ version: 3 });
+    assert.deepEqual(gateChecks(policy), ["verify", "review"]);
+    assert.deepEqual([policy.agents.reviewer.profile, policy.agents.verifier.profile, policy.agents.decider.profile], [null, null, null]);
+    assert.equal(policy.agents.decider.timeout_minutes, 10);
+    for (const input of [
+      { version: 2 }, { version: 1 }, { version: 3, on_fail: "report" },
+      { version: 3, on_outcome: {} }, { version: 3, agents: { answerer: {} } },
+      { version: 3, supervision: { checks: [] } },
+      { version: 3, supervision: { checks: ["review", "review"] } },
+      { version: 3, supervision: { budget: { max_auto_sends: 0 } } },
+      { version: 3, supervision: { budget: { max_retries: 4 } } },
+    ]) assert.equal(policySchema.safeParse(input).success, false, JSON.stringify(input));
   });
 
-  test("done lists the checks, on_fail picks fix rounds, profiles default off, v1 fields are rejected", () => {
-    const policy = policySchema.parse({ version: 2 });
-    assert.deepEqual(gateChecks(policy), ["review"]);
-    assert.equal(maxFixRounds(policy), 2, "fix is the default");
-    assert.equal(maxFixRounds(policySchema.parse({ version: 2, on_fail: "report" })), 0);
-    assert.deepEqual(gateChecks(policySchema.parse({ version: 2, on_outcome: { done: ["verify", "review"] } })), ["verify", "review"]);
-    assert.deepEqual(gateChecks(policySchema.parse({ version: 2, on_outcome: { done: "notify" } })), []);
-    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { done: [] } }).success, false);
-    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { done: ["review", "review"] } }).success, false);
-    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { done: "review" } }).success, false);
-    assert.deepEqual(
-      [policy.agents.reviewer.profile, policy.agents.verifier.profile, policy.agents.answerer.profile],
-      [null, null, null],
-    );
-    assert.equal(policy.agents.answerer.timeout_minutes, 10);
-    assert.equal(policySchema.parse({ version: 2, agents: { verifier: { profile: null } } }).agents.verifier.profile, null);
-    assert.equal(policySchema.safeParse({ version: 2, reviewer: {} }).success, false);
-    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { awaiting_user: { answer: { profile: "x" } } } }).success, false);
-    assert.equal(maxFixRounds(policySchema.parse({ version: 2, on_fail: { fix: {} } })), 2);
-    assert.equal(policySchema.safeParse({ version: 2, on_fail: { fix: { max_rounds: 0 } } }).success, false);
-    assert.equal(policySchema.safeParse({ version: 2, on_outcome: { awaiting_user: "gate" } }).success, false);
-    assert.equal(policySchema.safeParse({ version: 1, action: "review" }).success, false);
-    assert.equal(policySchema.safeParse({ version: 2, action: "review" }).success, false);
-  });
-
-  test("npm run init writes every field with its default, plus the chosen options", () => {
-    const run = (...args: string[]) =>
-      JSON.parse(execFileSync(process.execPath, ["bin/post-turn-gate-init.mjs", "--stdout", "--v2", ...args], { encoding: "utf8" }));
-    const defaults = run();
-    assert.deepEqual(defaults, policySchema.parse({ version: 2 }));
-    assert.deepEqual(defaults.on_fail, { fix: { max_rounds: 2 } });
-    assert.equal(run("--report").on_fail, "report");
-    assert.deepEqual(defaults.on_outcome.done, ["review"]);
-    assert.equal(defaults.agents.verifier.profile, null);
-    const chosen = run("--check", "verify,review", "--fix", "3");
-    assert.deepEqual(chosen.on_fail, { fix: { max_rounds: 3 } });
-    assert.deepEqual(chosen.on_outcome.done, ["verify", "review"]);
-    assert.equal(chosen.on_outcome.network, "notify", "other fields keep their defaults");
-    assert.throws(() => run("--fix", "0"), /Command failed/);
-    assert.throws(() => run("--check", "review,review"), /Command failed/);
-  });
-
-  test("npm run init writes a version 3 policy with every default", () => {
-    const run = (...args: string[]) =>
-      JSON.parse(execFileSync(process.execPath, ["bin/post-turn-gate-init.mjs", "--stdout", ...args], { encoding: "utf8" }));
-    assert.deepEqual(run("--supervise"), run(), "--supervise is the default");
-    assert.throws(() => run("--v2", "--supervise"), /Command failed/);
-    const written = run();
-    assert.equal(written.version, 3);
-    assert.deepEqual(written.supervision, supervisionSchema.parse({}));
-    assert.deepEqual(policySchema.parse(written), policySchema.parse({ version: 3 }), "the same policy as all defaults");
+  test("init writes every v3 default, permits check order, and rejects removed flags", () => {
+    const run = (...args: string[]) => JSON.parse(execFileSync(process.execPath,
+      ["bin/post-turn-gate-init.mjs", "--stdout", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }));
+    assert.deepEqual(run(), policySchema.parse({ version: 3 }));
+    assert.deepEqual(run().supervision, supervisionSchema.parse({}));
     assert.deepEqual(run("--check", "review").supervision.checks, ["review"]);
-    assert.throws(() => run("--fix", "2"), /Command failed/);
+    assert.deepEqual(run("--check", "review,verify").supervision.checks, ["review", "verify"]);
+    for (const args of [["--v2"], ["--report"], ["--fix", "2"], ["--supervise"], ["--check", "review,review"], ["--check", ""]]) {
+      assert.throws(() => run(...args), /Command failed/);
+    }
   });
 
   test("the CLI prints a safe, repository-specific coding-Agent setup task", () => {

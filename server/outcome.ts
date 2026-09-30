@@ -87,7 +87,7 @@ const REFUSAL =
 /**
  * Cheap, high-recall pre-screen for "the turn may not really be finished": a question, a reply cut off
  * mid code block, a turn that ended right after a tool call, unfinished todos, or a refusal.
- * A hit only means the semantic check (answerer agent) runs; a miss means `done`.
+ * A hit only means the semantic check (decider agent) runs; a miss means `done`.
  * Deliberately not a signal: a reply without final punctuation (too common in normal replies).
  */
 export function stopSignal(items: readonly (TurnItem & { items?: unknown })[]): StopSignal | null {
@@ -112,7 +112,7 @@ const CHOICE = /\bor\b|\bwhich\b|还是|哪/i;
 /**
  * A finished report that ends with one closing offer ("Implemented X. Let me know if you need anything
  * else."). Treated as done: a miss only costs a review of a half-finished task (whose FAIL tells the agent to
- * continue), while a false question costs an answerer run that may even accept the offer.
+ * continue), while a false question costs an decider run that may even accept the offer.
  */
 export function isCourtesyOffer(reply: string): boolean {
   const text = reply.replace(/```[\s\S]*?```/g, " ").replace(/[*_`>#]+/g, "").trim();
@@ -131,7 +131,7 @@ const ASKING =
 
 /**
  * Cheap, high-recall pre-screen for "the agent stopped to ask the user something".
- * A hit only means the semantic check (answerer agent) runs; a miss means `done`.
+ * A hit only means the semantic check (decider agent) runs; a miss means `done`.
  */
 export function looksLikeQuestion(reply: string): boolean {
   const text = reply

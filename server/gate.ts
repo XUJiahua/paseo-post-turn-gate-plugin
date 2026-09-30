@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
 import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { PluginHookContext, PluginLifecycleEvents } from "@getpaseo/plugin/server";
@@ -8,7 +7,6 @@ import type {
   DeciderPlan,
   DeciderReply,
   Category,
-  OnOutcome,
   OutcomeCard,
   PermissionCard,
   Policy,
@@ -16,7 +14,6 @@ import type {
   Verdict,
 } from "../shared/schema.ts";
 import {
-  ANSWER_JSON_SCHEMA,
   CARD_KIND,
   DECIDER_PLAN_JSON_SCHEMA,
   DECIDER_REPLY_JSON_SCHEMA,
@@ -32,8 +29,6 @@ import {
   ROLE_PROFILE,
   defaultInstructionsFile,
   gateChecks,
-  maxFixRounds,
-  isStoredPolicy,
   policySchema,
   triggerSchema,
 } from "../shared/schema.ts";
@@ -42,21 +37,18 @@ import type { Chain, Ledger, RoundRecord, Run } from "./ledger.ts";
 import { SUGGESTIONS, classify, currentTurnItems, replyText, similarity } from "./outcome.ts";
 import {
   ANSWER_PREFIX,
-  buildAnswerPrompt,
   buildDeciderPrompt,
-  buildFixPrompt,
   buildGatePrompt,
   buildNudgePrompt,
   latestAssistantText,
-  parseAnswer,
   parseDeciderPlan,
   parseDeciderReply,
   parseVerdict,
 } from "./prompts.ts";
 import { answerRisk, decideAutoApproval } from "./permissions.ts";
 import { resolveRole } from "./reviewer.ts";
-import { IDLE, IDLE_OR_ERROR, sendIfIdle } from "./dispatch.ts";
-import { decideAnswer, decideCheck, normalizeVerdict } from "./decisions.ts";
+import { IDLE_OR_ERROR, sendIfIdle } from "./dispatch.ts";
+import { decideCheck, normalizeVerdict } from "./decisions.ts";
 
 export type Paseo = PluginHookContext["paseo"];
 type TurnStarted = PluginLifecycleEvents["agent.turn_started"];
@@ -73,12 +65,11 @@ export const MANAGED_LABEL = "post-turn-gate.managed";
 export const TARGET_LABEL = "post-turn-gate.target";
 /** Added by the daemon to every agent created with a parent (design.md V8). */
 const PARENT_LABEL = "paseo.parent-agent-id";
-const FIX_PREFIX = "ptg:";
+const PLUGIN_PREFIX = "ptg:";
 const REQUEST_TEXT_LIMIT = 8000;
 /** Messages the version 3 supervisor sends to a source agent: pts:<chain>:<n>. */
 const ROUND_PREFIX = "pts:";
-const isPluginMessage = (id: string | null) => !!id && (id.startsWith(FIX_PREFIX) || id.startsWith(ROUND_PREFIX));
-const DECIDER_RULES = ".paseo/post-turn-gate/decider.md";
+const isPluginMessage = (id: string | null) => !!id && (id.startsWith(PLUGIN_PREFIX) || id.startsWith(ROUND_PREFIX));
 
 interface LoadedPolicy {
   repoRoot: string;
@@ -97,10 +88,6 @@ interface Pending extends LoadedPolicy {
   chainId: string | null;
   /** Request of a superseded run whose changes this turn now also covers. */
   carriedRequest?: string;
-  /** Fix rounds the carried task already used. */
-  carriedRounds?: number;
-  /** Tree a check of the carried task already failed; ending on it again changes nothing. */
-  checkedTree?: string | null;
 }
 
 /** Everything needed to gate the work of one task (a turn, or a chain of turns). */
@@ -118,10 +105,6 @@ interface Task {
   concurrent: readonly string[];
   /** The task did work (tool calls, or earlier turns of its chain), even if the tree did not change. */
   worked?: boolean;
-  /** Round a new gate run starts at: fix rounds the task used before (a question, a carry) carry over. */
-  startRound?: number;
-  /** Tree a check of this task already failed: a turn ending on it again is not checked again. */
-  checkedTree?: string | null;
   /** The turn answered a message from the user, not one the plugin sent. */
   userSpoke?: boolean;
 }
@@ -137,8 +120,6 @@ interface Blocked {
 const FAILURES: ReadonlySet<Category> = new Set(["crashed", "network", "rate_limited", "quota_exhausted", "context_exhausted", "error"]);
 // Minutes a checker gets to reply with a verdict after it was told a permission was denied.
 const NUDGE_MINUTES = 5;
-
-type AnswerConfig = Extract<OnOutcome["awaiting_user"], { answer: unknown }>["answer"];
 
 export interface GateOptions {
   ledger: Ledger;
@@ -225,14 +206,14 @@ export function createGate(options: GateOptions): Gate {
   const log = options.log ?? ((message, detail) => console.log(`[post-turn-gate] ${message}`, detail ?? ""));
   // Unfinished runs and chains store the policy frozen at their first turn; retire any in an older format.
   for (const run of ledger.active()) {
-    if (!isStoredPolicy(JSON.parse(run.policy_json))) {
+    if (!policySchema.safeParse(JSON.parse(run.policy_json)).success) {
       log(`retiring run ${run.run_id}: stored policy is in an old format`);
       ledger.update(run.run_id, { status: "ERROR", error: "stored policy is in an old format (plugin upgraded mid-run)" }, now());
       ledger.releaseRun(run.source_agent_id, run.run_id, true, now());
     }
   }
   for (const chain of ledger.chains()) {
-    if (!isStoredPolicy(JSON.parse(chain.policy_json))) {
+    if (!policySchema.safeParse(JSON.parse(chain.policy_json)).success) {
       log(`dropping chain ${chain.chain_id}: stored policy is in an old format`);
       ledger.deleteChain(chain.agent_id);
     }
@@ -240,10 +221,9 @@ export function createGate(options: GateOptions): Gate {
   const pending = new Map<string, Pending>();
   // Pending permission of each run's current child, shown on the card so it can be answered there.
   const waiting = new Map<string, PermissionCard>();
-  const autoApproved = new Map<string, number>(); // run id → requests approved without a human
   // ponytail: in memory; after a restart a shown request's wait starts again. Upgrade path: a ledger column.
   const escalatedAt = new Map<string, number>(); // `${agentId}:${requestId}` → when it was put on a card
-  const deniedAnswerers = new Set<string>(); // answerer ids whose request was denied after the wait
+  const deniedDeciders = new Set<string>(); // decider ids whose request was denied after the wait
   // ponytail: in memory; a failure before a restart is not reported after it (the turn is skipped as before).
   const snapshotErrors = new Map<string, string>(); // agent id → why its turn's baseline could not be taken
 
@@ -303,50 +283,6 @@ export function createGate(options: GateOptions): Gate {
 
   // ---------- timeline card ----------
 
-  function cardData(run: Run): CardData {
-    const policy = JSON.parse(run.policy_json) as Policy;
-    const verdict = run.result_json ? (JSON.parse(run.result_json) as Verdict) : null;
-    const blocking = (verdict?.findings ?? []).filter((f) => f.severity === "CRITICAL" || f.severity === "HIGH");
-    const shown = blocking.slice(0, 10).map((f) => ({
-      severity: f.severity,
-      title: truncate(f.title, 300),
-      evidence: truncate(f.evidence, 1000),
-      suggested_fix: truncate(f.suggested_fix, 1000),
-    }));
-    const dispatch = run.dispatch_json ? (JSON.parse(run.dispatch_json) as { title?: string; note?: string }) : null;
-    const records = (JSON.parse(run.rounds_json) as RoundRecord[]).filter((record) => record.round === run.round);
-    const checks = gateChecks(policy).map((check, index) => {
-      const record = records.find((entry) => entry.check === check);
-      if (record?.verdict) {
-        return { check, state: record.verdict, summary: record.summary ? truncate(record.summary, 1000) : null, reason: record.reason ?? null };
-      }
-      const state = isTerminal(run.status) ? ("skipped" as const) : index === run.step ? ("running" as const) : ("pending" as const);
-      return { check, state, summary: null, reason: null };
-    });
-    const denied = blockedOf(run).flatMap((entry) => entry.titles);
-    return {
-      status: run.status,
-      action: checkOf(run),
-      checks,
-      note: dispatch?.note ? truncate(dispatch.note, 500) : null,
-      round: run.round,
-      maxFixRounds: maxFixRounds(policy),
-      waiting: waiting.has(run.run_id),
-      permission: waiting.get(run.run_id) ?? null,
-      autoApproved: autoApproved.get(run.run_id) ?? 0,
-      summary: verdict ? truncate(verdict.summary, 2000) : null,
-      findings: shown,
-      otherFindings: (verdict?.findings.length ?? 0) - shown.length,
-      childAgentId: run.child_agent_id,
-      childTitle: dispatch?.title ?? null,
-      reviewerChanges: run.reviewer_changes ? truncate(run.reviewer_changes, 2000) : null,
-      error: run.error ? truncate(run.error, 2000) : null,
-      denied: denied.length > 0 ? truncate(denied.join("; "), 600) : null,
-      dispute: run.dispute ? truncate(run.dispute, 1500) : null,
-      fixed: false,
-    };
-  }
-
   const blockedOf = (run: Run): Blocked[] => (run.blocked_json ? (JSON.parse(run.blocked_json) as Blocked[]) : []);
 
   /** Records a denied permission request of a run's checker (denied by you on the card, or after the wait). */
@@ -360,17 +296,7 @@ export function createGate(options: GateOptions): Gate {
   }
 
   async function publishCard(paseo: Paseo, run: Run): Promise<void> {
-    // Version 3: the round's card shows the checks (one card per decision round).
-    if ((JSON.parse(run.policy_json) as Policy).supervision) return publishRoundChecks(paseo, run);
-    await paseo.agents.ref(run.source_agent_id).timeline.append({
-      type: "plugin",
-      // Keep updates for one round in place, but start each retry round at the current timeline position.
-      // Reusing only run_id makes Paseo update round 1's old card while round 2 appears card-less.
-      id: `post-turn-gate:${run.run_id}:round:${run.round}`,
-      kind: CARD_KIND,
-      version: CARD_VERSION,
-      data: cardData(run),
-    });
+    await publishRoundChecks(paseo, run);
   }
 
   /**
@@ -402,23 +328,8 @@ export function createGate(options: GateOptions): Gate {
   function errorCard(error: string, note: string | null, fixed = false): CardData {
     return {
       status: "ERROR",
-      action: null,
-      round: 0,
-      maxFixRounds: 0,
-      waiting: false,
-      permission: null,
-      autoApproved: 0,
-      summary: null,
-      findings: [],
-      otherFindings: 0,
-      childAgentId: null,
-      childTitle: null,
-      reviewerChanges: null,
       error: truncate(error, 2000),
-      checks: [],
       note,
-      denied: null,
-      dispute: null,
       fixed,
     };
   }
@@ -432,7 +343,6 @@ export function createGate(options: GateOptions): Gate {
     const next = ledger.update(run.run_id, patch, now());
     if (isTerminal(next.status)) {
       waiting.delete(next.run_id);
-      autoApproved.delete(next.run_id);
       // NEEDS_HUMAN and SUPERSEDED hand the task on (a carry or a chain); any other result ends it.
       ledger.releaseRun(next.source_agent_id, next.run_id, !ACCEPTS_NOTHING.includes(next.status), now());
     }
@@ -464,30 +374,23 @@ export function createGate(options: GateOptions): Gate {
     if (!carry || !target?.policy || target.repoRoot !== carry.repo_root) return;
     target.baseTree = carry.base_tree;
     target.carriedRequest = carry.request_text;
-    target.carriedRounds = carry.rounds_used;
-    target.checkedTree = carry.checked_tree;
   }
 
-  async function supersede(paseo: Paseo, run: Run, fixesUsed?: number): Promise<Run> {
+  async function supersede(paseo: Paseo, run: Run): Promise<Run> {
     const next = await transition(paseo, run, { status: "SUPERSEDED" });
-    carryOver(run, null, fixesUsed);
+    carryOver(run);
     return next;
   }
 
-  /**
-   * Hands a run's unchecked changes to the source agent's next gated turn (see applyCarry). `checkedTree` is
-   * the tree a check failed on (or the agent disputed): a next turn ending on it again leaves the task as it
-   * is instead of checking the same tree again. The task keeps the fix rounds it used.
-   */
-  function carryOver(run: Run, checkedTree: string | null = null, fixesUsed = run.status === "FIXING" ? run.round : run.round - 1): void {
+  /** Hands unchecked changes to the source agent's next turn, keeping the original baseline. */
+  function carryOver(run: Run): void {
     ledger.setCarry(
       {
         agent_id: run.source_agent_id,
         repo_root: run.repo_root,
         base_tree: run.base_tree,
         request_text: run.request_text,
-        rounds_used: fixesUsed,
-        checked_tree: checkedTree,
+
       },
       now(),
     );
@@ -508,8 +411,7 @@ export function createGate(options: GateOptions): Gate {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
     }
-    // Always taken: on_outcome (answers, retries) works even when `done` does not gate, and an invalid policy's
-    // card is only shown for a turn that changed files.
+    // Freeze the baseline for checks, decisions and retries; invalid policies get a card only after file changes.
     const baseTree = await snapshotTree(repoRoot);
     const base = { repoRoot, policyHash: createHash("sha256").update(raw).digest("hex"), baseTree };
     const invalid = (error: string, json: unknown) => {
@@ -537,16 +439,11 @@ export function createGate(options: GateOptions): Gate {
    * turn start (the agent may edit them during the turn). Returns an error message for a bad file.
    */
   async function loadRules(repoRoot: string, policy: Policy): Promise<string | null> {
-    for (const role of ["reviewer", "verifier", "answerer"] as const) {
+    for (const role of ["reviewer", "verifier", "decider"] as const) {
       const spec = policy.agents[role];
       if (!spec.instructions_file) continue;
       const field = `agents.${role}.instructions_file`;
-      // A version 3 decider without its own rules file uses the answerer's (it is the answerer's successor).
-      const deciderDefault = role === "answerer" && spec.instructions_file === DECIDER_RULES;
-      const file = path.resolve(
-        repoRoot,
-        deciderDefault && !existsSync(path.resolve(repoRoot, DECIDER_RULES)) ? defaultInstructionsFile("answerer") : spec.instructions_file,
-      );
+      const file = path.resolve(repoRoot, spec.instructions_file);
       const inside = (target: string, root: string) => target === root || target.startsWith(`${root}${path.sep}`);
       if (!inside(file, repoRoot)) return `${field}: must be inside the repository`;
       let text: string;
@@ -556,7 +453,7 @@ export function createGate(options: GateOptions): Gate {
         // HTML comments are guidance for the person editing the file (npm run init writes them), not rules.
         text = (await readFile(file, "utf8")).replace(/<!--[\s\S]*?-->/g, "").trim();
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT" && (deciderDefault || spec.instructions_file === defaultInstructionsFile(role))) continue;
+        if ((error as NodeJS.ErrnoException).code === "ENOENT" && spec.instructions_file === defaultInstructionsFile(role)) continue;
         return `${field}: cannot read ${spec.instructions_file}: ${(error as Error).message}`;
       }
       const combined = [text, spec.instructions?.trim()].filter(Boolean).join("\n\n");
@@ -569,7 +466,7 @@ export function createGate(options: GateOptions): Gate {
   async function triggers(paseo: Paseo, trigger: Policy["trigger"], agent: AgentSnapshot, parentId: string | null): Promise<boolean> {
     if (agent.labels[MANAGED_LABEL] === "true") return false;
     if (trigger === "root_only" || (trigger === "root_and_opt_in" && agent.labels[TARGET_LABEL] !== "true")) return parentId === null;
-    // A descendant of the plugin's own reviewer, verifier or answerer is part of that check, not a task to gate.
+    // A descendant of the plugin's own reviewer, verifier or decider is part of that check, not a task to gate.
     // ponytail: one refresh per ancestor, capped at 10 levels; an unknown or deeper ancestor counts as not managed.
     for (let depth = 0; parentId && depth < 10; depth++) {
       const ancestor = await refreshAgent(paseo, parentId);
@@ -609,7 +506,7 @@ export function createGate(options: GateOptions): Gate {
     if (!resolved.ok) return fail(paseo, run, `agents.${role}: ${resolved.error}`);
     const { model, ...launch } = resolved.config;
     const childAgentId = randomUUID();
-    const key = `${FIX_PREFIX}${run.run_id}:${run.round}:${run.step}`;
+    const key = `${PLUGIN_PREFIX}${run.run_id}:${run.round}:${run.step}`;
     const payload = {
       agentId: childAgentId,
       idempotencyKey: key,
@@ -694,7 +591,7 @@ export function createGate(options: GateOptions): Gate {
       );
       await publishCard(paseo, next).catch((error) => log("card update failed", error));
       await paseo.agents.ref(childAgentId).send(buildNudgePrompt(blocked!.titles.join("; ")), {
-        messageId: `${FIX_PREFIX}nudge:${run.run_id}:${round}:${run.step}`,
+        messageId: `${PLUGIN_PREFIX}nudge:${run.run_id}:${round}:${run.step}`,
       });
     };
     if (outcome.kind !== "completed") {
@@ -735,7 +632,7 @@ export function createGate(options: GateOptions): Gate {
       reviewer_changes: reviewerChanges,
       rounds_json: JSON.stringify(rounds),
     };
-    const decision = decideCheck({ policy, verdict, step: run.step, round, records: rounds.filter((record) => record.round === round) });
+    const decision = decideCheck({ policy, verdict, step: run.step, records: rounds.filter((record) => record.round === round) });
     switch (decision.kind) {
       case "next_check": {
         // DISPATCHING without a payload: after a crash here, reconcile dispatches the next check instead of
@@ -763,112 +660,8 @@ export function createGate(options: GateOptions): Gate {
       case "failed":
         await transition(paseo, run, { ...base, status: "FAILED" });
         break;
-      case "rounds_used_up":
-        await transition(paseo, run, {
-          ...base,
-          status: "NEEDS_HUMAN",
-          error:
-            "The fix rounds are used up. Take over in the chat: if the agent's next turn changes files, the whole task is " +
-            "checked again (without new fix rounds); a turn that changes nothing leaves the changes as they are.",
-        });
-        // The failing changes stay unaccepted until a turn changes them or leaves them as they are.
-        carryOver(run, run.end_tree);
-        break;
-      case "fix":
-        try {
-          await sendFix(paseo, ledger.update(run.run_id, base, now()), verdict, policy);
-        } finally {
-          await archiveChild(paseo, childAgentId);
-        }
-        return;
     }
     await archiveChild(paseo, childAgentId);
-  }
-
-  async function sendFix(paseo: Paseo, run: Run, verdict: Verdict, policy: Policy): Promise<void> {
-    // No deadline: the source agent does the fix, and a role's timeout_minutes does not bound its work.
-    // A slow fix still ends in a turn_ended that re-checks it; timing it out would leave the fix unchecked.
-    // FIXING is recorded right before send() (synchronously), and the card follows the send.
-    let fixing = run;
-    const result = await sendIfIdle(
-      paseo,
-      run.source_agent_id,
-      { text: buildFixPrompt(verdict, run.round, maxFixRounds(policy), concurrentOf(run)), messageId: fixMessageId(run) },
-      { accept: IDLE, beforeSend: () => (fixing = ledger.update(run.run_id, { status: "FIXING", deadline_at: null }, now())) },
-    );
-    if (result !== "sent") {
-      await supersede(paseo, run, run.round - 1); // the fix was not sent
-      return;
-    }
-    await publishCard(paseo, fixing).catch((error) => log("card update failed", error));
-  }
-
-  const fixMessageId = (run: Run) => `${FIX_PREFIX}${run.run_id}:fix:${run.round}`;
-
-  async function onFixTurnEnded(
-    paseo: Paseo,
-    run: Run,
-    outcome: TurnEnded["outcome"],
-    concurrent: readonly string[],
-    timeline: readonly TimelineItem[],
-  ): Promise<void> {
-    if (run.status !== "FIXING") return;
-    if (concurrent.length > 0) {
-      run = ledger.update(run.run_id, { concurrent_agents: encodeConcurrent([...concurrentOf(run), ...concurrent]) }, now());
-    }
-    if (outcome.kind !== "completed") {
-      await supersede(paseo, run);
-      return;
-    }
-    const endTree = await snapshotTree(run.repo_root);
-    if (endTree === run.end_tree) return onFixWithoutChanges(paseo, run, timeline);
-    // A fix can break a check that passed earlier, so the next round starts from the first check.
-    // Leaves FIXING in the same write, so a crash here cannot count the fix turn twice on recovery.
-    const next = ledger.update(
-      run.run_id,
-      { end_tree: endTree, round: run.round + 1, step: 0, status: "DISPATCHING", dispatch_json: null, child_agent_id: null },
-      now(),
-    );
-    await dispatch(paseo, next);
-  }
-
-  /**
-   * The agent changed nothing in its fix turn: checking the same tree again would only use up a round.
-   * A question goes to the answerer (or you); any other reply disputes the findings and goes to you: the checker never
-   * sees the agent's arguments, so its verdict stays independent of the agent it checks.
-   */
-  async function onFixWithoutChanges(paseo: Paseo, run: Run, timeline: readonly TimelineItem[]): Promise<void> {
-    const policy = JSON.parse(run.policy_json) as Policy;
-    const items = currentTurnItems(timeline);
-    const reply = replyText(items).trim();
-    const { category, detail } = classify({ outcome: { kind: "completed" }, turnItems: items, statusAtEnd: null });
-    if (category === "awaiting_user" && detail !== "refused" && policy.on_outcome.awaiting_user !== "as_done") {
-      await transition(paseo, run, { status: "SUPERSEDED", error: "The agent asked a question instead of fixing; the task continues from the answer." });
-      // The task continues as a chain from the run's baseline; its next gate run keeps counting fix rounds.
-      const chain = ensureChain({
-        agentId: run.source_agent_id,
-        workspaceId: run.workspace_id,
-        repoRoot: run.repo_root,
-        policy,
-        policyJson: run.policy_json,
-        policyHash: run.policy_hash,
-        baseTree: run.base_tree,
-        requestText: run.request_text,
-        turnKey: `${run.run_id}:fix:${run.round}`,
-        concurrent: concurrentOf(run),
-      });
-      const current = ledger.updateChain(chain.agent_id, { rounds_used: run.round }, now()) ?? chain;
-      return handleAwaitingUser(paseo, current, reply, detail);
-    }
-    await transition(paseo, run, {
-      status: "NEEDS_HUMAN",
-      dispute: truncate(reply || "(no reply)", 4000),
-      error:
-        `The agent changed nothing in fix round ${run.round} and replied instead (below). Decide who is right, ` +
-        "then send the agent a message: if its next turn changes files, the whole task is checked again; a turn " +
-        "that changes nothing leaves the changes as they are.",
-    });
-    carryOver(run, run.end_tree);
   }
 
   // ---------- task chains, answers and retries (docs/turn-outcomes.md) ----------
@@ -888,11 +681,6 @@ export function createGate(options: GateOptions): Gate {
     return chain;
   }
 
-  function answerConfig(policy: Policy): AnswerConfig | null {
-    const action = policy.on_outcome.awaiting_user;
-    return typeof action === "object" ? action.answer : null;
-  }
-
   function chainCard(chain: Chain): OutcomeCard {
     if (chain.card_json) return JSON.parse(chain.card_json) as OutcomeCard;
     return {
@@ -909,7 +697,7 @@ export function createGate(options: GateOptions): Gate {
       childAgentId: null,
       canStopAnswering: false,
       permission: null,
-      decider: Boolean((JSON.parse(chain.policy_json) as Policy).supervision),
+      decider: true,
       checks: null,
       canResume: false,
     };
@@ -948,7 +736,7 @@ export function createGate(options: GateOptions): Gate {
     return ledger.updateChain(chain.agent_id, { card_seq: closed.card_seq + 1, card_json: null }, now()) ?? closed;
   }
 
-  /** Drops a scheduled retry or answer, or a running answerer; the chain itself stays. */
+  /** Drops a scheduled retry or answer, or a running decider; the chain itself stays. */
   async function cancelChainWork(paseo: Paseo, chain: Chain): Promise<Chain> {
     if (chain.answer_child_id) await archiveChild(paseo, chain.answer_child_id);
     // A version 3 round's checks go with it; nothing would read their result.
@@ -964,8 +752,7 @@ export function createGate(options: GateOptions): Gate {
           answer_dispatch_json: null,
           answer_deadline_at: null,
           answer_at: null,
-          answer_reply: null,
-          answer_signal: null,
+
           round_json: null,
         },
         now(),
@@ -1008,9 +795,7 @@ export function createGate(options: GateOptions): Gate {
       },
       now(),
     );
-    // A carried task keeps the fix rounds it already used.
-    const roundsUsed = (task.startRound ?? 1) - 1;
-    return roundsUsed > 0 ? (ledger.updateChain(task.agentId, { rounds_used: roundsUsed }, now()) ?? created) : created;
+    return created;
   }
 
   function taskFromChain(chain: Chain): Task {
@@ -1025,7 +810,6 @@ export function createGate(options: GateOptions): Gate {
       requestText: chain.request_text,
       turnKey: `${chain.agent_id}:chain:${chain.chain_id}:${chain.answers}:${chain.retries}`,
       concurrent: ledger.taskConcurrent(chain.agent_id),
-      startRound: chain.rounds_used + 1,
     };
   }
 
@@ -1038,24 +822,6 @@ export function createGate(options: GateOptions): Gate {
     return clipRequest(`${prior}\n\n${label}: ${text}`);
   }
 
-  async function needsUser(paseo: Paseo, chain: Chain, question: string | undefined, reason: string): Promise<void> {
-    const cfg = answerConfig(JSON.parse(chain.policy_json) as Policy);
-    log(`needs user for ${chain.agent_id}: ${reason}`);
-    await publishChainCard(paseo, chain, {
-      category: "awaiting_user",
-      state: "needs_user",
-      ...(question !== undefined ? { question: truncate(question, 2000) } : {}),
-      answer: null,
-      message: truncate(reason, 1000),
-      suggestion: SUGGESTIONS.awaiting_user,
-      attempt: chain.answers,
-      maxAttempts: cfg?.max ?? 0,
-      canStopAnswering: false,
-      permission: null,
-      nextRetryAt: null,
-    });
-  }
-
   /** Starts a review/verify of the task's changes (no-op without checks or for an unchanged tree). */
   /** Returns the new run's id, or null when nothing was started. */
   async function startGate(paseo: Paseo, task: Task, knownEndTree?: string): Promise<string | null> {
@@ -1064,7 +830,6 @@ export function createGate(options: GateOptions): Gate {
     const endTree = knownEndTree ?? (await snapshotTree(task.repoRoot));
     const skip = (reason: string) => (log(`skip ${task.agentId}: ${reason}`), null);
     if (endTree === task.baseTree) return skip("working tree unchanged");
-    if (endTree === task.checkedTree) return skip("tree already checked; its changes are left as they are");
     const run = {
       run_id: randomUUID(),
       source_agent_id: task.agentId,
@@ -1079,11 +844,13 @@ export function createGate(options: GateOptions): Gate {
       concurrent_agents: encodeConcurrent(task.concurrent),
       task_id: ledger.beginTask(task.agentId, now()),
     };
-    if (!ledger.claim(run, now(), task.startRound ?? 1)) return skip("run already exists for this turn");
+    if (!ledger.claim(run, now())) return skip("run already exists for this turn");
     // The task lives until this run's result is in (transition → releaseRun).
     ledger.attachRun(task.agentId, run.run_id, now());
     log(`gate ${run.run_id} for ${task.agentId}: ${checks.join(" → ")}`);
-    await dispatch(paseo, ledger.get(run.run_id)!);
+    // A transient SDK failure leaves a DISPATCHING run for recovery. Still attach it to the decision round,
+    // so recovery can publish its result rather than leaving a task without a card or a round.
+    await dispatch(paseo, ledger.get(run.run_id)!).catch((error) => log("check dispatch deferred to recovery", error));
     return run.run_id;
   }
 
@@ -1094,12 +861,11 @@ export function createGate(options: GateOptions): Gate {
     detail: string | null,
     reply: string,
   ): Promise<void> {
-    const action = task.policy.on_outcome[category];
     if (category === "replaced") return; // its baseline was carried into the newer turn
     if (category === "user_canceled") {
       // A stop is your decision, never the decider's: no round starts. Paseo only tells "canceled while idle", so
       // the card does not claim who stopped it (a daemon shutdown or another client looks the same).
-      if (task.policy.supervision && !task.userSpoke && ledger.chain(task.agentId)) {
+      if (!task.userSpoke && ledger.chain(task.agentId)) {
         // You stopped a turn the plugin started (its reply): the task stays, so Stop auto-answering still works;
         // your next message continues it. The chain keeps the baseline, so no carry is needed.
         const chain = await newCard(paseo, saveRound(ensureChain(task), null));
@@ -1120,101 +886,29 @@ export function createGate(options: GateOptions): Gate {
             repo_root: task.repoRoot,
             base_tree: task.baseTree,
             request_text: task.requestText,
-            rounds_used: (task.startRound ?? 1) - 1,
-            checked_tree: null,
+
           },
           now(),
         );
       }
       return endChain(paseo, task.agentId, { state: "stopped", message: "The turn was stopped." });
     }
-    if (task.policy.supervision && !FAILURES.has(category)) return startRound(paseo, task, category, detail, reply);
-    // A task that did nothing (a chat question, an explanation) is left alone: no checks, no answerer. One that
-    // worked without changing files yet (it read code, then asks how to proceed) can still be answered, and a
-    // failed turn is always reported: the user may not be watching.
-    let endTree: string | undefined;
-    if (!FAILURES.has(category)) {
-      endTree = await snapshotTree(task.repoRoot);
-      const unchanged = endTree === task.baseTree;
-      const asDone = category === "done" || action === "as_done";
-      if (unchanged && (asDone || !task.worked)) {
-        log(`skip ${task.agentId}: working tree unchanged (${category})`);
-        return endChain(paseo, task.agentId, { state: "resolved", message: "The task ended without changing files." });
-      }
-    }
-    if (category === "done" || (category === "awaiting_user" && action === "as_done")) {
-      if (gateChecks(task.policy).length > 0) await startGate(paseo, task, endTree);
-      else if (task.policy.on_outcome.done === "notify") {
-        const chain = await newCard(paseo, ensureChain(task));
-        await publishChainCard(paseo, chain, { category: "done", state: "notice", message: "The agent finished its turn." });
-        return endChain(paseo, task.agentId, null);
-      }
-      return endChain(paseo, task.agentId, { state: "resolved", message: "The task continued and finished." });
-    }
-    if (action === "ignore") {
-      ensureChain(task);
-      return;
-    }
+    if (!FAILURES.has(category) || category === "error") return startRound(paseo, task, category, detail, reply);
     const chain = await newCard(paseo, ensureChain(task));
-    if (category === "awaiting_user") return handleAwaitingUser(paseo, chain, reply, detail);
-    const base = {
-      category,
-      message: detail,
-      suggestion: SUGGESTIONS[category],
-      question: null,
-      answer: null,
-      childAgentId: null,
-      canStopAnswering: false,
-      permission: null,
-    };
-    if (typeof action === "object" && "retry" in action) {
-      const supervision = task.policy.supervision;
-      const withinBudget = !supervision || chain.answers + chain.retries < supervision.budget.max_auto_sends;
-      // Version 3 backs off: 30s, 2min, 8min.
-      const retry = supervision ? { ...action.retry, delay_seconds: action.retry.delay_seconds * 4 ** chain.retries } : action.retry;
-      if (chain.retries < action.retry.max && withinBudget) return scheduleRetry(paseo, chain, base, retry);
-      // Version 3: once the mechanical retries are used up, the decider looks at the failure.
-      if (supervision) return startRound(paseo, task, category, detail, reply);
-      await publishChainCard(paseo, chain, {
-        ...base,
-        state: "notice",
-        attempt: chain.retries,
-        maxAttempts: action.retry.max,
-        nextRetryAt: null,
-        message: `${detail ?? category} (automatic retries used up)`,
-      });
-      return;
+    const budget = task.policy.supervision.budget;
+    if (["crashed", "network", "rate_limited"].includes(category)) {
+      if (chain.retries < budget.max_retries && sendsOf(chain) < budget.max_auto_sends) {
+        return scheduleRetry(paseo, chain, { category, message: detail, suggestion: SUGGESTIONS[category] }, {
+          max: budget.max_retries, delay_seconds: 30 * 4 ** chain.retries,
+        });
+      }
+      return startRound(paseo, task, category, detail, reply);
     }
-    // Version 3: an unrecognized error goes to the decider; quota and context exhaustion are yours (no retry helps).
-    if (task.policy.supervision && category === "error") return startRound(paseo, task, category, detail, reply);
-    await publishChainCard(paseo, chain, { ...base, state: "notice", attempt: 0, maxAttempts: 0, nextRetryAt: null });
-  }
-
-  /** A stop that may wait for the user: answer it (after the grace period), or hand it to the user. */
-  async function handleAwaitingUser(paseo: Paseo, chain: Chain, reply: string, signal: string | null): Promise<void> {
-    const cfg = answerConfig(JSON.parse(chain.policy_json) as Policy);
-    if (!cfg) return needsUser(paseo, chain, replyTail(reply), "auto-answer is off for this repository");
-    if (chain.stop_answering) return needsUser(paseo, chain, replyTail(reply), "auto-answering was stopped for this task");
-    if (chain.answers >= cfg.max) return needsUser(paseo, chain, replyTail(reply), `auto-answer limit reached (${cfg.max})`);
-    if (cfg.delay_seconds === 0) return dispatchAnswerer(paseo, chain, reply, cfg, signal);
-    // The user is often still there: give them delay_seconds to reply before an agent answers for them.
-    const at = now() + cfg.delay_seconds * 1000;
-    const next = ledger.updateChain(chain.agent_id, { answer_at: at, answer_reply: reply, answer_signal: signal }, now())!;
-    await publishChainCard(paseo, next, {
-      category: "awaiting_user",
-      state: "answer_scheduled",
-      question: replyTail(reply),
-      answer: null,
-      message: null,
-      suggestion: SUGGESTIONS.awaiting_user,
-      attempt: next.answers + 1,
-      maxAttempts: cfg.max,
-      nextRetryAt: at,
-      childAgentId: null,
-      canStopAnswering: true,
-      permission: null,
+    await publishChainCard(paseo, chain, {
+      category, state: "needs_user", message: detail, suggestion: SUGGESTIONS[category],
+      question: null, answer: null, childAgentId: null, canStopAnswering: false, permission: null,
+      attempt: 0, maxAttempts: 0, nextRetryAt: null,
     });
-    wakeAt(paseo, at);
   }
 
   /** The reconcile loop also starts due work (after restarts); the timer only makes short delays exact. */
@@ -1251,14 +945,6 @@ export function createGate(options: GateOptions): Gate {
     const current = ledger.updateChain(chain.agent_id, { answer_at: null }, now()) ?? chain;
     const waiting = roundOf(current);
     if (waiting?.phase === "waiting") return dispatchDecider(paseo, current, waiting.plan ? "merge" : "plan");
-    const cfg = answerConfig(JSON.parse(current.policy_json) as Policy);
-    const source = await refreshAgent(paseo, current.agent_id);
-    if (!source) return ledger.deleteChain(current.agent_id);
-    if (!cfg || !sendable(source.status)) {
-      await publishChainCard(paseo, current, { state: "stopped", canStopAnswering: false, nextRetryAt: null, message: "The agent was busy again; the automatic answer was skipped." });
-      return;
-    }
-    await dispatchAnswerer(paseo, current, current.answer_reply ?? "", cfg, current.answer_signal);
   }
 
   // ----- retries -----
@@ -1296,80 +982,7 @@ export function createGate(options: GateOptions): Gate {
 
   // ----- answers -----
 
-  async function dispatchAnswerer(
-    paseo: Paseo,
-    chain: Chain,
-    reply: string,
-    cfg: AnswerConfig,
-    signal: string | null,
-  ): Promise<void> {
-    const policy = JSON.parse(chain.policy_json) as Policy;
-    const source = await refreshAgent(paseo, chain.agent_id);
-    if (!source) return;
-    const spec = policy.agents.answerer;
-    const profiles = spec.profile ? (await paseo.config.get()).config.agentProfiles ?? [] : [];
-    const resolved = resolveRole(inheritedConfig(source), spec, ROLE_PROFILE.answerer, profiles);
-    if (!resolved.ok) return needsUser(paseo, chain, replyTail(reply), `cannot start the answerer: ${resolved.error}`);
-    const { model, ...launch } = resolved.config;
-    const endTree = await snapshotTree(chain.repo_root);
-    const childAgentId = randomUUID();
-    const attempt = chain.answers + 1;
-    // One key per answerer child: `answers` only grows when an answer is sent, so an escalated or failed
-    // call would reuse an attempt number with a new payload (agent_request_key_conflict). Replays reuse the payload.
-    const key = `ptg:ask:${chain.chain_id}:${childAgentId}`;
-    const payload = {
-      agentId: childAgentId,
-      idempotencyKey: key,
-      parent: chain.agent_id,
-      config: { ...launch, provider: `${launch.provider}/${model}` },
-      title: `Gate answer #${attempt} · ${source.title ?? chain.agent_id.slice(0, 8)}`,
-      prompt: buildAnswerPrompt({
-        requestText: chain.request_text,
-        repoRoot: chain.repo_root,
-        baseTree: chain.base_tree,
-        endTree,
-        agentReply: truncate(reply, 6000),
-        previousQuestion: chain.last_question,
-        signal,
-        instructions: spec.instructions,
-      }),
-      clientMessageId: key,
-      outputSchema: ANSWER_JSON_SCHEMA,
-      labels: {
-        [MANAGED_LABEL]: "true",
-        "post-turn-gate.role": "answerer",
-        "post-turn-gate.chain-id": chain.chain_id,
-      },
-    };
-    ledger.addChainChild(childAgentId, chain.agent_id, chain.chain_id);
-    let current = ledger.updateChain(
-      chain.agent_id,
-      {
-        answer_child_id: childAgentId,
-        // endTree: the tree the answerer started on, to detect its edits (not part of the create payload).
-        answer_dispatch_json: JSON.stringify({ workspaceId: chain.workspace_id, endTree, ...payload }),
-        answer_deadline_at: now() + spec.timeout_minutes * minuteMs,
-      },
-      now(),
-    )!;
-    current = await publishChainCard(paseo, current, {
-      category: "awaiting_user",
-      state: "answering",
-      question: replyTail(reply),
-      answer: null,
-      message: resolved.note ?? null,
-      suggestion: null,
-      attempt,
-      maxAttempts: cfg.max,
-      nextRetryAt: null,
-      childAgentId,
-      canStopAnswering: true,
-      permission: null,
-    });
-    await createAnswerer(paseo, current);
-  }
-
-  async function createAnswerer(paseo: Paseo, chain: Chain): Promise<void> {
+  async function createDecider(paseo: Paseo, chain: Chain): Promise<void> {
     const { workspaceId, endTree: _endTree, ...payload } = JSON.parse(chain.answer_dispatch_json ?? "{}");
     try {
       await paseo.workspaces.ref(workspaceId).agents.create(payload);
@@ -1377,11 +990,11 @@ export function createGate(options: GateOptions): Gate {
       const existing = await refreshAgent(paseo, payload.agentId).catch(() => null);
       if (existing) return;
       const current = await cancelChainWork(paseo, chain);
-      return needsUser(paseo, current, undefined, `failed to start the answerer: ${(error as Error).message}`);
+      return roundNeedsUser(paseo, current, "", `failed to start the decider: ${(error as Error).message}`);
     }
   }
 
-  async function finalizeAnswer(
+  async function finalizeDecision(
     paseo: Paseo,
     childId: string,
     owner: { agentId: string; chainId: string },
@@ -1390,82 +1003,7 @@ export function createGate(options: GateOptions): Gate {
   ): Promise<void> {
     const chain = ledger.chain(owner.agentId);
     if (!chain || chain.chain_id !== owner.chainId || chain.answer_child_id !== childId) return; // stale
-    if (roundOf(chain)) return finalizeDecider(paseo, chain, childId, outcome, timeline);
-    const startTree = (JSON.parse(chain.answer_dispatch_json ?? "{}") as { endTree?: string }).endTree;
-    let current = await cancelChainWork(paseo, chain);
-    const denied = deniedAnswerers.delete(childId) ? "a permission request of the answerer was not answered in time and was denied; " : "";
-    if (outcome.kind !== "completed") return needsUser(paseo, current, undefined, `${denied}the answerer turn ${outcome.kind}`);
-    // Like a reviewer's (finalizeReview), an answerer's edits would pass as the source agent's work.
-    const afterTree = startTree ? await snapshotTree(current.repo_root) : null;
-    if (startTree && afterTree !== startTree) {
-      const changes = await diffStat(current.repo_root, startTree, afterTree!);
-      return needsUser(
-        paseo,
-        current,
-        undefined,
-        `the working tree changed while the answerer ran, so its answer was not sent. Nothing was reverted:\n${truncate(changes, 600)}`,
-      );
-    }
-    const reply = parseAnswer(latestAssistantText(timeline));
-    if (!reply) return needsUser(paseo, current, undefined, `${denied}the answerer reply is not valid JSON`);
-    const decision = decideAnswer({
-      reply,
-      fallbackQuestion: chainCard(current).question || "",
-      lastQuestion: current.last_question,
-      risk: answerRisk,
-      similar: (a, b) => similarity(a, b) >= SAME_QUESTION,
-    });
-    if (decision.kind === "done") {
-      await startGate(paseo, taskFromChain(current));
-      // Not a question after all: the card says "Finished", without an "Agent asked" excerpt.
-      return endChain(paseo, owner.agentId, {
-        state: "resolved",
-        category: "done",
-        question: null,
-        message: "The agent had finished; nothing to answer.",
-      });
-    }
-    if (decision.kind === "refused") {
-      const policy = JSON.parse(current.policy_json) as Policy;
-      if (policy.on_outcome.refused === "ignore") return endChain(paseo, owner.agentId, null);
-      await publishChainCard(paseo, current, {
-        category: "refused",
-        state: "notice",
-        question: null,
-        answer: null,
-        message: reply.reason ? truncate(reply.reason, 1000) : null,
-        suggestion: SUGGESTIONS.refused,
-        canStopAnswering: false,
-        permission: null,
-      });
-      return;
-    }
-    if (decision.kind === "escalate") return needsUser(paseo, current, decision.question, decision.reason);
-    const { question, text, lastQuestion } = decision;
-    const attempt = current.answers + 1;
-    const result = await sendIfIdle(
-      paseo,
-      owner.agentId,
-      { text: `${ANSWER_PREFIX}\n${text}`, messageId: `ptg:answer:${current.chain_id}:${attempt}` },
-      { accept: IDLE_OR_ERROR, beforeSend: () => (current = ledger.updateChain(owner.agentId, { answers: attempt, last_question: lastQuestion }, now())!) },
-    );
-    if (result !== "sent") {
-      await publishChainCard(paseo, current, { state: "stopped", canStopAnswering: false, message: "You replied first; the automatic answer was not sent." });
-      return;
-    }
-    const cfg = answerConfig(JSON.parse(current.policy_json) as Policy);
-    await publishChainCard(paseo, current, {
-      state: "answered",
-      question: truncate(question, 2000),
-      answer: truncate(text, 2000),
-      message: reply.reason ? truncate(reply.reason, 1000) : null,
-      attempt,
-      maxAttempts: cfg?.max ?? attempt,
-      childAgentId: childId,
-      canStopAnswering: true,
-      permission: null,
-    });
-    log(`answered for ${owner.agentId} (${attempt})`);
+    if (roundOf(chain)) await finalizeDecider(paseo, chain, childId, outcome, timeline);
   }
 
   async function stopAnswering(chainId: string, paseo: Paseo, resume = false): Promise<boolean> {
@@ -1524,11 +1062,11 @@ export function createGate(options: GateOptions): Gate {
   const roundOf = (chain: Chain): Round | null => (chain.round_json ? (JSON.parse(chain.round_json) as Round) : null);
   const saveRound = (chain: Chain, round: Round | null): Chain =>
     ledger.updateChain(chain.agent_id, { round_json: round ? JSON.stringify(round) : null }, now()) ?? chain;
-  const supervisionOfChain = (chain: Chain) => (JSON.parse(chain.policy_json) as Policy).supervision!;
+  const supervisionOfChain = (chain: Chain) => (JSON.parse(chain.policy_json) as Policy).supervision;
   const sendsOf = (chain: Chain) => chain.answers + chain.retries;
 
   async function startRound(paseo: Paseo, task: Task, category: Category, detail: string | null, reply: string): Promise<void> {
-    const supervision = task.policy.supervision!;
+    const supervision = task.policy.supervision;
     const endTree = await snapshotTree(task.repoRoot);
     const changed = endTree !== task.baseTree;
     if (!changed && !FAILURES.has(category) && (category === "done" || !task.worked)) {
@@ -1673,9 +1211,9 @@ export function createGate(options: GateOptions): Gate {
       // You (or another message) started a turn during the grace period; that turn starts a new round.
       return endRound(paseo, saveRound(chain, null), { state: "stopped", message: "The agent was busy again; this round was skipped." });
     }
-    const spec = policy.agents.answerer;
+    const spec = policy.agents.decider;
     const profiles = spec.profile ? (await paseo.config.get()).config.agentProfiles ?? [] : [];
-    const resolved = resolveRole(inheritedConfig(source), spec, ROLE_PROFILE.answerer, profiles);
+    const resolved = resolveRole(inheritedConfig(source), spec, ROLE_PROFILE.decider, profiles);
     if (!resolved.ok) return roundNeedsUser(paseo, chain, replyTail(round.reply), `cannot start the decider: ${resolved.error}`);
     const { model, ...launch } = resolved.config;
     const run = round.runId ? ledger.get(round.runId) : null;
@@ -1739,7 +1277,7 @@ export function createGate(options: GateOptions): Gate {
       childAgentId,
       canStopAnswering: true,
     });
-    await createAnswerer(paseo, current);
+    await createDecider(paseo, current);
   }
 
   async function finalizeDecider(
@@ -1755,7 +1293,7 @@ export function createGate(options: GateOptions): Gate {
     const round = roundOf(current);
     if (!round) return;
     const handOff = (reason: string) => roundNeedsUser(paseo, current, replyTail(round.reply), reason);
-    const denied = deniedAnswerers.delete(childId) ? "a permission request of the decider was not answered in time and was denied; " : "";
+    const denied = deniedDeciders.delete(childId) ? "a permission request of the decider was not answered in time and was denied; " : "";
     if (outcome.kind !== "completed") return handOff(`${denied}the decider turn ${outcome.kind}`);
     const afterTree = startTree ? await snapshotTree(current.repo_root) : null;
     if (startTree && afterTree !== startTree) {
@@ -1805,7 +1343,6 @@ export function createGate(options: GateOptions): Gate {
 
   /** A run of a version 3 task ended: its round goes on. */
   async function onRunSettled(paseo: Paseo, run: Run): Promise<void> {
-    if (!(JSON.parse(run.policy_json) as Policy).supervision) return;
     const chain = ledger.chain(run.source_agent_id);
     const round = chain ? roundOf(chain) : null;
     if (chain && round?.runId === run.run_id) await settleRound(paseo, chain, run);
@@ -1982,10 +1519,10 @@ export function createGate(options: GateOptions): Gate {
   async function handleTurnStarted(event: TurnStarted, paseo: Paseo, early: Promise<LoadedPolicy | null> | null = null): Promise<void> {
     const agentId = event.agent.id;
     const owned = ledger.child(agentId);
-    const answerer = owned ? null : ledger.chainChild(agentId);
-    if (owned || answerer) {
-      const repoRoot = owned ? owned.run.repo_root : ledger.chain(answerer!.agentId)?.repo_root;
-      if (repoRoot) startActivity(agentId, owned ? owned.run.source_agent_id : answerer!.agentId, repoRoot, event.turnId);
+    const decider = owned ? null : ledger.chainChild(agentId);
+    if (owned || decider) {
+      const repoRoot = owned ? owned.run.repo_root : ledger.chain(decider!.agentId)?.repo_root;
+      if (repoRoot) startActivity(agentId, owned ? owned.run.source_agent_id : decider!.agentId, repoRoot, event.turnId);
       return;
     }
     // The user spoke while a review was running: the review is stale.
@@ -2078,22 +1615,12 @@ export function createGate(options: GateOptions): Gate {
     const concurrent = endActivity(agentId, event.turnId);
     const owned = ledger.child(agentId);
     if (owned) return finalizeReview(paseo, owned.run, agentId, event.outcome, event.timeline, concurrent);
-    const answerer = ledger.chainChild(agentId);
-    if (answerer) return finalizeAnswer(paseo, agentId, answerer, event.outcome, event.timeline);
+    const decider = ledger.chainChild(agentId);
+    if (decider) return finalizeDecision(paseo, agentId, decider, event.outcome, event.timeline);
 
     const lastUser = lastUserMessage(event.timeline);
     const messageId = lastUser?.messageId ?? lastUser?.clientMessageId ?? null;
     const taken = takePending(agentId, event.turnId);
-    const fix = messageId?.startsWith(FIX_PREFIX) ? /^ptg:(.+):fix:(\d+)$/.exec(messageId) : null;
-    if (fix) {
-      const run = ledger.get(fix[1]);
-      if (run && run.source_agent_id === agentId && run.round === Number(fix[2])) {
-        return onFixTurnEnded(paseo, run, event.outcome, concurrent, event.timeline);
-      }
-      // The run is gone or moved on: gate this turn like any other so its changes are still checked.
-      log(`stale fix message ${messageId} on ${agentId}; gating the turn normally`);
-    }
-
     const skip = (reason: string) => log(`skip ${agentId}: ${reason}`);
     if (taken.stale) return skip("an older turn ended after a newer one started (replaced)");
     const snapshot = taken.snapshot;
@@ -2137,9 +1664,7 @@ export function createGate(options: GateOptions): Gate {
       worked:
         items.some((item) => item.type === "tool_call") ||
         snapshot.carriedRequest !== undefined ||
-        (chain !== null && (chain.answers > 0 || chain.retries > 0 || chain.rounds_used > 0)),
-      startRound: (chain?.rounds_used ?? snapshot.carriedRounds ?? 0) + 1,
-      checkedTree: chain ? null : snapshot.checkedTree ?? null,
+        (chain !== null && (chain.answers > 0 || chain.retries > 0)),
       userSpoke: !isPluginMessage(messageId),
     };
     await applyOutcome(paseo, task, category, detail, replyText(items));
@@ -2181,12 +1706,12 @@ export function createGate(options: GateOptions): Gate {
 
   async function handlePermission(event: PermissionRequested | PermissionResolved, paseo: Paseo): Promise<void> {
     const agentId = event.agent.id;
-    const answerer = ledger.chainChild(agentId);
-    if (answerer) {
-      const chain = ledger.chain(answerer.agentId);
+    const decider = ledger.chainChild(agentId);
+    if (decider) {
+      const chain = ledger.chain(decider.agentId);
       if (!chain || chain.answer_child_id !== agentId) return;
       if ("request" in event) {
-        await answererPermission(paseo, chain, agentId, event.request);
+        await deciderPermission(paseo, chain, agentId, event.request);
       } else if (chainCard(chain).permission?.requestId === event.requestId) {
         await publishChainCard(paseo, chain, { permission: null });
       }
@@ -2238,8 +1763,8 @@ export function createGate(options: GateOptions): Gate {
     return true;
   }
 
-  async function answererPermission(paseo: Paseo, chain: Chain, agentId: string, request: PermissionRequested["request"]): Promise<void> {
-    const permissions = (JSON.parse(chain.policy_json) as Policy).agents.answerer.permissions;
+  async function deciderPermission(paseo: Paseo, chain: Chain, agentId: string, request: PermissionRequested["request"]): Promise<void> {
+    const permissions = (JSON.parse(chain.policy_json) as Policy).agents.decider.permissions;
     const result = await autoApprove(paseo, agentId, request, permissions, chain.repo_root);
     if (result.approved) return;
     escalatedAt.set(`${agentId}:${request.id}`, escalatedAt.get(`${agentId}:${request.id}`) ?? now());
@@ -2248,10 +1773,7 @@ export function createGate(options: GateOptions): Gate {
 
   async function checkerPermission(paseo: Paseo, run: Run, agentId: string, request: PermissionRequested["request"]): Promise<void> {
     const result = await autoApprove(paseo, agentId, request, specOf(run).permissions, run.repo_root);
-    if (result.approved) {
-      autoApproved.set(run.run_id, (autoApproved.get(run.run_id) ?? 0) + 1);
-      return;
-    }
+    if (result.approved) return;
     waiting.set(run.run_id, permissionCard(agentId, request, result.reason));
     escalatedAt.set(`${agentId}:${request.id}`, escalatedAt.get(`${agentId}:${request.id}`) ?? now());
     await publishCard(paseo, run);
@@ -2338,29 +1860,6 @@ export function createGate(options: GateOptions): Gate {
       if (agent.status === "error") return fail(paseo, run, `reviewer failed: ${agent.lastError ?? "unknown error"}`);
       return finalizeReview(paseo, run, watched, { kind: "completed" }, items);
     }
-    // FIXING: find our fix message; anything the user sent after it supersedes the run.
-    const expected = fixMessageId(run);
-    const index = items.findIndex((item) => item.type === "user_message" && item.messageId === expected);
-    if (index === -1) {
-      // The send never landed (crash between ledger write and send): send again, deduplicated by messageId.
-      const verdict = JSON.parse(run.result_json ?? "null") as Verdict | null;
-      if (!verdict) return fail(paseo, run, "fix round lost its findings");
-      const policy = JSON.parse(run.policy_json) as Policy;
-      // Not sent while busy: the next reconcile tries again, deduplicated by messageId.
-      await sendIfIdle(
-        paseo,
-        run.source_agent_id,
-        { text: buildFixPrompt(verdict, run.round, maxFixRounds(policy), concurrentOf(run)), messageId: expected },
-        { accept: IDLE_OR_ERROR },
-      );
-      return;
-    }
-    const later = items.slice(index + 1);
-    if (later.some((item) => item.type === "user_message")) {
-      await supersede(paseo, run);
-      return;
-    }
-    return onFixTurnEnded(paseo, run, { kind: "completed" }, [], items);
   }
 
   async function reconcileChain(paseo: Paseo, agentId: string): Promise<void> {
@@ -2375,7 +1874,7 @@ export function createGate(options: GateOptions): Gate {
         } else if (chain.answer_at !== null && chain.answer_at <= now()) {
           await startScheduledAnswer(paseo, chain);
         } else if (chain.answer_child_id) {
-          await reconcileAnswerer(paseo, chain);
+          await reconcileDecider(paseo, chain);
         } else if (roundOf(chain)?.phase === "checking") {
           const run = ledger.get(roundOf(chain)!.runId ?? "");
           if (run && isTerminal(run.status)) await settleRound(paseo, chain, run);
@@ -2386,26 +1885,26 @@ export function createGate(options: GateOptions): Gate {
     }
   }
 
-  async function reconcileAnswerer(paseo: Paseo, chain: Chain): Promise<void> {
+  async function reconcileDecider(paseo: Paseo, chain: Chain): Promise<void> {
     const childId = chain.answer_child_id!;
     const child = await refreshAgent(paseo, childId).catch(() => null);
-    if (!child) return createAnswerer(paseo, chain); // the create never landed; replay it idempotently
+    if (!child) return createDecider(paseo, chain); // the create never landed; replay it idempotently
     if (child.status === "running" || child.status === "initializing") {
       if (chain.answer_deadline_at !== null && now() > chain.answer_deadline_at) {
-        return needsUser(paseo, await cancelChainWork(paseo, chain), undefined, "the answerer timed out");
+        return roundNeedsUser(paseo, await cancelChainWork(paseo, chain), "", "the decider timed out");
       }
       // The card keeps its permission in the ledger, but a request that arrived while the plugin was down has none.
       const shown = chainCard(chain).permission;
       const open = child.pendingPermissions;
       if (open.length > 0 && !open.some((request) => request.id === shown?.requestId)) {
-        await answererPermission(paseo, chain, childId, open[0]);
+        await deciderPermission(paseo, chain, childId, open[0]);
       } else if (open.length === 0 && shown) {
         await publishChainCard(paseo, chain, { permission: null });
       } else {
-        const wait = (JSON.parse(chain.policy_json) as Policy).agents.answerer.permission_wait_minutes;
+        const wait = (JSON.parse(chain.policy_json) as Policy).agents.decider.permission_wait_minutes;
         const stale = overdue(shown, wait);
         if (stale && (await denyOverdue(paseo, stale, wait))) {
-          deniedAnswerers.add(childId);
+          deniedDeciders.add(childId);
           await publishChainCard(paseo, chain, { permission: null });
         }
       }
@@ -2414,8 +1913,8 @@ export function createGate(options: GateOptions): Gate {
     const page = await paseo.agents.ref(childId).timeline.refetch({ direction: "tail", limit: 200, projection: "canonical" });
     const items = page.entries.map((entry) => entry.item) as TimelineItem[];
     const outcome: TurnEnded["outcome"] =
-      child.status === "error" ? { kind: "failed", error: { message: child.lastError ?? "answerer failed" } } : { kind: "completed" };
-    return finalizeAnswer(paseo, childId, { agentId: chain.agent_id, chainId: chain.chain_id }, outcome, items);
+      child.status === "error" ? { kind: "failed", error: { message: child.lastError ?? "decider failed" } } : { kind: "completed" };
+    return finalizeDecision(paseo, childId, { agentId: chain.agent_id, chainId: chain.chain_id }, outcome, items);
   }
 
   return {

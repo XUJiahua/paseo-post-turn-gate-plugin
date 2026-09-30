@@ -5,7 +5,7 @@ type Paseo = PluginHookContext["paseo"];
 export type DispatchResult = "sent" | "busy" | "gone";
 
 /**
- * The one path every automatic message to a source agent takes (fix, answer, retry; docs/completion-supervisor.md
+ * The one path every automatic message to a source agent takes (decision, retry; docs/completion-supervisor.md
  * §11.2). Paseo has no atomic "send only if idle" and send() cancels a running turn (design.md V5), so this is
  * best-effort: refresh, check the status, record the send, then send, with nothing awaited between the refresh
  * and send(). A user message in that window is canceled by ours.
@@ -28,6 +28,5 @@ export async function sendIfIdle(
   return "sent";
 }
 
-/** Statuses a message may be sent in: a fix needs a finished turn; an answer or retry may follow a failed one. */
-export const IDLE: readonly string[] = ["idle"];
+/** A decision or retry may follow a finished or failed turn. */
 export const IDLE_OR_ERROR: readonly string[] = ["idle", "error"];

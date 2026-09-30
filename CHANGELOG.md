@@ -6,28 +6,30 @@ All notable changes to this project are documented here.
 
 ### Added
 
-- `agents.<role>.permission_wait_minutes` (default 5): a request on the card that nobody answers is denied, and the checker is asked once for a verdict from its evidence.
-- `awaiting_user.answer.delay_seconds` (default 60): the answerer waits for your own reply first.
-- `on_inconclusive` (`report` | `fail`) and `inconclusive_reason` in the verdict; blocked or ambiguous checks show NEEDS HUMAN.
+- Task supervision with a decider's plan and merge phases, independent checks, one reply and one card per round.
+- A plain finished reply with file changes starts checks immediately and skips the decider when all pass.
+- Shared task state, automatic send budgets, no-progress and wall-clock limits, and retry backoff (30s, 2min, 8min).
+- Stop/Resume auto-answering controls and bounded permission waits with a checker verdict nudge.
+- Per-workspace queues, baseline capture at turn arrival, Git timeouts, and persistent overlap notes.
 
 ### Changed
 
-- After the fix rounds are used up (or the agent disputed the findings), the next turn keeps counting the task's rounds instead of starting a new fix loop, and a turn that changes nothing leaves the changes as they are instead of checking the same tree again. Unchecked changes expire after a day.
-- Stopping the agent no longer drops what it changed: the changes are checked with its next turn.
-- A turn that was running when the plugin reloaded or the daemon restarted is still checked from its own baseline, instead of being skipped with its changes left unchecked.
-- Failed turns are reported or retried even when they changed no files; a stop after tool calls is auto-answered even before files change.
-- A finished report ending with a closing offer ("Let me know if you need anything else.") is `done`, not a question.
-- A fix turn that changes nothing is no longer checked again: a question goes to the answerer, a disagreement to you. The checker never sees the agent's reply.
-- Only the closing sentence of a reply counts as asking: "要不要" or "should I" earlier in the reply, or inside quotes, no longer starts the answerer.
-- The second check on automatic answers looks at commands and action phrases only: a cloud tool named in prose ("use the AWS SDK", `src/aws/client.ts`) no longer sends the question to you.
-- When the answerer finds the agent had finished, the card reads "Finished" without an "Agent asked" excerpt; excerpts of long replies start at a sentence boundary.
-- Outcome cards: each new question, failure or retry gets a new card at the current timeline position.
-- Config error cards appear only for gated turns that changed files, once per policy version, and are marked fixed once the policy is valid.
-- Cloud/deploy tools named in a command still need you whatever prefix runs them, but read-only commands (`cat src/aws/x.ts`, `grep helm …`) no longer do; `git -C <dir> push` and `sh -c` scripts are recognized.
+- Initialization and policy validation now support version 3 only, directly without an internal v2 translation.
+- Failed checks go to the decider for a reply; stopped source turns never start one and keep unaccepted changes.
+- Repository role rules and optional shared profiles are named reviewer, verifier and decider.
+- Managed roles disable `plan_mode` regardless of provider id, preserving other inherited settings.
+- Requests, snapshots, carry and decision state persist together across turns and reloads.
+
+### Removed
+
+- Version 2 policies, report-only mode, template fix loops, the independent answerer path, and their old state fields.
+- Initializer flags `--v2`, `--fix`, `--report`, `--supervise`, and the `answerer.md` rules fallback.
+- Imports from the early chains/carries/turn_snapshots tables; old policies are not migrated automatically.
 
 ### Fixed
 
-- A role rules file symlinked to a path outside the repository is rejected instead of being read into the prompt.
+- A role rules symlink outside the repository is rejected instead of being read into a prompt.
+- Transient check dispatch failures remain attached to their decision round for recovery and error reporting.
 
 ## [0.1.0] - 2026-09-30
 

@@ -1,5 +1,7 @@
 {
   "id": "post-turn-gate",
-  "description": "Runs an independent verifier or reviewer after each agent turn, driven by .paseo/post-turn-gate.json",
-  "requirements": { "paseo": ">=0.10.0" }
+  "description": "Checks coding tasks independently and replies through a decider, driven by .paseo/post-turn-gate.json",
+  "requirements": {
+    "paseo": ">=0.10.0"
+  }
 }

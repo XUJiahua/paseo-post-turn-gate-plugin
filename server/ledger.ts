@@ -40,8 +40,6 @@ export interface Run {
   task_id: string | null;
   /** JSON {title, nudged}: the current checker's denied permission request, and whether it was nudged for a verdict. */
   blocked_json: string | null;
-  /** The agent's reply when a fix round changed nothing and disputed the findings. */
-  dispute: string | null;
   rounds_json: string;
   error: string | null;
   created_at: number;
@@ -70,22 +68,18 @@ export interface Chain {
   card_json: string | null;
   /** Outcome cards of the chain are numbered: each new event gets a card at the current timeline position. */
   card_seq: number;
-  /** Fix rounds a gate run of this chain already used (a fix turn that asked a question continues as a chain). */
-  rounds_used: number;
-  /** A scheduled answerer start (answer.delay_seconds), with the reply and signal it will be given. */
+  /** A scheduled decider start after the grace period. */
   answer_at: number | null;
-  answer_reply: string | null;
-  answer_signal: string | null;
-  /** Version 3: the decision round in progress (JSON, see gate.ts Round). */
+  /** the decision round in progress (JSON, see gate.ts Round). */
   round_json: string | null;
-  /** Version 3: the tree the checks last passed on; a later turn ending on it needs no new checks. */
+  /** the tree the checks last passed on; a later turn ending on it needs no new checks. */
   passed_tree: string | null;
-  /** Version 3: the tree of the last decision round, and how many rounds in a row ended on it. */
+  /** the tree of the last decision round, and how many rounds in a row ended on it. */
   last_fingerprint: string | null;
   no_progress: number;
-  /** Version 3: start of the automation budget (the chain's start, or your last message in it). */
+  /** start of the automation budget (the chain's start, or your last message in it). */
   budget_since: number | null;
-  /** Version 3: the last run that checked this task; a later round on the same tree reuses its results. */
+  /** the last run that checked this task; a later round on the same tree reuses its results. */
   last_run_id: string | null;
   created_at: number;
   updated_at: number;
@@ -97,10 +91,6 @@ export interface Carry {
   repo_root: string;
   base_tree: string;
   request_text: string;
-  /** Fix rounds the task already used, so a carried task does not start with a fresh budget. */
-  rounds_used: number;
-  /** Tree a check already failed or disputed; a later turn ending on the same tree is not checked again. */
-  checked_tree: string | null;
   created_at: number;
 }
 
@@ -122,10 +112,7 @@ const CHAIN_COLUMNS = [
   "answer_deadline_at",
   "card_json",
   "card_seq",
-  "rounds_used",
   "answer_at",
-  "answer_reply",
-  "answer_signal",
   "round_json",
   "passed_tree",
   "last_fingerprint",
@@ -148,8 +135,6 @@ const CHAIN_RESET = {
   card_json: null,
   card_seq: 0,
   answer_at: null,
-  answer_reply: null,
-  answer_signal: null,
   round_json: null,
   passed_tree: null,
   last_fingerprint: null,
@@ -159,7 +144,7 @@ const CHAIN_RESET = {
 } as const;
 
 /**
- * A source agent's task row: the task's scope (repo, baseline, request, fix rounds used), shared by its carry and
+ * A source agent's task row: the task's scope (repo, baseline, request, request history), shared by its carry and
  * its chain; `carried_at` marks unchecked changes waiting for the next turn; `chain_id` a running chain.
  */
 interface TaskRow extends Omit<Chain, "chain_id" | "workspace_id" | "repo_root" | "policy_json" | "policy_hash" | "base_tree" | "request_text"> {
@@ -171,7 +156,6 @@ interface TaskRow extends Omit<Chain, "chain_id" | "workspace_id" | "repo_root" 
   policy_hash: string | null;
   base_tree: string | null;
   request_text: string | null;
-  checked_tree: string | null;
   carried_at: number | null;
   turn_json: string | null;
   turn_at: number | null;
@@ -219,7 +203,6 @@ const COLUMNS = [
   "concurrent_agents",
   "task_id",
   "blocked_json",
-  "dispute",
   "rounds_json",
   "error",
   "created_at",
@@ -262,7 +245,6 @@ export class Ledger {
         concurrent_agents TEXT,
         task_id TEXT,
         blocked_json TEXT,
-        dispute TEXT,
         rounds_json TEXT NOT NULL DEFAULT '[]',
         error TEXT,
         created_at INTEGER NOT NULL,
@@ -282,8 +264,6 @@ export class Ledger {
         workspace_id TEXT,
         base_tree TEXT,
         request_text TEXT,
-        rounds_used INTEGER NOT NULL DEFAULT 0,
-        checked_tree TEXT,
         carried_at INTEGER,
         chain_id TEXT UNIQUE,
         chain_created_at INTEGER,
@@ -301,8 +281,6 @@ export class Ledger {
         card_json TEXT,
         card_seq INTEGER NOT NULL DEFAULT 0,
         answer_at INTEGER,
-        answer_reply TEXT,
-        answer_signal TEXT,
         turn_json TEXT,
         turn_at INTEGER,
         round_json TEXT,
@@ -341,7 +319,6 @@ export class Ledger {
       step: "INTEGER NOT NULL DEFAULT 0",
       concurrent_agents: "TEXT",
       blocked_json: "TEXT",
-      dispute: "TEXT",
       task_id: "TEXT",
     });
     migrate("tasks", {
@@ -355,7 +332,6 @@ export class Ledger {
       budget_since: "INTEGER",
       last_run_id: "TEXT",
     });
-    this.importOldTables();
   }
 
   /** Records a reviewer/verifier agent id before it is created, so its events are never mistaken for a source. */
@@ -534,7 +510,7 @@ export class Ledger {
     now: number,
   ): Chain {
     const { agent_id, ...fields } = chain;
-    this.upsert(agent_id, { ...fields, ...CHAIN_RESET, rounds_used: 0, chain_created_at: now }, now);
+    this.upsert(agent_id, { ...fields, ...CHAIN_RESET, chain_created_at: now }, now);
     return this.chain(agent_id)!;
   }
 
@@ -558,7 +534,7 @@ export class Ledger {
       .run(childAgentId, agentId, chainId);
   }
 
-  /** Answerer agents: the source agent and chain they serve (the chain may already be gone). */
+  /** Decider agents: the source agent and chain they serve (the chain may already be gone). */
   chainChild(childAgentId: string): { agentId: string; chainId: string } | null {
     const row = this.db
       .prepare("SELECT agent_id, chain_id FROM chain_children WHERE child_agent_id = ?")
@@ -587,21 +563,18 @@ export class Ledger {
 
   /**
    * Records the unchecked changes of a run for the agent's next gated turn. An existing carry keeps its
-   * baseline and request (it is older, so they already cover the new run's changes); rounds, checked tree and
-   * age follow the newest run.
+   * baseline and request (it is older, so they already cover the new run's changes); its age follows the newest run.
    */
   setCarry(carry: Omit<Carry, "created_at">, now: number): void {
     const existing = this.carry(carry.agent_id);
     this.upsert(
       carry.agent_id,
       existing
-        ? { rounds_used: Math.max(existing.rounds_used, carry.rounds_used), checked_tree: carry.checked_tree, carried_at: now }
+        ? { carried_at: now }
         : {
             repo_root: carry.repo_root,
             base_tree: carry.base_tree,
             request_text: carry.request_text,
-            rounds_used: carry.rounds_used,
-            checked_tree: carry.checked_tree,
             carried_at: now,
           },
       now,
@@ -616,8 +589,6 @@ export class Ledger {
       repo_root: row.repo_root,
       base_tree: row.base_tree,
       request_text: row.request_text,
-      rounds_used: row.rounds_used,
-      checked_tree: row.checked_tree,
       created_at: row.carried_at,
     };
   }
@@ -625,7 +596,7 @@ export class Ledger {
   /** The carry was handed on; a chain of the same task keeps the shared baseline and request. */
   deleteCarry(agentId: string): void {
     if (!this.carry(agentId)) return;
-    this.upsert(agentId, { carried_at: null, checked_tree: null }, Date.now());
+    this.upsert(agentId, { carried_at: null }, Date.now());
     this.pruneTask(agentId);
   }
 
@@ -647,39 +618,6 @@ export class Ledger {
     if (!row?.turn_json) return;
     this.upsert(agentId, { turn_json: null, turn_at: null }, Date.now());
     if (!keepTask) this.pruneTask(agentId);
-  }
-
-  /** Moves rows of the chains, carries and turn_snapshots tables of earlier releases into tasks. */
-  private importOldTables(): void {
-    const tables = new Set(
-      (this.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((t) => t.name),
-    );
-    this.db.exec("BEGIN");
-    try {
-      if (tables.has("chains")) {
-        for (const chain of this.db.prepare("SELECT * FROM chains").all() as unknown as Chain[]) {
-          const { agent_id, created_at, updated_at: _updated, ...fields } = chain;
-          const known = Object.fromEntries(Object.entries(fields).filter(([key]) => key === "chain_id" || (CHAIN_COLUMNS as readonly string[]).includes(key)));
-          this.upsert(agent_id, { ...known, chain_created_at: created_at }, created_at);
-        }
-        this.db.exec("DROP TABLE chains");
-      }
-      if (tables.has("carries")) {
-        for (const carry of this.db.prepare("SELECT * FROM carries").all() as unknown as Carry[]) {
-          this.setCarry({ ...carry, rounds_used: carry.rounds_used ?? 0, checked_tree: carry.checked_tree ?? null }, carry.created_at);
-        }
-        this.db.exec("DROP TABLE carries");
-      }
-      if (tables.has("turn_snapshots")) {
-        const rows = this.db.prepare("SELECT * FROM turn_snapshots").all() as Array<{ agent_id: string; snapshot_json: string; created_at: number }>;
-        for (const row of rows) this.setTurnSnapshot(row.agent_id, row.snapshot_json, row.created_at);
-        this.db.exec("DROP TABLE turn_snapshots");
-      }
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
   }
 
   close(): void {

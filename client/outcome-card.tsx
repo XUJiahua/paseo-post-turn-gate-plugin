@@ -21,25 +21,13 @@ const CATEGORY_LABELS: Record<Category, string> = {
 };
 
 function stateLabel(data: OutcomeCardData): string {
-  if (data.decider) {
-    switch (data.state) {
-      case "answer_scheduled":
-        return "Deciding soon";
-      case "answering":
-        return data.childAgentId ? "Deciding…" : "Checking…";
-      case "answered":
-        return `Replied for you (${data.attempt}/${data.maxAttempts})`;
-      case "resolved":
-        return data.category === "done" ? "Completed" : "Resolved";
-    }
-  }
   switch (data.state) {
     case "answer_scheduled":
-      return "Answering for you soon";
+      return "Deciding soon";
     case "answering":
-      return "Answering for you…";
+      return data.childAgentId ? "Deciding…" : "Checking…";
     case "answered":
-      return `Answered for you (${data.attempt}/${data.maxAttempts})`;
+      return `Replied for you (${data.attempt}/${data.maxAttempts})`;
     case "needs_user":
       return "Needs you";
     case "retry_scheduled":
@@ -49,7 +37,7 @@ function stateLabel(data: OutcomeCardData): string {
     case "stopped":
       return "Stopped";
     case "resolved":
-      return "Resolved";
+      return data.category === "done" ? "Completed" : "Resolved";
     default:
       return CATEGORY_LABELS[data.category];
   }
@@ -88,7 +76,7 @@ export function OutcomeCard({ item, theme }: PluginTimelineItemProps<OutcomeCard
 
   const status = stateLabel(data);
   const title = data.decider ? "Post-turn supervisor" : `Post-turn gate · ${CATEGORY_LABELS[data.category]}`;
-  const who = data.decider ? "Decider" : "Answerer";
+  const who = "Decider";
   return (
     <View style={styles.card} accessible accessibilityLabel={`${title}, ${status}`}>
       <View style={styles.header}>
@@ -103,7 +91,7 @@ export function OutcomeCard({ item, theme }: PluginTimelineItemProps<OutcomeCard
       ) : null}
       {data.answer ? (
         <Text style={styles.body} selectable>
-          {data.decider ? "Reply sent" : "Answer sent"}: {data.answer}
+          Reply sent: {data.answer}
         </Text>
       ) : null}
       {data.checks ? (
