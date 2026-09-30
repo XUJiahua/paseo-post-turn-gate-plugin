@@ -64,7 +64,7 @@
 
 1. **预筛（插件内，零成本，重召回）**：`completed` 轮次的最后一段 assistant 文本满足任一条件即可进入第二段：
    - 以 `?` 或 `？` 结尾；
-   - 最后 300 字内出现 `should I|shall I|would you like|do you want|which (one|option)|let me know|please confirm|before I (proceed|continue)|waiting for|要不要|是否需要|需要我|请确认|请告诉我|你希望|选哪个`；
+   - 最后一句（最后一个非空行的最后一句，引号里的内容不算）出现 `should I|shall I|would you like|do you want|which (one|option)|let me know|please confirm|before I (proceed|continue)|waiting for|要不要|是否需要|需要我|请确认|请告诉我|你希望|选哪个`。前面句子里的这些词多半是在转述（“选方案、要不要继续这两类提问”），不算提问；
    - 以编号选项列表结尾（`1.`、`A)` 等两项以上）。
 
    预筛不命中就是 `done`，照常走 gate，行为与现在一致。
@@ -151,6 +151,8 @@ prompt 包含：
 - 涉及删除数据、force push、发布或部署、花钱、改权限、凭据或密钥、对外发送消息；
 - Agent 在索要只有用户知道的信息（账号、路径偏好、密码等）；
 - 同一个问题已经代答过一次，Agent 仍然在问（死循环保护：问题文本相似度高于阈值即 escalate）。
+
+插件的二次检查（`answerRisk`）是 answerer 判断越界时的兜底，只看答案会不会批准不可逆或对外的动作，不看话题：问题和答案里的命令（代码块、反引号片段、`$ ` 行、“run/执行”后面的分句）按权限检查的同一套 argv 规则判断，其余文字只匹配动作短语（push it、deploy to production、apply the Terraform plan、run migrations on production、密码等）。所以“用 AWS SDK v3 还是 v2”“给 `src/aws/client.ts` 加测试”照常代答，“要跑 `terraform apply` 吗？”答“Yes”会交给你。answerer 的 prompt 要求答案里的命令放进反引号。
 
 代答的时机：先等 `answer.delay_seconds`（默认 60 秒）。卡片显示 “Answering for you soon” 和开始时间，按钮 “Stop auto-answering” 此时已可用；这段时间里你发了消息（`turn_started`），计划中的代答就被取消。到点后由定时器或 60 秒一次的对账启动 answerer（ledger 的 `answer_at`、`answer_reply`、`answer_signal`，重启后也能继续）。设为 `0` 时立即启动。宽限期同时缩小了“检查 idle 与 send 之间用户插话”的竞态窗口。
 

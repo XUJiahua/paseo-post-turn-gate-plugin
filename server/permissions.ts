@@ -35,7 +35,6 @@ const DANGEROUS: ReadonlyArray<[RegExp, string]> = [
 // whatever prefix runs it (`timeout 60 aws …`, `watch kubectl …`, `env -u X terraform …`). The only exception
 // is a read-only program whose arguments are paths or search terms: `cat src/aws/client.ts`, `ls infra/terraform`.
 const CLOUD_TOOLS = new Set(["kubectl", "helm", "terraform", "pulumi", "aws", "gcloud", "az", "flyctl", "vercel", "netlify"]);
-const CLOUD_WORD = /\b(kubectl|helm|terraform|pulumi|aws|gcloud|az|flyctl|vercel|netlify)\b/i;
 const READ_ONLY = new Set(["cat", "less", "more", "head", "tail", "ls", "tree", "wc", "file", "stat", "grep", "egrep", "fgrep", "rg", "ag", "diff"]);
 // Prefixes that run the next word as the program.
 const WRAPPERS = new Set(["env", "command", "exec", "time", "nice", "nohup", "npx", "pnpx", "bunx", "xargs"]);
@@ -137,13 +136,39 @@ function commandRisk(command: string): string | null {
 
 // Natural-language red flags for answers given on the user's behalf (second check after the answerer).
 const RISKY_ANSWER =
-  /\bforce[- ]push|\bdeploy(ing)? to (prod|production|staging)|\bpublish(ing)? (to|on) (npm|pypi|crates|the store)|\bdrop (the )?(table|database)|\bdelete (the )?(database|data|branch|repo(sitory)?|bucket|production|user data)|\b(password|credential|secret|api[ -]?key|private key)s?\b|\b(pay|purchase|billing|credit card)\b|删除(数据|分支|仓库)|强制推送|发布到|部署到|密码|密钥|付费|付款/i;
+  /\bforce[- ]push|\bdeploy(ing)? to (prod|production|staging)|\bpublish(ing)? (to|on) (npm|pypi|crates|the store)|\bdrop (the )?(table|database)|\bdelete (the )?(database|data|branch|repo(sitory)?|bucket|production|user data)|\b(password|credential|secret|api[ -]?key|private key)s?\b|\b(pay|purchase|billing|credit card)\b|\bpush(ing)? (it|this|them|the (branch|changes|commits?)|to (origin|main|master|the remote|github))\b|\bdeploy(ing)? (it|this|now)\b|\bapply(ing)? (the )?(terraform|pulumi|infra(structure)?) (plan|changes)\b|\b(run|apply)(ning)? (the )?migrations? (on|against|to|in) (prod|production|staging)\b|\broll(ing)? ?out (to|on) (prod|production)\b|删除(数据|分支|仓库)|强制推送|推送到|发布到|部署到|密码|密钥|付费|付款/i;
 
-/** Why an auto-answer must go to the user instead; null when nothing risky was found. */
+/**
+ * The commands a question or answer names: fenced code lines, `inline` spans, `$ ` lines, and the clause after
+ * "run"/"执行" in prose ("Yes, run aws s3 rm …"). A tool named in plain prose ("use the AWS SDK") is not one.
+ */
+function commandSpans(text: string): string[] {
+  const spans: string[] = [];
+  const prose = text.replace(/```[^\n]*\n?([\s\S]*?)(```|$)/g, (_match, body: string) => {
+    spans.push(...body.split("\n"));
+    return " ";
+  });
+  for (const match of prose.matchAll(/`+([^`\n]+?)`+/g)) spans.push(match[1]);
+  for (const match of prose.matchAll(/^\s*\$\s+(.+)$/gm)) spans.push(match[1]);
+  for (const match of prose.replace(/`/g, "").matchAll(/(?:\brun|\bexecute|运行|执行)\s*[:：]?\s*([^.,;!?。，；！？\n]+)/gi)) {
+    spans.push(match[1]);
+  }
+  return spans.map((span) => span.trim()).filter(Boolean);
+}
+
+/**
+ * Why an auto-answer must go to the user instead; null when nothing risky was found. A backstop for an answerer
+ * that misjudged its scope: the risk is an answer authorizing an irreversible or outward-facing action, so only
+ * commands and action phrases count, not a tool's name in prose.
+ */
 export function answerRisk(text: string): string | null {
-  // Answers are prose ("yes, run aws s3 rm …"), so a cloud tool counts anywhere in them.
-  const risk = commandRisk(text) ?? (CLOUD_WORD.test(text) ? "cloud or deployment tool" : null);
-  if (risk) return risk;
+  for (const span of commandSpans(text)) {
+    const risk = commandRisk(span);
+    if (risk) return risk;
+  }
+  for (const [pattern, reason] of DANGEROUS) {
+    if (pattern.test(text)) return reason;
+  }
   return RISKY_ANSWER.test(text) ? "involves an irreversible, outward-facing or credential decision" : null;
 }
 

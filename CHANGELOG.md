@@ -18,6 +18,9 @@ All notable changes to this project are documented here.
 - Failed turns are reported or retried even when they changed no files; a stop after tool calls is auto-answered even before files change.
 - A finished report ending with a closing offer ("Let me know if you need anything else.") is `done`, not a question.
 - A fix turn that changes nothing is no longer checked again: a question goes to the answerer, a disagreement to you (or the checker).
+- Only the closing sentence of a reply counts as asking: "要不要" or "should I" earlier in the reply, or inside quotes, no longer starts the answerer.
+- The second check on automatic answers looks at commands and action phrases only: a cloud tool named in prose ("use the AWS SDK", `src/aws/client.ts`) no longer sends the question to you.
+- When the answerer finds the agent had finished, the card reads "Finished" without an "Agent asked" excerpt; excerpts of long replies start at a sentence boundary.
 - Outcome cards: each new question, failure or retry gets a new card at the current timeline position.
 - Config error cards appear only for gated turns that changed files, once per policy version, and are marked fixed once the policy is valid.
 - Cloud/deploy tools named in a command still need you whatever prefix runs them, but read-only commands (`cat src/aws/x.ts`, `grep helm …`) no longer do; `git -C <dir> push` and `sh -c` scripts are recognized.

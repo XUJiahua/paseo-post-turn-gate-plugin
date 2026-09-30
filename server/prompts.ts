@@ -241,7 +241,7 @@ Classify the agent's state:
 For "awaiting_user", choose decision "answer" only when the request, the repository, or common engineering
 practice clearly determines the answer. If the agent recommends one option and that option is reversible,
 stays inside this repository, and stays within the scope of the original request, answer
-"Go with your recommendation." Keep the answer short and actionable. Choose "escalate" when:
+"Go with your recommendation." Keep the answer short and actionable, and put any command in backticks. Choose "escalate" when:
 - it is a product or business trade-off the request does not settle (several reasonable options);
 - it involves deleting data, force-pushing, publishing, deploying, spending money, changing permissions,
   credentials or secrets, or sending anything outside this machine;

@@ -81,7 +81,16 @@ describe("looksLikeQuestion (pre-screen, high recall)", () => {
     }
   });
   test("misses", () => {
-    for (const text of ["Done. All tests pass.", "Fixed the bug in parse().", "Steps taken:\n1. Read\n2. Fixed", "```js\nif (a?.b) {}\n```\nImplemented.", ""]) {
+    for (const text of [
+      "Done. All tests pass.",
+      "Fixed the bug in parse().",
+      "Steps taken:\n1. Read\n2. Fixed",
+      "```js\nif (a?.b) {}\n```\nImplemented.",
+      "",
+      // An asking phrase that is reported, not asked: only the closing sentence counts.
+      "结果是：选方案、要不要继续这两类提问都能自动回答。这也符合插件的定位。",
+      'The prompt now says "should I ask first" nowhere. Tests pass.',
+    ]) {
       assert.equal(looksLikeQuestion(text), false, text);
     }
   });
@@ -140,6 +149,29 @@ describe("answer guards", () => {
     assert.ok(answerRisk("可以，删除数据库里的旧数据"));
     assert.equal(answerRisk("Use TypeScript and keep the existing test layout."), null);
     assert.equal(answerRisk("Yes, delete the unused helper function."), null);
+  });
+  test("answerRisk counts commands and actions, not a cloud tool's name in prose", () => {
+    for (const text of [
+      "Should I use the AWS SDK v3 or v2 for the S3 client?\nUse v3.",
+      "Should I add a unit test for src/aws/client.ts?\nYes.",
+      "Helm chart values: keep replicaCount at 2 or bump it to 3?\nKeep 2.",
+      "Should I update the Terraform module docs in README?\nYes, update the README.",
+      "Want me to refactor the blob adapter? (az-storage)\nYes.",
+      "Should I run the tests?\nYes, run `npm test`.",
+      "Should I check `cat src/aws/client.ts` first?\nYes.",
+    ]) {
+      assert.equal(answerRisk(text), null, text);
+    }
+    for (const text of [
+      "Should I run `terraform apply`?\nYes.",
+      "Clean up the bucket?\nYes, run aws s3 rm s3://old --recursive",
+      "Next step:\n```sh\nkubectl delete ns staging\n```\nGo ahead.",
+      "Should I apply the Terraform plan?\nYes.",
+      "Should I push the branch?\nYes, push it.",
+      "Should I run the migrations on production?\nYes.",
+    ]) {
+      assert.ok(answerRisk(text), text);
+    }
   });
   test("similarity catches the same question reworded slightly", () => {
     assert.ok(similarity("Which language should I use?", "Which language should I use for this?") >= 0.5);

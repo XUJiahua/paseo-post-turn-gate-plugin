@@ -1309,10 +1309,16 @@ describe("turn outcomes: answers, retries, chains", () => {
 
   test("the answerer can say the agent was done: gate runs, nothing is sent", async () => {
     writePolicy({ version: 2 });
-    await sourceTurn({ change: edit, reply: "Implemented, the tests pass now, right?" });
+    await sourceTurn({ change: edit, reply: `${"Filler words here. ".repeat(60)}Implemented, the tests pass now, right?` });
+    // A long reply's excerpt starts at a sentence boundary, not mid-sentence.
+    assert.match(outcomeCard().question, /^…Filler words here\. /);
     await childTurn(answerers()[0].agentId, JSON.stringify({ state: "done", decision: "answer" }));
     assert.equal(fake.sent.length, 0);
     assert.equal(reviewers().length, 1);
+    // Not a question after all: the card reads "Finished" and drops the "Agent asked" excerpt.
+    assert.equal(outcomeCard().category, "done");
+    assert.equal(outcomeCard().question, null);
+    assert.equal(outcomeCard().state, "resolved");
   });
 
   test("awaiting_user as_done skips the answerer and applies done (verify)", async () => {

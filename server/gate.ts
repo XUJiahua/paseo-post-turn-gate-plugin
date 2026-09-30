@@ -159,6 +159,14 @@ function truncate(text: string, limit: number): string {
   return text.length > limit ? `${text.slice(0, limit)}…` : text;
 }
 
+/** The end of a reply as the card's question, starting at a sentence or line boundary rather than mid-sentence. */
+function replyTail(reply: string, limit = 600): string {
+  if (reply.length <= limit) return reply;
+  const tail = reply.slice(-limit);
+  const start = tail.search(/[.!?。！？\n]\s*\S/);
+  return `…${start === -1 ? tail : tail.slice(start + 1).trimStart()}`;
+}
+
 /**
  * Shortens request text from the middle: the head holds the original request, the tail the latest
  * follow-ups and answers, which carry the newest constraints.
@@ -912,7 +920,11 @@ export function createGate(options: GateOptions): Gate {
     );
   }
 
-  async function endChain(paseo: Paseo, agentId: string, final: { state: OutcomeCard["state"]; message: string } | null) {
+  async function endChain(
+    paseo: Paseo,
+    agentId: string,
+    final: (Pick<OutcomeCard, "state" | "message"> & Partial<Pick<OutcomeCard, "category" | "question">>) | null,
+  ) {
     const chain = ledger.chain(agentId);
     if (!chain) return;
     const current = await cancelChainWork(paseo, chain);
@@ -1098,9 +1110,9 @@ export function createGate(options: GateOptions): Gate {
   /** A stop that may wait for the user: answer it (after the grace period), or hand it to the user. */
   async function handleAwaitingUser(paseo: Paseo, chain: Chain, reply: string, signal: string | null): Promise<void> {
     const cfg = answerConfig(JSON.parse(chain.policy_json) as Policy);
-    if (!cfg) return needsUser(paseo, chain, reply.slice(-600), "auto-answer is off for this repository");
-    if (chain.stop_answering) return needsUser(paseo, chain, reply.slice(-600), "auto-answering was stopped for this task");
-    if (chain.answers >= cfg.max) return needsUser(paseo, chain, reply.slice(-600), `auto-answer limit reached (${cfg.max})`);
+    if (!cfg) return needsUser(paseo, chain, replyTail(reply), "auto-answer is off for this repository");
+    if (chain.stop_answering) return needsUser(paseo, chain, replyTail(reply), "auto-answering was stopped for this task");
+    if (chain.answers >= cfg.max) return needsUser(paseo, chain, replyTail(reply), `auto-answer limit reached (${cfg.max})`);
     if (cfg.delay_seconds === 0) return dispatchAnswerer(paseo, chain, reply, cfg, signal);
     // The user is often still there: give them delay_seconds to reply before an agent answers for them.
     const at = now() + cfg.delay_seconds * 1000;
@@ -1108,7 +1120,7 @@ export function createGate(options: GateOptions): Gate {
     await publishChainCard(paseo, next, {
       category: "awaiting_user",
       state: "answer_scheduled",
-      question: truncate(reply.slice(-600), 2000),
+      question: replyTail(reply),
       answer: null,
       message: null,
       suggestion: SUGGESTIONS.awaiting_user,
@@ -1201,7 +1213,7 @@ export function createGate(options: GateOptions): Gate {
     const spec = policy.agents.answerer;
     const profiles = spec.profile ? (await paseo.config.get()).config.agentProfiles ?? [] : [];
     const resolved = resolveRole(inheritedConfig(source), spec, ROLE_PROFILE.answerer, profiles);
-    if (!resolved.ok) return needsUser(paseo, chain, reply.slice(-600), `cannot start the answerer: ${resolved.error}`);
+    if (!resolved.ok) return needsUser(paseo, chain, replyTail(reply), `cannot start the answerer: ${resolved.error}`);
     const { model, ...launch } = resolved.config;
     const endTree = await snapshotTree(chain.repo_root);
     const childAgentId = randomUUID();
@@ -1247,7 +1259,7 @@ export function createGate(options: GateOptions): Gate {
     current = await publishChainCard(paseo, current, {
       category: "awaiting_user",
       state: "answering",
-      question: truncate(reply.slice(-600), 2000),
+      question: replyTail(reply),
       answer: null,
       message: resolved.note ?? null,
       suggestion: null,
@@ -1301,7 +1313,13 @@ export function createGate(options: GateOptions): Gate {
     if (!reply) return needsUser(paseo, current, undefined, `${denied}the answerer reply is not valid JSON`);
     if (reply.state === "done") {
       await startGate(paseo, taskFromChain(current));
-      return endChain(paseo, owner.agentId, { state: "resolved", message: "The agent had finished; nothing to answer." });
+      // Not a question after all: the card says "Finished", without an "Agent asked" excerpt.
+      return endChain(paseo, owner.agentId, {
+        state: "resolved",
+        category: "done",
+        question: null,
+        message: "The agent had finished; nothing to answer.",
+      });
     }
     if (reply.state === "refused") {
       const policy = JSON.parse(current.policy_json) as Policy;

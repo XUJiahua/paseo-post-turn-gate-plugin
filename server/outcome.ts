@@ -140,8 +140,16 @@ export function looksLikeQuestion(reply: string): boolean {
     .trim();
   if (!text) return false;
   if (/[?？]\s*$/.test(text)) return true;
-  const tail = text.slice(-300);
-  if (ASKING.test(tail)) return true;
+  // Only the closing sentence asks. An asking phrase earlier, or inside quotes, is usually reported speech
+  // ("选方案、要不要继续这两类提问"), not a question to the user.
+  const lastLine = text.split("\n").map((line) => line.trim()).filter(Boolean).at(-1) ?? "";
+  const lastSentence = lastLine
+    .replace(/"[^"\n]*"|“[^”\n]*”|「[^」\n]*」/g, " ")
+    .split(/(?<=[.!?。！？])\s*/)
+    .map((sentence) => sentence.trim())
+    .filter(Boolean)
+    .at(-1);
+  if (lastSentence && ASKING.test(lastSentence)) return true;
   // Ends with an option list of at least two items ("1. …\n2. …", "A) …\nB) …") introduced as a choice,
   // not a summary like "Steps taken:".
   const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
