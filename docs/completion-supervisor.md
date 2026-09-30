@@ -477,6 +477,9 @@ decider 协议 v1 的实现（`server/gate.ts` “decision rounds” 一节）�
 - “写 add.js 和测试，完成后问我要不要 commit”：verify、review 在宽限期内推测性启动并 PASS；decider 计划等检查结果，汇总后按请求把 commit 问题交给用户，卡片带上检查结论。用户回复“Yes, commit it.”后，下一轮在同一棵 tree 上：不再启动检查，decider 直接判定完成。
 - 发现并修正：第一次运行时卡片文字是西班牙语和中文（请求是英文），语言规则改为明确以 `<<<REQUEST` 中的文字为准；用户回复后原先会重跑全部检查，现在交给用户时保留当前 tree 的 PASS，由 decider 判断用户的消息是否需要重新检查。
 
+- 一轮一张卡之后（`f9ea91a`）：“给 add.js 加 div，只写函数”：检查 PASS，decider 判定完成，没有发送任何消息，任务结束。“给 add.js 加 mul”，仓库的 `verifier.md` 规定每个导出函数都要有测试：verify FAIL → decider 发出修复要求 → 主 Agent 补了 mul 的测试 → verify 又因为 div 没有测试 FAIL → decider 再发一次 → PASS → 完成。全程 2 条自动消息，没有人参与。
+- 仍存在：检查者的 summary 偶尔不是请求的语言（英文请求得到西班牙语 summary），decider 的回复语言正确。只影响卡片上的检查结论文字。
+
 v1 与本设计的差异，后续步骤处理：
 
 - decider 的两个阶段是两个子 Agent，而不是同一个子 Agent 收到第二条消息：Paseo 的 `send()` 不接受 `outputSchema`，第二阶段拿不到结构化输出。代价是汇总阶段要重新读一遍上下文。
