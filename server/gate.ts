@@ -266,24 +266,20 @@ export function createGate(options: GateOptions): Gate {
   }
 
   // A superseded run's changes were never passed, so the agent's next gated turn starts from the run's
-  // baseline and request instead of taking a fresh one (which would already contain them).
-  // ponytail: kept in memory; a restart before the next turn starts loses it and that turn gets a fresh
-  // baseline. Upgrade path: store the carry on the ledger.
-  const carried = new Map<string, { baseTree: string; requestText: string }>();
-
+  // baseline and request instead of taking a fresh one (which would already contain them). The carry lives
+  // on the ledger until a finished turn has handled it, so a restart mid-way does not drop it.
   function applyCarry(agentId: string): void {
-    const carry = carried.get(agentId);
+    const carry = ledger.carry(agentId);
     const target = pending.get(agentId);
-    if (!carry || !target?.policy) return;
-    carried.delete(agentId);
-    target.baseTree = carry.baseTree;
-    target.carriedRequest = carry.requestText;
+    if (!carry || !target?.policy || target.repoRoot !== carry.repo_root) return;
+    target.baseTree = carry.base_tree;
+    target.carriedRequest = carry.request_text;
   }
 
   async function supersede(paseo: Paseo, run: Run): Promise<Run> {
     const next = await transition(paseo, run, { status: "SUPERSEDED" });
+    ledger.setCarry({ agent_id: run.source_agent_id, repo_root: run.repo_root, base_tree: run.base_tree, request_text: run.request_text }, now());
     // A turn that already started (its pending snapshot exists) takes the carry now, otherwise the next one does.
-    carried.set(run.source_agent_id, { baseTree: run.base_tree, requestText: run.request_text });
     applyCarry(run.source_agent_id);
     return next;
   }
@@ -1089,6 +1085,9 @@ export function createGate(options: GateOptions): Gate {
       turnKey: `${agentId}:${messageId ?? `turn:${event.turnId}:${event.timeline.length}`}`,
     };
     await applyOutcome(paseo, task, category, detail, replyText(items));
+    // Handled: a run, a chain (both keep the carried baseline) or nothing left to check. A replaced turn's
+    // snapshot, carry included, moves on to the newer turn, so the carry stays until that one ends.
+    if (snapshot.carriedRequest !== undefined && category !== "replaced") ledger.deleteCarry(agentId);
   }
 
   /** Auto-approves routine requests of a managed agent; returns the reason when a human must decide. */

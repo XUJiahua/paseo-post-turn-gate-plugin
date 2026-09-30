@@ -62,6 +62,15 @@ export interface Chain {
   updated_at: number;
 }
 
+/** Unchecked changes of a superseded run, handed to the source agent's next gated turn. */
+export interface Carry {
+  agent_id: string;
+  repo_root: string;
+  base_tree: string;
+  request_text: string;
+  created_at: number;
+}
+
 const CHAIN_COLUMNS = [
   "workspace_id",
   "repo_root",
@@ -192,6 +201,13 @@ export class Ledger {
         child_agent_id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL,
         round INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS carries (
+        agent_id TEXT PRIMARY KEY,
+        repo_root TEXT NOT NULL,
+        base_tree TEXT NOT NULL,
+        request_text TEXT NOT NULL,
+        created_at INTEGER NOT NULL
       );
     `);
     // Ledgers created before multi-check runs lack `step`.
@@ -341,6 +357,26 @@ export class Ledger {
       .prepare("SELECT agent_id, chain_id FROM chain_children WHERE child_agent_id = ?")
       .get(childAgentId) as { agent_id: string; chain_id: string } | undefined;
     return row ? { agentId: row.agent_id, chainId: row.chain_id } : null;
+  }
+
+  // ---------- carries ----------
+
+  /**
+   * Records the unchecked changes of a superseded run for the agent's next gated turn. An existing carry is
+   * kept: it is older, so its baseline already covers the new run's changes.
+   */
+  setCarry(carry: Omit<Carry, "created_at">, now: number): void {
+    this.db
+      .prepare("INSERT OR IGNORE INTO carries (agent_id, repo_root, base_tree, request_text, created_at) VALUES (?, ?, ?, ?, ?)")
+      .run(carry.agent_id, carry.repo_root, carry.base_tree, carry.request_text, now);
+  }
+
+  carry(agentId: string): Carry | null {
+    return (this.db.prepare("SELECT * FROM carries WHERE agent_id = ?").get(agentId) as Carry | undefined) ?? null;
+  }
+
+  deleteCarry(agentId: string): void {
+    this.db.prepare("DELETE FROM carries WHERE agent_id = ?").run(agentId);
   }
 
   close(): void {

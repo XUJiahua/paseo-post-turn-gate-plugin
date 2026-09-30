@@ -189,9 +189,10 @@ npm run profiles -- --provider codex --model gpt-5.5 --role reviewer --thinking 
 ```text
 turn_started(agent)
   ├─ agent 是 ledger 中某个 run 的子 Agent → 忽略
-  ├─ 该源 Agent 有 REVIEWING/DISPATCHING 的 run → 旧 run 标 SUPERSEDED，其 base_tree 和请求留给下一轮
+  ├─ 该源 Agent 有 REVIEWING/DISPATCHING 的 run → 旧 run 标 SUPERSEDED，其 base_tree 和请求写入 ledger 的 carries 表留给下一轮
   ├─ trigger=root_only 且 parentAgentId≠null → 忽略
-  └─ 读取策略、计算基线 tree → 存入内存 pending[agentId] = { policy, baseTree, repoRoot }；有留下的 base_tree 时用它替换基线
+  └─ 读取策略、计算基线 tree → 存入内存 pending[agentId] = { policy, baseTree, repoRoot }；同一 repo 有 carry 时用它替换基线
+     （carry 在这一轮结束、结果交给 run 或 chain 后才删除；插件中途重启也不会丢）
 
 turn_ended(agent, outcome, timeline)
   ├─ agent 是 ledger 中某个 run 的子 Agent → finalizeReview(run, outcome, timeline)

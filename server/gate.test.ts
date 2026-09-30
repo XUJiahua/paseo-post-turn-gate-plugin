@@ -657,6 +657,24 @@ describe("superseded runs keep their changes in scope", () => {
     assert.equal(fake.created.length, 2, "once checked, the carry is gone");
   });
 
+  test("the carry survives plugin restarts, before and during the next turn", async () => {
+    writePolicy({ version: 2 });
+    await sourceTurn({ change: edit });
+    const [base] = diffOf(fake.created[0].prompt);
+    gate.onTurnStarted({ agent: hookAgent(SOURCE), turnId: "t2" }, fake.paseo); // supersedes the review
+    await gate.idle();
+    // Restart mid-turn: the new process has no snapshot for t2, so that turn is skipped.
+    gate = createGate({ ledger, now: () => clock, minuteMs: 1_000 / 30, log: () => {} });
+    gate.onTurnEnded({ agent: hookAgent(SOURCE), turnId: "t2", outcome: { kind: "completed" }, timeline: [] }, fake.paseo);
+    await gate.idle();
+    assert.equal(fake.created.length, 1);
+    gate = createGate({ ledger, now: () => clock, minuteMs: 1_000 / 30, log: () => {} });
+    await sourceTurn({ text: "thanks", messageId: "m3" });
+    assert.equal(fake.created.length, 2);
+    assert.equal(diffOf(fake.created[1].prompt)[0], base);
+    assert.match(fake.created[1].prompt, /Implement feature X[\s\S]*Follow-up from the user: thanks/);
+  });
+
   test("an interrupted fix turn: the next turn is checked from the run's original baseline", async () => {
     writePolicy({ version: 2, on_fail: { fix: { max_rounds: 2 } } });
     await sourceTurn({ change: edit });
