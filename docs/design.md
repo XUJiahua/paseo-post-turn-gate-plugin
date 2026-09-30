@@ -418,11 +418,16 @@ CREATE TABLE config_errors (agent_id TEXT PRIMARY KEY, card_id TEXT NOT NULL, er
 
 旧版 ledger 缺少的列在启动时用 `ALTER TABLE … ADD COLUMN` 补上。
 
-在 claim 之前，`turn_started` 到 `turn_ended` 之间的策略快照只放在内存里。hook 本身不会重放，把它持久化没有意义。
+```sql
+-- turn_started 冻结的策略和基线（内存 pending 的副本），插件重载或 daemon 重启后该轮仍按原基线检查；24 小时过期
+CREATE TABLE turn_snapshots (agent_id TEXT PRIMARY KEY, snapshot_json TEXT NOT NULL, created_at INTEGER NOT NULL);
+```
+
+在 claim 之前，`turn_started` 到 `turn_ended` 之间的策略快照同时放在内存 `pending` 和 `turn_snapshots` 里。hook 本身不会重放，但一轮可能跨越插件重载或 daemon 重启：只存内存时，重启后 `turn_ended` 找不到基线，这一轮的改动会不经检查地落进下一轮的基线（786b759 修复）。
 
 ## 9. 恢复与对账
 
-- **触发时机**：第一次拿到 `context.paseo` 时（任意 hook 或 RPC）；之后只要存在未终结的 run，就每 60 秒检查一次。只扫描 ledger，不扫描历史 Agent。
+- **触发时机**：第一次拿到 `context.paseo` 时（任意 hook 或 RPC）立即对账，并启动一个每 60 秒一次的定时器，此后一直运行到插件卸载（不管有没有未终结的 run）。每次只扫描 ledger 中未终结的 run 和任务链，不扫描历史 Agent。计划中的代答和重试另有定时器按时启动，60 秒的对账是重启后的兜底。
 - **`DISPATCHING`**：用 `dispatch_json` 中记录的同一份参数（同 id、同 key）重放 create（V9、V10）。成功 → `REVIEWING`；失败时先查询子 Agent，存在则进入 `REVIEWING`，否则 `ERROR`。如果还没来得及记录 `dispatch_json`，就重新 dispatch。
 - **`REVIEWING`**：`refresh(child)`。仍在 running → 继续等（等待授权也不顺延截止时间，§7），卡片上的请求超过 `permission_wait_minutes` 则代为拒绝（§5）；已 idle → 用 `timeline.refetch({ direction: "tail" })` 取结果并 finalize；超时 → `ERROR`。
 - **`FIXING`**：`refresh(source)`。已 idle 时在 timeline 中查找 `ptg:…:fix:<n>`：
