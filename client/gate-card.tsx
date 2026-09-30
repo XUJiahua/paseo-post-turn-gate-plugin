@@ -137,7 +137,7 @@ export function GateCard({ item, theme }: PluginTimelineItemProps<CardData>) {
       ) : null}
       {data.reviewerChanges ? (
         <Text style={styles.warning} selectable>
-          Reviewer modified the workspace:{"\n"}
+          The working tree changed during the check:{"\n"}
           {data.reviewerChanges}
         </Text>
       ) : null}

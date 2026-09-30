@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import type { CardData } from "../shared/schema.ts";
-import { createGate, type Gate, type Paseo } from "./gate.ts";
+import { clipRequest, createGate, type Gate, type Paseo } from "./gate.ts";
 import { Ledger } from "./ledger.ts";
 import { parseVerdict } from "./prompts.ts";
 import { resolveReviewer, resolveRole } from "./reviewer.ts";
@@ -460,13 +460,46 @@ describe("dispatch and report", () => {
     assert.match(onlyRun().error ?? "", /verdict/);
   });
 
-  test("workspace edits by the reviewer are reported but do not change the verdict", async () => {
+  test("workspace edits by the reviewer discard its verdict and hand the run to the user", async () => {
     writePolicy({ version: 2 });
     await sourceTurn({ change: edit });
     await childTurn(fake.created[0].agentId, PASS, () => writeFileSync(path.join(repo, "note.txt"), "x\n"));
     const card = onlyRun();
-    assert.equal(card.status, "PASSED");
+    assert.equal(card.status, "NEEDS_HUMAN");
     assert.match(card.reviewerChanges ?? "", /note\.txt/);
+    assert.match(card.error ?? "", /verdict was discarded/);
+    assert.equal(readFileSync(path.join(repo, "note.txt"), "utf8"), "x\n", "nothing is reverted");
+  });
+
+  test("a PASS that lists a HIGH finding counts as FAIL", async () => {
+    writePolicy({ version: 2, on_fail: "report" });
+    await sourceTurn({ change: edit });
+    await childTurn(fake.created[0].agentId, FAIL.replace('"FAIL"', '"PASS"'));
+    assert.equal(onlyRun().status, "FAILED");
+  });
+
+  test("another agent's overlapping turn is noted on the card and in the prompts", async () => {
+    writePolicy({ version: 2, on_fail: { fix: { max_rounds: 2 } } });
+    const other = hookAgent("other-agent");
+    gate.onTurnStarted({ agent: other, turnId: "o" }, fake.paseo);
+    await gate.idle();
+    await sourceTurn({ change: edit });
+    assert.match(fake.created[0].prompt, /Other agents \(other-agent\) were working in this repository/);
+    assert.match(onlyRun().note ?? "", /Other agents worked in this repository at the same time \(other-ag\)/);
+    await childTurn(fake.created[0].agentId, FAIL);
+    assert.match(fake.sent[0].text, /Fix only findings caused by your own changes/);
+  });
+
+  test("a turn without overlapping agents gets no concurrency note", async () => {
+    writePolicy({ version: 2 });
+    const other = hookAgent("other-agent");
+    gate.onTurnStarted({ agent: other, turnId: "o" }, fake.paseo);
+    await gate.idle();
+    gate.onTurnEnded({ agent: other, turnId: "o", outcome: { kind: "completed" }, timeline: [] }, fake.paseo);
+    await gate.idle();
+    await sourceTurn({ change: edit });
+    assert.doesNotMatch(fake.created[0].prompt, /Other agents/);
+    assert.equal(onlyRun().note, null);
   });
 
   test("a failed create is an ERROR", async () => {
@@ -752,6 +785,45 @@ describe("recovery", () => {
     assert.deepEqual(fake.archived, [child.id], "the stuck reviewer is archived");
   });
 
+  test("after a restart, a reviewer's open permission request is shown on the card again", async () => {
+    writePolicy({ version: 2 });
+    await sourceTurn({ change: edit });
+    const child = fake.agents.get(fake.created[0].agentId)!;
+    child.pendingPermissions = [
+      { id: "req-9", name: "execute", kind: "tool", title: "Running: git push", detail: { type: "shell", command: "git push" } },
+    ];
+    const restarted = createGate({ ledger, now: () => clock, minuteMs: 1_000 / 30, log: () => {} });
+    restarted.reconcile(fake.paseo);
+    await restarted.idle();
+    assert.equal(onlyRun().permission?.requestId, "req-9");
+    assert.equal(onlyRun().permission?.reason, "destructive or remote git operation");
+    assert.equal(fake.answered.length, 0);
+
+    child.pendingPermissions = [];
+    restarted.reconcile(fake.paseo);
+    await restarted.idle();
+    assert.equal(onlyRun().permission, null, "a request resolved elsewhere leaves the card");
+  });
+
+  test("a dispatch that keeps failing before the child exists ends in ERROR", async () => {
+    writePolicy({ version: 2, agents: { reviewer: { profile: "some-profile" } } });
+    const config = (fake.paseo as unknown as { config: { get: () => Promise<unknown> } }).config;
+    config.get = async () => {
+      throw new Error("daemon unreachable");
+    };
+    await sourceTurn({ change: edit });
+    const [run] = ledger.active();
+    assert.equal(run.status, "DISPATCHING");
+    gate.reconcile(fake.paseo);
+    await gate.idle();
+    assert.equal(ledger.get(run.run_id)?.status, "DISPATCHING", "retried inside the deadline");
+    clock += 5_000;
+    gate.reconcile(fake.paseo);
+    await gate.idle();
+    assert.equal(ledger.get(run.run_id)?.status, "ERROR");
+    assert.match(onlyRun().error ?? "", /could not start the review agent/);
+  });
+
   test("a FIXING run whose fix message never landed is re-sent with the same messageId", async () => {
     writePolicy({ version: 2, on_fail: { fix: { max_rounds: 2 } } });
     await sourceTurn({ change: edit });
@@ -815,6 +887,45 @@ describe("turn outcomes: answers, retries, chains", () => {
     assert.equal(baseOf(reviewers()[0].prompt), firstBase, "review covers the whole task");
     assert.match(reviewers()[0].prompt, /Answered on the user's behalf/);
     assert.equal(outcomeCard().state, "resolved");
+  });
+
+  test("an answerer that edits the working tree does not get its answer sent", async () => {
+    writePolicy({ version: 2 });
+    await sourceTurn({ change: edit, reply: "Which language should I use for the script?" });
+    await childTurn(answerers()[0].agentId, ANSWER("Use TypeScript."), () => writeFileSync(path.join(repo, "sneaky.txt"), "x\n"));
+    assert.equal(fake.sent.length, 0);
+    assert.equal(outcomeCard().state, "needs_user");
+    assert.match(outcomeCard().message, /changed while the answerer ran[\s\S]*sneaky\.txt/);
+  });
+
+  test("the first request carries the user's earlier messages; long chains keep the newest follow-up", async () => {
+    writePolicy({ version: 2 });
+    const agent = hookAgent(SOURCE);
+    gate.onTurnStarted({ agent, turnId: "t" }, fake.paseo);
+    await gate.idle();
+    edit();
+    gate.onTurnEnded(
+      {
+        agent,
+        turnId: "t",
+        outcome: { kind: "completed" },
+        timeline: [
+          { type: "user_message", text: "Write a CSV parser in src/csv.ts", messageId: "m0" },
+          { type: "assistant_message", text: "Done." },
+          { type: "user_message", text: "Also support quoted fields", messageId: "m1" },
+          { type: "assistant_message", text: "Done." },
+        ] as never,
+      },
+      fake.paseo,
+    );
+    await gate.idle();
+    assert.match(reviewers()[0].prompt, /Earlier messages[\s\S]*Write a CSV parser[\s\S]*Request:\nAlso support quoted fields/);
+
+    const long = clipRequest(`${"a".repeat(9000)}\n\nFollow-up from the user: use tabs`);
+    assert.ok(long.length < 8100);
+    assert.match(long, /^a+/);
+    assert.match(long, /characters omitted/);
+    assert.match(long, /use tabs$/);
   });
 
   test("a turn that changed no files gets no answerer, retry or card", async () => {
@@ -1042,6 +1153,7 @@ describe("parseVerdict", () => {
     assert.equal(parseVerdict('{"verdict":"MAYBE","summary":"","findings":[]}'), null);
     assert.equal(parseVerdict("PASS"), null);
     assert.equal(parseVerdict(""), null);
+    assert.equal(parseVerdict(FAIL.replace('"FAIL"', '"INCONCLUSIVE"'))?.verdict, "FAIL", "a HIGH finding means FAIL");
   });
 
   test("uses the final structured reply after Codex progress messages", () => {

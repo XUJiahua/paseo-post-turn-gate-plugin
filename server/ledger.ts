@@ -32,6 +32,8 @@ export interface Run {
   verdict: string | null;
   result_json: string | null;
   reviewer_changes: string | null;
+  /** JSON array of other agents whose turns overlapped this task in the same repository. */
+  concurrent_agents: string | null;
   rounds_json: string;
   error: string | null;
   created_at: number;
@@ -102,6 +104,7 @@ export type NewRun = Pick<
   | "request_text"
   | "base_tree"
   | "end_tree"
+  | "concurrent_agents"
 >;
 
 const COLUMNS = [
@@ -124,6 +127,7 @@ const COLUMNS = [
   "verdict",
   "result_json",
   "reviewer_changes",
+  "concurrent_agents",
   "rounds_json",
   "error",
   "created_at",
@@ -163,6 +167,7 @@ export class Ledger {
         verdict TEXT,
         result_json TEXT,
         reviewer_changes TEXT,
+        concurrent_agents TEXT,
         rounds_json TEXT NOT NULL DEFAULT '[]',
         error TEXT,
         created_at INTEGER NOT NULL,
@@ -215,6 +220,9 @@ export class Ledger {
     if (!columns.some((column) => column.name === "step")) {
       this.db.exec("ALTER TABLE gate_runs ADD COLUMN step INTEGER NOT NULL DEFAULT 0");
     }
+    if (!columns.some((column) => column.name === "concurrent_agents")) {
+      this.db.exec("ALTER TABLE gate_runs ADD COLUMN concurrent_agents TEXT");
+    }
   }
 
   /** Records a reviewer/verifier agent id before it is created, so its events are never mistaken for a source. */
@@ -240,8 +248,8 @@ export class Ledger {
       .prepare(
         `INSERT OR IGNORE INTO gate_runs
           (run_id, source_agent_id, source_turn_key, workspace_id, repo_root, policy_hash, policy_json,
-           request_text, base_tree, end_tree, status, round, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DISPATCHING', 1, ?, ?)`,
+           request_text, base_tree, end_tree, concurrent_agents, status, round, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DISPATCHING', 1, ?, ?)`,
       )
       .run(
         run.run_id,
@@ -254,6 +262,7 @@ export class Ledger {
         run.request_text,
         run.base_tree,
         run.end_tree,
+        run.concurrent_agents,
         now,
         now,
       );

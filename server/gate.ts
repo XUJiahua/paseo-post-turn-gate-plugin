@@ -51,6 +51,7 @@ type TurnEnded = PluginLifecycleEvents["agent.turn_ended"];
 type PermissionRequested = PluginLifecycleEvents["agent.permission_requested"];
 type PermissionResolved = PluginLifecycleEvents["agent.permission_resolved"];
 type TimelineItem = TurnEnded["timeline"][number];
+type UserItem = Extract<TimelineItem, { type: "user_message" }>;
 type AgentSnapshot = NonNullable<
   Awaited<ReturnType<ReturnType<Paseo["agents"]["ref"]>["refresh"]>>
 >["agent"];
@@ -88,6 +89,8 @@ interface Task {
   baseTree: string;
   requestText: string;
   turnKey: string;
+  /** Other agents whose turns overlapped this task in the same repository. */
+  concurrent: readonly string[];
 }
 
 type AnswerConfig = Extract<OnOutcome["awaiting_user"], { answer: unknown }>["answer"];
@@ -116,7 +119,7 @@ export interface Gate {
 
 const isTerminal = (status: RunStatus) => TERMINAL_STATUSES.includes(status);
 
-function lastUserMessage(timeline: readonly TimelineItem[]) {
+function lastUserMessage(timeline: readonly TimelineItem[]): UserItem | null {
   for (let index = timeline.length - 1; index >= 0; index -= 1) {
     const item = timeline[index];
     if (item.type === "user_message") return item;
@@ -126,6 +129,34 @@ function lastUserMessage(timeline: readonly TimelineItem[]) {
 
 function truncate(text: string, limit: number): string {
   return text.length > limit ? `${text.slice(0, limit)}…` : text;
+}
+
+/**
+ * Shortens request text from the middle: the head holds the original request, the tail the latest
+ * follow-ups and answers, which carry the newest constraints.
+ */
+export function clipRequest(text: string, limit = REQUEST_TEXT_LIMIT): string {
+  if (text.length <= limit) return text;
+  const head = Math.floor(limit / 4);
+  const marker = `\n\n[… ${text.length - limit} characters omitted …]\n\n`;
+  return `${text.slice(0, head)}${marker}${text.slice(text.length - (limit - head))}`;
+}
+
+const EARLIER_MESSAGES = 5;
+
+/**
+ * The first request of a task, with the user's earlier messages in the conversation as context: a
+ * request like "also add X" means nothing to a checker that only sees the last message.
+ */
+function firstRequestText(timeline: readonly TimelineItem[], lastUser: UserItem | null): string {
+  const text = lastUser?.text ?? "";
+  const earlier = timeline
+    .filter((item): item is UserItem => item.type === "user_message" && item !== lastUser)
+    .filter((item) => !(item.messageId ?? item.clientMessageId ?? "").startsWith(FIX_PREFIX)) // the plugin's own messages
+    .slice(-EARLIER_MESSAGES)
+    .map((item) => `- ${truncate(item.text, 1000)}`);
+  if (earlier.length === 0) return text;
+  return `Earlier messages from the user in this conversation (context only):\n${earlier.join("\n")}\n\nRequest:\n${text}`;
 }
 
 export function createGate(options: GateOptions): Gate {
@@ -154,6 +185,45 @@ export function createGate(options: GateOptions): Gate {
   // Pending permission of each run's current child, shown on the card so it can be answered there.
   const waiting = new Map<string, PermissionCard>();
   const autoApproved = new Map<string, number>(); // run id → requests approved without a human
+
+  // Agents with a running turn per repository, and the other agents whose turns overlapped theirs. A tree
+  // snapshot covers the whole working tree, so overlapping agents' changes end up in each other's diffs.
+  // ponytail: in memory only; turns that were already running when the plugin started are not seen, and a
+  // turn whose turn_ended never arrives counts as running for ACTIVITY_TTL_MS. Upgrade path: one worktree per agent.
+  const ACTIVITY_TTL_MS = 24 * 60 * 60 * 1000;
+  interface Activity { repoRoot: string; owner: string; turnId: string | null; startedAt: number; others: Set<string> }
+  const activity = new Map<string, Activity>();
+  /** Overlapping agents of a task that spans turns (a chain, or a superseded run's carry). */
+  const taskConcurrent = new Map<string, Set<string>>();
+
+  /** owner: the source agent itself, or the source agent a gate child works for (never paired with each other). */
+  function startActivity(agentId: string, owner: string, repoRoot: string, turnId: string | null): void {
+    const entry = activity.get(agentId) ?? { repoRoot, owner, turnId, startedAt: now(), others: new Set<string>() };
+    Object.assign(entry, { repoRoot, owner, turnId });
+    for (const [id, other] of activity) {
+      if (now() - other.startedAt > ACTIVITY_TTL_MS) activity.delete(id);
+      else if (id !== agentId && other.repoRoot === repoRoot && other.owner !== owner) {
+        entry.others.add(id);
+        other.others.add(agentId);
+      }
+    }
+    activity.set(agentId, entry);
+  }
+
+  function endActivity(agentId: string, turnId: string | null): string[] {
+    const entry = activity.get(agentId);
+    if (!entry) return [];
+    // A replaced turn's late turn_ended must not end the newer turn's tracking.
+    if (!turnId || !entry.turnId || entry.turnId === turnId) activity.delete(agentId);
+    return [...entry.others];
+  }
+
+  const concurrentOf = (run: Run): string[] => (run.concurrent_agents ? (JSON.parse(run.concurrent_agents) as string[]) : []);
+  const encodeConcurrent = (ids: Iterable<string>): string | null => {
+    const list = [...new Set(ids)];
+    return list.length > 0 ? JSON.stringify(list) : null;
+  };
+  const shortIds = (ids: readonly string[]) => ids.map((id) => id.slice(0, 8)).join(", ");
 
   // ponytail: one global queue serializes all gate work; a slow agent create delays other agents' events.
   // Upgrade path: per-source-agent queues if this ever becomes a bottleneck.
@@ -279,6 +349,9 @@ export function createGate(options: GateOptions): Gate {
   async function supersede(paseo: Paseo, run: Run): Promise<Run> {
     const next = await transition(paseo, run, { status: "SUPERSEDED" });
     ledger.setCarry({ agent_id: run.source_agent_id, repo_root: run.repo_root, base_tree: run.base_tree, request_text: run.request_text }, now());
+    const carried = taskConcurrent.get(run.source_agent_id) ?? new Set<string>();
+    for (const id of concurrentOf(run)) carried.add(id);
+    if (carried.size > 0) taskConcurrent.set(run.source_agent_id, carried);
     // A turn that already started (its pending snapshot exists) takes the carry now, otherwise the next one does.
     applyCarry(run.source_agent_id);
     return next;
@@ -392,6 +465,7 @@ export function createGate(options: GateOptions): Gate {
         baseTree: run.base_tree,
         endTree: run.end_tree,
         instructions: spec.instructions,
+        concurrentAgents: concurrentOf(run),
       }),
       clientMessageId: key,
       outputSchema: VERDICT_JSON_SCHEMA,
@@ -402,10 +476,19 @@ export function createGate(options: GateOptions): Gate {
       },
     };
     ledger.addChild(childAgentId, run.run_id, run.round);
+    const concurrent = concurrentOf(run);
+    const note = [
+      resolved.note,
+      concurrent.length > 0
+        ? `Other agents worked in this repository at the same time (${shortIds(concurrent)}); the checked diff may include their changes.`
+        : null,
+    ]
+      .filter(Boolean)
+      .join(" ");
     const claimed = await transition(paseo, run, {
       status: "DISPATCHING",
       child_agent_id: childAgentId,
-      dispatch_json: JSON.stringify({ workspaceId: run.workspace_id, ...(resolved.note ? { note: resolved.note } : {}), ...payload }),
+      dispatch_json: JSON.stringify({ workspaceId: run.workspace_id, ...(note ? { note } : {}), ...payload }),
       deadline_at: now() + timeoutOf(run),
       reviewer_changes: null,
     });
@@ -433,6 +516,7 @@ export function createGate(options: GateOptions): Gate {
     childAgentId: string,
     outcome: TurnEnded["outcome"],
     timeline: readonly TimelineItem[],
+    concurrent: readonly string[] = [],
   ): Promise<void> {
     // Only the run's current child counts; earlier rounds' or checks' children are stale.
     if (run.status !== "REVIEWING" || run.child_agent_id !== childAgentId) return;
@@ -444,6 +528,17 @@ export function createGate(options: GateOptions): Gate {
     }
     const afterTree = await snapshotTree(run.repo_root);
     const reviewerChanges = afterTree === run.end_tree ? null : await diffStat(run.repo_root, run.end_tree, afterTree);
+    if (reviewerChanges) {
+      // A checker that edits the tree is no longer independent (it may have "fixed" what it then passed), and
+      // the edits would count as the source agent's work in the next round. Nothing is reverted: the user decides.
+      const who = concurrent.length > 0 ? `the ${check} agent or another agent (${shortIds(concurrent)})` : `the ${check} agent`;
+      await transition(paseo, run, {
+        status: "NEEDS_HUMAN",
+        reviewer_changes: reviewerChanges,
+        error: `The working tree changed while ${who} ran, so its verdict was discarded. Nothing was reverted; look at the changes below and decide what to keep.`,
+      });
+      return archiveChild(paseo, childAgentId);
+    }
     const verdict = parseVerdict(latestAssistantText(timeline));
     if (!verdict) {
       return fail(paseo, run, "reviewer reply is not a valid verdict JSON", { reviewer_changes: reviewerChanges });
@@ -463,7 +558,7 @@ export function createGate(options: GateOptions): Gate {
       if (next < gateChecks(policy).length) {
         // DISPATCHING without a payload: after a crash here, reconcile dispatches the next check instead of
         // re-reading the finished child's verdict and advancing twice.
-        const advanced = { ...base, step: next, status: "DISPATCHING" as const, dispatch_json: null, child_agent_id: null };
+        const advanced = { ...base, step: next, status: "DISPATCHING" as const, dispatch_json: null, child_agent_id: null, deadline_at: null };
         const dispatching = await transition(paseo, run, advanced);
         await archiveChild(paseo, childAgentId);
         return dispatch(paseo, dispatching);
@@ -494,15 +589,18 @@ export function createGate(options: GateOptions): Gate {
       await supersede(paseo, fixing);
       return;
     }
-    await paseo.agents.ref(run.source_agent_id).send(buildFixPrompt(verdict, run.round, maxFixRounds(policy)), {
+    await paseo.agents.ref(run.source_agent_id).send(buildFixPrompt(verdict, run.round, maxFixRounds(policy), concurrentOf(run)), {
       messageId: fixMessageId(fixing),
     });
   }
 
   const fixMessageId = (run: Run) => `${FIX_PREFIX}${run.run_id}:fix:${run.round}`;
 
-  async function onFixTurnEnded(paseo: Paseo, run: Run, outcome: TurnEnded["outcome"]): Promise<void> {
+  async function onFixTurnEnded(paseo: Paseo, run: Run, outcome: TurnEnded["outcome"], concurrent: readonly string[] = []): Promise<void> {
     if (run.status !== "FIXING") return;
+    if (concurrent.length > 0) {
+      run = ledger.update(run.run_id, { concurrent_agents: encodeConcurrent([...concurrentOf(run), ...concurrent]) }, now());
+    }
     if (outcome.kind !== "completed") {
       await supersede(paseo, run);
       return;
@@ -631,16 +729,17 @@ export function createGate(options: GateOptions): Gate {
       baseTree: chain.base_tree,
       requestText: chain.request_text,
       turnKey: `${chain.agent_id}:chain:${chain.chain_id}:${chain.answers}:${chain.retries}`,
+      concurrent: [...(taskConcurrent.get(chain.agent_id) ?? [])],
     };
   }
 
-  function chainRequestText(prior: string | null, lastUser: ReturnType<typeof lastUserMessage>): string {
+  function chainRequestText(prior: string | null, timeline: readonly TimelineItem[], lastUser: UserItem | null): string {
     const text = lastUser?.text ?? "";
     const id = lastUser?.messageId ?? lastUser?.clientMessageId ?? "";
-    if (prior === null) return truncate(text, REQUEST_TEXT_LIMIT);
+    if (prior === null) return clipRequest(firstRequestText(timeline, lastUser));
     if (id.startsWith("ptg:retry:")) return prior;
     const label = id.startsWith("ptg:answer:") ? "Answered on the user's behalf" : "Follow-up from the user";
-    return truncate(`${prior}\n\n${label}: ${text}`, REQUEST_TEXT_LIMIT);
+    return clipRequest(`${prior}\n\n${label}: ${text}`);
   }
 
   async function needsUser(paseo: Paseo, chain: Chain, question: string | undefined, reason: string): Promise<void> {
@@ -678,6 +777,7 @@ export function createGate(options: GateOptions): Gate {
       request_text: task.requestText,
       base_tree: task.baseTree,
       end_tree: endTree,
+      concurrent_agents: encodeConcurrent(task.concurrent),
     };
     if (!ledger.claim(run, now())) return log(`skip ${task.agentId}: run already exists for this turn`);
     log(`gate ${run.run_id} for ${task.agentId}: ${checks.join(" → ")}`);
@@ -782,10 +882,11 @@ export function createGate(options: GateOptions): Gate {
     }
     const attempt = chain.retries + 1;
     const current = ledger.updateChain(chain.agent_id, { retries: attempt, next_retry_at: null }, now())!;
-    await publishChainCard(paseo, current, { state: "retrying", attempt, nextRetryAt: null });
+    // Send first: publishing the card between the idle check and send() would widen the race (finalizeAnswer).
     await paseo.agents
       .ref(chain.agent_id)
       .send(chain.retry_message ?? DEFAULT_RETRY_MESSAGE, { messageId: `ptg:retry:${chain.chain_id}:${attempt}` });
+    await publishChainCard(paseo, current, { state: "retrying", attempt, nextRetryAt: null });
   }
 
   // ----- answers -----
@@ -840,7 +941,8 @@ export function createGate(options: GateOptions): Gate {
       chain.agent_id,
       {
         answer_child_id: childAgentId,
-        answer_dispatch_json: JSON.stringify({ workspaceId: chain.workspace_id, ...payload }),
+        // endTree: the tree the answerer started on, to detect its edits (not part of the create payload).
+        answer_dispatch_json: JSON.stringify({ workspaceId: chain.workspace_id, endTree, ...payload }),
         answer_deadline_at: now() + spec.timeout_minutes * minuteMs,
       },
       now(),
@@ -863,7 +965,7 @@ export function createGate(options: GateOptions): Gate {
   }
 
   async function createAnswerer(paseo: Paseo, chain: Chain): Promise<void> {
-    const { workspaceId, ...payload } = JSON.parse(chain.answer_dispatch_json ?? "{}");
+    const { workspaceId, endTree: _endTree, ...payload } = JSON.parse(chain.answer_dispatch_json ?? "{}");
     try {
       await paseo.workspaces.ref(workspaceId).agents.create(payload);
     } catch (error) {
@@ -883,8 +985,20 @@ export function createGate(options: GateOptions): Gate {
   ): Promise<void> {
     const chain = ledger.chain(owner.agentId);
     if (!chain || chain.chain_id !== owner.chainId || chain.answer_child_id !== childId) return; // stale
+    const startTree = (JSON.parse(chain.answer_dispatch_json ?? "{}") as { endTree?: string }).endTree;
     let current = await cancelChainWork(paseo, chain);
     if (outcome.kind !== "completed") return needsUser(paseo, current, undefined, `the answerer turn ${outcome.kind}`);
+    // Like a reviewer's (finalizeReview), an answerer's edits would pass as the source agent's work.
+    const afterTree = startTree ? await snapshotTree(current.repo_root) : null;
+    if (startTree && afterTree !== startTree) {
+      const changes = await diffStat(current.repo_root, startTree, afterTree!);
+      return needsUser(
+        paseo,
+        current,
+        undefined,
+        `the working tree changed while the answerer ran, so its answer was not sent. Nothing was reverted:\n${truncate(changes, 600)}`,
+      );
+    }
     const reply = parseAnswer(latestAssistantText(timeline));
     if (!reply) return needsUser(paseo, current, undefined, "the answerer reply is not valid JSON");
     if (reply.state === "done") {
@@ -917,6 +1031,8 @@ export function createGate(options: GateOptions): Gate {
     if (reply.state === "awaiting_user" && current.last_question && similarity(question, current.last_question) >= SAME_QUESTION) {
       return needsUser(paseo, current, question, "the agent asked the same question again after an automatic answer");
     }
+    // Paseo has no "send only if idle": a user message between this refresh and send() would be canceled
+    // by ours (design.md V5). Nothing awaits between the two, so the window is one round trip.
     const source = await refreshAgent(paseo, owner.agentId);
     if (!source || !sendable(source.status)) {
       await publishChainCard(paseo, current, { state: "stopped", canStopAnswering: false, message: "You replied first; the automatic answer was not sent." });
@@ -928,8 +1044,11 @@ export function createGate(options: GateOptions): Gate {
       { answers: attempt, last_question: reply.state === "awaiting_user" ? question : current.last_question },
       now(),
     )!;
+    await paseo.agents.ref(owner.agentId).send(`${ANSWER_PREFIX}\n${text}`, {
+      messageId: `ptg:answer:${current.chain_id}:${attempt}`,
+    });
     const cfg = answerConfig(JSON.parse(current.policy_json) as Policy);
-    current = await publishChainCard(paseo, current, {
+    await publishChainCard(paseo, current, {
       state: "answered",
       question: truncate(question, 2000),
       answer: truncate(text, 2000),
@@ -941,9 +1060,6 @@ export function createGate(options: GateOptions): Gate {
       permission: null,
     });
     log(`answered for ${owner.agentId} (${attempt})`);
-    await paseo.agents.ref(owner.agentId).send(`${ANSWER_PREFIX}\n${text}`, {
-      messageId: `ptg:answer:${current.chain_id}:${attempt}`,
-    });
   }
 
   async function stopAnswering(chainId: string, paseo: Paseo): Promise<boolean> {
@@ -973,7 +1089,13 @@ export function createGate(options: GateOptions): Gate {
 
   async function handleTurnStarted(event: TurnStarted, paseo: Paseo): Promise<void> {
     const agentId = event.agent.id;
-    if (ledger.child(agentId) || ledger.chainChild(agentId)) return;
+    const owned = ledger.child(agentId);
+    const answerer = owned ? null : ledger.chainChild(agentId);
+    if (owned || answerer) {
+      const repoRoot = owned ? owned.run.repo_root : ledger.chain(answerer!.agentId)?.repo_root;
+      if (repoRoot) startActivity(agentId, owned ? owned.run.source_agent_id : answerer!.agentId, repoRoot, event.turnId);
+      return;
+    }
     // The user spoke while a review was running: the review is stale.
     for (const run of ledger.activeForSource(agentId)) {
       if (run.status === "REVIEWING" || run.status === "DISPATCHING") {
@@ -983,6 +1105,8 @@ export function createGate(options: GateOptions): Gate {
     }
     await snapshotTurn(event, paseo);
     applyCarry(agentId);
+    const snapshot = pending.get(agentId);
+    if (snapshot) startActivity(agentId, agentId, snapshot.repoRoot, event.turnId);
   }
 
   async function snapshotTurn(event: TurnStarted, paseo: Paseo): Promise<void> {
@@ -1038,8 +1162,9 @@ export function createGate(options: GateOptions): Gate {
 
   async function handleTurnEnded(event: TurnEnded, paseo: Paseo): Promise<void> {
     const agentId = event.agent.id;
+    const concurrent = endActivity(agentId, event.turnId);
     const owned = ledger.child(agentId);
-    if (owned) return finalizeReview(paseo, owned.run, agentId, event.outcome, event.timeline);
+    if (owned) return finalizeReview(paseo, owned.run, agentId, event.outcome, event.timeline, concurrent);
     const answerer = ledger.chainChild(agentId);
     if (answerer) return finalizeAnswer(paseo, agentId, answerer, event.outcome, event.timeline);
 
@@ -1050,7 +1175,7 @@ export function createGate(options: GateOptions): Gate {
     if (fix) {
       const run = ledger.get(fix[1]);
       if (run && run.source_agent_id === agentId && run.round === Number(fix[2])) {
-        return onFixTurnEnded(paseo, run, event.outcome);
+        return onFixTurnEnded(paseo, run, event.outcome, concurrent);
       }
       return;
     }
@@ -1073,6 +1198,8 @@ export function createGate(options: GateOptions): Gate {
     const { category, detail } = classify({ outcome: event.outcome, turnItems: items, statusAtEnd: source.status });
     log(`outcome ${agentId}: ${category}${detail ? ` (${detail.slice(0, 160)})` : ""}`);
     const chain = snapshot.chainId ? ledger.chain(agentId) : null;
+    // Overlaps of earlier turns of the same task (chain or carry) plus this one.
+    const taskOverlap = new Set([...(taskConcurrent.get(agentId) ?? []), ...concurrent]);
     const task: Task = {
       agentId,
       workspaceId,
@@ -1081,13 +1208,20 @@ export function createGate(options: GateOptions): Gate {
       policyJson: snapshot.policyJson,
       policyHash: snapshot.policyHash,
       baseTree: snapshot.baseTree,
-      requestText: chainRequestText(chain?.request_text ?? snapshot.carriedRequest ?? null, lastUser),
+      requestText: chainRequestText(chain?.request_text ?? snapshot.carriedRequest ?? null, event.timeline, lastUser),
       turnKey: `${agentId}:${messageId ?? `turn:${event.turnId}:${event.timeline.length}`}`,
+      concurrent: [...taskOverlap],
     };
     await applyOutcome(paseo, task, category, detail, replyText(items));
     // Handled: a run, a chain (both keep the carried baseline) or nothing left to check. A replaced turn's
     // snapshot, carry included, moves on to the newer turn, so the carry stays until that one ends.
     if (snapshot.carriedRequest !== undefined && category !== "replaced") ledger.deleteCarry(agentId);
+    // The task goes on (a chain, a carry, or a replacing turn): keep its overlaps for the turn that finishes it.
+    if (taskOverlap.size > 0 && (category === "replaced" || ledger.chain(agentId) || ledger.carry(agentId))) {
+      taskConcurrent.set(agentId, taskOverlap);
+    } else {
+      taskConcurrent.delete(agentId);
+    }
   }
 
   /** Auto-approves routine requests of a managed agent; returns the reason when a human must decide. */
@@ -1124,8 +1258,7 @@ export function createGate(options: GateOptions): Gate {
       const chain = ledger.chain(answerer.agentId);
       if (!chain || chain.answer_child_id !== agentId) return;
       if ("request" in event) {
-        const result = await autoApprove(paseo, agentId, event.request, (JSON.parse(chain.policy_json) as Policy).agents.answerer.permissions, chain.repo_root);
-        if (!result.approved) await publishChainCard(paseo, chain, { permission: permissionCard(agentId, event.request, result.reason) });
+        await answererPermission(paseo, chain, agentId, event.request);
       } else if (chainCard(chain).permission?.requestId === event.requestId) {
         await publishChainCard(paseo, chain, { permission: null });
       }
@@ -1134,19 +1267,39 @@ export function createGate(options: GateOptions): Gate {
     const owned = ledger.child(agentId);
     if (!owned || owned.run.child_agent_id !== agentId || isTerminal(owned.run.status)) return;
     const runId = owned.run.run_id;
-    if ("request" in event) {
-      const result = await autoApprove(paseo, agentId, event.request, specOf(owned.run).permissions, owned.run.repo_root);
-      if (result.approved) {
-        autoApproved.set(runId, (autoApproved.get(runId) ?? 0) + 1);
-        return;
-      }
-      waiting.set(runId, permissionCard(agentId, event.request, result.reason));
-    } else if (waiting.get(runId)?.requestId === event.requestId) {
-      waiting.delete(runId);
-    } else {
+    if ("request" in event) return checkerPermission(paseo, owned.run, agentId, event.request);
+    if (waiting.get(runId)?.requestId !== event.requestId) return;
+    waiting.delete(runId);
+    await publishCard(paseo, owned.run);
+  }
+
+  async function answererPermission(paseo: Paseo, chain: Chain, agentId: string, request: PermissionRequested["request"]): Promise<void> {
+    const permissions = (JSON.parse(chain.policy_json) as Policy).agents.answerer.permissions;
+    const result = await autoApprove(paseo, agentId, request, permissions, chain.repo_root);
+    if (!result.approved) await publishChainCard(paseo, chain, { permission: permissionCard(agentId, request, result.reason) });
+  }
+
+  async function checkerPermission(paseo: Paseo, run: Run, agentId: string, request: PermissionRequested["request"]): Promise<void> {
+    const result = await autoApprove(paseo, agentId, request, specOf(run).permissions, run.repo_root);
+    if (result.approved) {
+      autoApproved.set(run.run_id, (autoApproved.get(run.run_id) ?? 0) + 1);
       return;
     }
-    await publishCard(paseo, owned.run);
+    waiting.set(run.run_id, permissionCard(agentId, request, result.reason));
+    await publishCard(paseo, run);
+  }
+
+  /**
+   * `waiting` lives in memory: after a restart (or a missed event) a child's open request would have no card
+   * and no buttons, and the child would sit until its timeout. Rebuilds it from the agent's own state.
+   */
+  async function restorePermissions(paseo: Paseo, run: Run, agent: AgentSnapshot): Promise<void> {
+    const shown = waiting.get(run.run_id);
+    const open = agent.pendingPermissions;
+    if (shown && open.some((request) => request.id === shown.requestId)) return;
+    if (shown) waiting.delete(run.run_id);
+    if (open.length > 0) return checkerPermission(paseo, run, agent.id, open[0]);
+    if (shown) await publishCard(paseo, run);
   }
 
   function permissionCard(agentId: string, request: PermissionRequested["request"], reason: string | null): PermissionCard {
@@ -1182,6 +1335,10 @@ export function createGate(options: GateOptions): Gate {
 
   async function reconcileRun(paseo: Paseo, run: Run): Promise<void> {
     if (run.status === "DISPATCHING") {
+      // A dispatch that keeps failing before its child exists (refresh or config errors) is retried here,
+      // but not forever: without a payload there is no deadline yet, so count from the last state change.
+      const deadline = run.deadline_at ?? run.updated_at + timeoutOf(run);
+      if (now() > deadline) return fail(paseo, run, `could not start the ${checkOf(run)} agent within ${Math.round(timeoutOf(run) / 60000)} minutes`);
       if (run.dispatch_json) return createChild(paseo, run);
       return dispatch(paseo, run);
     }
@@ -1195,6 +1352,7 @@ export function createGate(options: GateOptions): Gate {
         const waitingOn = agent.pendingPermissions.length > 0 ? " (a permission request was not answered)" : "";
         return fail(paseo, run, `timed out after ${Math.round(timeoutOf(run) / 60000)} minutes${waitingOn}`);
       }
+      if (run.status === "REVIEWING") await restorePermissions(paseo, run, agent);
       return;
     }
     // ponytail: only the last 500 items are searched; a fix turn longer than that would look unsent
@@ -1213,7 +1371,7 @@ export function createGate(options: GateOptions): Gate {
       const verdict = JSON.parse(run.result_json ?? "null") as Verdict | null;
       if (!verdict) return fail(paseo, run, "fix round lost its findings");
       const policy = JSON.parse(run.policy_json) as Policy;
-      await paseo.agents.ref(run.source_agent_id).send(buildFixPrompt(verdict, run.round, maxFixRounds(policy)), {
+      await paseo.agents.ref(run.source_agent_id).send(buildFixPrompt(verdict, run.round, maxFixRounds(policy), concurrentOf(run)), {
         messageId: expected,
       });
       return;
@@ -1249,6 +1407,14 @@ export function createGate(options: GateOptions): Gate {
     if (child.status === "running" || child.status === "initializing") {
       if (chain.answer_deadline_at !== null && now() > chain.answer_deadline_at) {
         return needsUser(paseo, await cancelChainWork(paseo, chain), undefined, "the answerer timed out");
+      }
+      // The card keeps its permission in the ledger, but a request that arrived while the plugin was down has none.
+      const shown = chainCard(chain).permission;
+      const open = child.pendingPermissions;
+      if (open.length > 0 && !open.some((request) => request.id === shown?.requestId)) {
+        await answererPermission(paseo, chain, childId, open[0]);
+      } else if (open.length === 0 && shown) {
+        await publishChainCard(paseo, chain, { permission: null });
       }
       return;
     }

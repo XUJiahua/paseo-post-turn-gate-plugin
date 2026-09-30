@@ -23,7 +23,13 @@ export function buildGatePrompt(input: {
   baseTree: string;
   endTree: string;
   instructions?: string;
+  concurrentAgents?: readonly string[];
 }): string {
+  const concurrent = input.concurrentAgents?.length
+    ? `\nOther agents (${input.concurrentAgents.join(", ")}) were working in this repository at the same time, so the diff
+may include their changes and the working tree may change while you check. Judge only changes that belong to the
+request; say in the summary when build or test results may have been disturbed by concurrent work.\n`
+    : "";
   const extra = input.instructions?.trim()
     ? `\nAdditional instructions from the repository policy:\n<<<INSTRUCTIONS\n${input.instructions.trim()}\nINSTRUCTIONS>>>\n`
     : "";
@@ -32,7 +38,7 @@ ${extra}
 Repository: ${input.repoRoot}
 Inspect the change with: git -C ${JSON.stringify(input.repoRoot)} diff ${input.baseTree} ${input.endTree}
 (The two shas are tree snapshots of the working directory before and after the change, including uncommitted files.)
-
+${concurrent}
 Original request:
 <<<REQUEST
 ${input.requestText}
@@ -49,7 +55,12 @@ Reply with ONLY one JSON object, no prose and no code fence, in exactly this sha
 {"verdict":"PASS|FAIL|INCONCLUSIVE","summary":"...","findings":[{"severity":"CRITICAL|HIGH|MEDIUM|LOW","title":"...","evidence":"...","suggested_fix":"..."}]}`;
 }
 
-export function buildFixPrompt(verdict: Verdict, round: number, maxFixRounds: number): string {
+export function buildFixPrompt(
+  verdict: Verdict,
+  round: number,
+  maxFixRounds: number,
+  concurrentAgents: readonly string[] = [],
+): string {
   const findings = verdict.findings
     .map(
       (finding, index) =>
@@ -63,7 +74,12 @@ Summary: ${verdict.summary}
 Findings:
 ${findings || "(none listed)"}
 
-Fix the CRITICAL and HIGH findings, then stop. The change will be reviewed again automatically.`;
+Fix the CRITICAL and HIGH findings, then stop. The change will be reviewed again automatically.${
+    concurrentAgents.length
+      ? `\n\nOther agents were changing this repository at the same time. Fix only findings caused by your own changes;
+for a finding in someone else's work, say so instead of changing their code.`
+      : ""
+  }`;
 }
 
 /** Concatenated assistant text after the latest user message (providers may split one reply into chunks). */
@@ -128,9 +144,15 @@ export function parseJsonReply<Schema extends ZodType>(text: string, schema: Sch
   return null;
 }
 
-/** Never treated as PASS when null. */
+/**
+ * Never treated as PASS when null. A CRITICAL/HIGH finding makes the verdict FAIL whatever the model
+ * wrote, as the prompt's rule says; a blocking finding under PASS would otherwise slip through.
+ */
 export function parseVerdict(text: string): Verdict | null {
-  return parseJsonReply(text, verdictSchema);
+  const verdict = parseJsonReply(text, verdictSchema);
+  if (!verdict || verdict.verdict === "FAIL") return verdict;
+  const blocking = verdict.findings.some((finding) => finding.severity === "CRITICAL" || finding.severity === "HIGH");
+  return blocking ? { ...verdict, verdict: "FAIL" } : verdict;
 }
 
 export function parseAnswer(text: string): AnswerReply | null {

@@ -83,7 +83,7 @@
 | 启动时恢复 | 启动时拿不到 `paseo`（V1） | 懒恢复（§9） |
 | 先建无 Prompt 子 Agent 再 `send` | `outputSchema` 只随初始 prompt 生效，这样做会丢掉它，还多一次竞态 | 预分配 `agentId`，先写 ledger，再带 prompt 和 `outputSchema` 一次创建（V8–V11） |
 | YAML 策略 | 需要依赖和 build 步骤 | 改用 JSON：`JSON.parse` + zod（zod 由宿主提供），零依赖，无 build |
-| “Reviewer 不得修改代码” | 各 provider 的只读手段各不相同（kiro 需要单独配置 agent，拒绝权限还会终止整轮，见 K6–K8）；而且 Verify 本身需要跑构建和测试 | 不强制只读，只在 prompt 中要求。review 前后对比 tree，发现改动时在卡片上**警告**并附 diffstat（§5） |
+| “Reviewer 不得修改代码” | 各 provider 的只读手段各不相同（kiro 需要单独配置 agent，拒绝权限还会终止整轮，见 K6–K8）；而且 Verify 本身需要跑构建和测试 | 不强制只读，只在 prompt 中要求。review 前后对比 tree，发现改动时丢弃 verdict、转 `NEEDS_HUMAN` 并附 diffstat，不回滚（§5） |
 | 一个 turn 就 review 一次 | 调度型根 Agent 每轮都会触发 | `turn_started` 记录 git 基线，工作区没有变化就跳过 |
 | fix 轮当作新 turn | 会产生新的 run，并重新读策略 | fix 消息带 `messageId = ptg:<run_id>:fix:<n>`（V6），据此归入原 run |
 | 直接 `send` fix | 会打断用户（V5） | 源 Agent 不是 `idle` 就判 `SUPERSEDED` |
@@ -254,8 +254,9 @@ dispatch(run, round):
 finalizeReview(run, outcome, childTimeline):
   run 已是终态 → 忽略
   outcome ≠ completed → ERROR("reviewer turn <kind>")
-  afterTree ≠ end_tree → 记录 reviewer_changes = git diff --stat end_tree afterTree（只警告，不改判）
+  afterTree ≠ end_tree → 记录 reviewer_changes = git diff --stat end_tree afterTree，丢弃 verdict → NEEDS_HUMAN（不回滚）
   解析最后一条 assistant_message 为 Verdict；失败 → ERROR（不得当作 PASS）
+  verdict 不是 FAIL 但有 CRITICAL/HIGH finding → 按 FAIL 处理（prompt 的判定规则由代码执行）
   PASS / INCONCLUSIVE:
     done 列表里还有下一项检查 → step+1，dispatch 下一项
     否则 → 本轮有 INCONCLUSIVE 则 INCONCLUSIVE，全部 PASS 则 PASSED
@@ -299,9 +300,8 @@ Reviewer 不强制只读，与源 Agent 采用相同的权限模型：
 
 - **能力**：继承源 Agent 的 mode，Verify 可以正常运行构建和测试。构建产物通常位于被 git 忽略的目录，不计入 tree，不会误报。
 - **约束**：prompt 中明确要求不要修改文件。
-- **检测**：review 前后对比 tree（§4.4）。发生变化时，卡片显示 “Reviewer 修改了 N 个文件” 和 diffstat，verdict 照常采用（K12 已在 kiro 上实测）。
-  - report 模式：改动留在工作区，由用户决定是否保留；
-  - fix 模式：下一轮的 `end_tree` 在修复轮结束后重新计算，Reviewer 的改动会一起进入下一次 review 的 diff 范围，不会被遗漏。
+- **检测**：review 前后对比 tree（§4.4，K12 已在 kiro 上实测）。发生变化时 verdict 作废：改了代码的检查者不再独立（可能自己“修好”再报 PASS），fix 模式下这些改动还会算进源 Agent 的下一轮 diff。run 转 `NEEDS_HUMAN`，卡片显示 diffstat；插件不回滚，由用户决定保留哪些改动。未被 git 忽略的构建产物也会触发这一条，应当加进 `.gitignore`。
+  - Answerer 同理：派发时记录 tree，结束时 tree 变了就不发送答案，把问题交给用户。
 - **权限请求**：默认自动处理（`agents.<role>.permissions: "auto"`）。引入 gate 的目的就是减少人工反复确认，因此：
   - 常规工具调用（读文件、搜索、构建、跑测试、仓库内编辑）由插件以 `allow_once` 自动批准，不留长期授权；
   - 不可逆、对外、提权、涉及凭据的请求（`rm -rf`、`git push/reset --hard`、`sudo`、发布、云/部署工具、`curl | sh`、破坏性 SQL、仓库外路径、`.env`/私钥等），以及 plan、question、mode 类请求，不自动批准，显示在卡片上，附带原因和按钮，由用户决定；
@@ -338,6 +338,8 @@ REVIEWING | FIXING ── 用户插话 / fix 轮被取消 ──→ SUPERSEDED
 - `round` 从 1 开始，表示第几次 review；`step` 表示本轮进行到 `done` 列表的第几项检查。
 - 每项检查的截止时间在 dispatch 时设为 `agents.<role>.timeout_minutes`（默认 30 分钟），包括等待授权的时间，不会顺延（turn-outcomes.md §7.3）。子 Agent 等待授权期间 `status` 仍是 `running`（K11），超时时若 `pendingPermissions` 非空，错误信息写明 “a permission request was not answered”。
 - `FIXING` 没有截止时间：修复由源 Agent 完成，不受角色超时约束。修复轮结束时照常重新检查。
+- `DISPATCHING` 还没写入派发参数时（例如 `refresh`、`config.get` 一直失败），对账从最后一次状态变化起算同一个超时，到期转 `ERROR`，不会无限重试。
+- 等待中的权限请求只保存在内存里。对账时若 reviewer 仍在运行，按它的 `pendingPermissions` 重新走自动批准或重新上卡；answerer 同理。插件重启后按钮会回到卡片上。
 
 ## 8. Ledger（`node:sqlite`）
 
@@ -363,7 +365,8 @@ CREATE TABLE gate_runs (
   deadline_at     INTEGER,
   verdict         TEXT,
   result_json     TEXT,
-  reviewer_changes TEXT,             -- Reviewer 改动的 diffstat
+  reviewer_changes TEXT,             -- 检查期间工作区改动的 diffstat（有则 verdict 作废）
+  concurrent_agents TEXT,            -- 与本任务重叠运行、同一仓库的其他 Agent id（JSON 数组）
   rounds_json     TEXT NOT NULL DEFAULT '[]',
   error           TEXT,
   created_at      INTEGER NOT NULL,  -- epoch 毫秒
