@@ -477,7 +477,7 @@ describe("dispatch and report", () => {
   });
 
   test("init --force regenerates the policy but keeps customized role rules", () => {
-    const init = (...args: string[]) => execFileSync(process.execPath, ["bin/post-turn-gate-init.mjs", "--dir", repo, ...args]);
+    const init = (...args: string[]) => execFileSync(process.execPath, ["bin/post-turn-gate-init.mjs", "--v2", "--dir", repo, ...args]);
     init();
     const rules = path.join(repo, ".paseo/post-turn-gate/reviewer.md");
     writeFileSync(rules, "- Money is integer cents.\n");
@@ -488,8 +488,28 @@ describe("dispatch and report", () => {
     assert.equal(readFileSync(rules, "utf8"), "- Money is integer cents.\n");
   });
 
-  test("npm run init writes active repository instructions for every role", async () => {
+  test("npm run init writes a version 3 setup whose decider reads decider.md", async () => {
     execFileSync(process.execPath, ["bin/post-turn-gate-init.mjs", "--dir", repo]);
+    for (const role of ["reviewer", "verifier", "decider"]) {
+      const active = readFileSync(path.join(repo, `.paseo/post-turn-gate/${role}.md`), "utf8").replace(/<!--[\s\S]*?-->/g, "").trim();
+      assert.notEqual(active, "", `${role}.md must contain active instructions`);
+    }
+    await sourceTurn({ change: edit, messageId: "a" });
+    const verifier = fake.created.find((create) => create.labels["post-turn-gate.role"] === "verifier");
+    assert.ok(verifier, "the checks start at once");
+    const policy = JSON.parse(readFileSync(path.join(repo, ".paseo/post-turn-gate.json"), "utf8"));
+    assert.equal(policy.supervision.reply_delay_seconds, 60, "the decider waits for the grace period");
+    await childTurn(verifier!.agentId, PASS);
+    await childTurn(fake.created.find((create) => create.labels["post-turn-gate.role"] === "reviewer")!.agentId, PASS);
+    clock += 61_000;
+    gate.reconcile(fake.paseo);
+    await gate.idle();
+    const decider = fake.created.find((create) => create.labels["post-turn-gate.role"] === "decider");
+    assert.match(decider!.prompt, /# Repository decider instructions/);
+  });
+
+  test("npm run init --v2 writes active repository instructions for every role", async () => {
+    execFileSync(process.execPath, ["bin/post-turn-gate-init.mjs", "--v2", "--dir", repo]);
     for (const role of ["reviewer", "verifier", "answerer"]) {
       const template = readFileSync(path.join(repo, `.paseo/post-turn-gate/${role}.md`), "utf8");
       const active = template.replace(/<!--[\s\S]*?-->/g, "").trim();

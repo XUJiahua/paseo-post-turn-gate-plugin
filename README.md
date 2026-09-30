@@ -37,16 +37,17 @@ npx --yes --package=git+https://github.com/XUJiahua/paseo-post-turn-gate-plugin.
 This downloads and runs the repository's initializer, so review or pin the source when needed (for example, append `#<tag-or-commit>` to the Git URL). From a local checkout, the equivalent commands are:
 
 ```bash
-npm run init -- --dir /path/to/repo                            # every field with its default
-npm run init -- --dir /path/to/repo --check verify,review --fix 3  # the same, with these choices applied
-npm run init -- --dir /path/to/repo --report                   # report failures instead of fixing them
-npm run init -- --stdout                                       # print the policy instead of writing
+npm run init -- --dir /path/to/repo                    # version 3: a decider answers for you, every field with its default
+npm run init -- --dir /path/to/repo --check review     # the same, reviewing code quality only
+npm run init -- --dir /path/to/repo --v2 --fix 3       # version 2: fixed fix rounds and answer limits
+npm run init -- --dir /path/to/repo --v2 --report      # version 2, reporting failures instead of fixing them
+npm run init -- --stdout                               # print the policy instead of writing
 ```
 
 The initializer writes four files:
 
 - `.paseo/post-turn-gate.json`: every field with its default value. Tests keep the initializer output aligned with the plugin schema. A field you delete falls back to the same default.
-- `.paseo/post-turn-gate/reviewer.md`, `verifier.md`, `answerer.md`: active repository instructions for each role. The short HTML comment is editing guidance and is ignored; the Markdown below it is included in every role prompt. Customize and commit these files with the project. See [Choosing the agents](#choosing-the-agents).
+- `.paseo/post-turn-gate/reviewer.md`, `verifier.md`, `decider.md` (`answerer.md` with `--v2`): active repository instructions for each role. The short HTML comment is editing guidance and is ignored; the Markdown below it is included in every role prompt. Customize and commit these files with the project. See [Choosing the agents](#choosing-the-agents).
 
 It refuses to overwrite an existing policy unless you pass `--force`, and never overwrites an existing role rules file (delete one to regenerate its template); `post-turn-gate-init --help` or `npm run init -- --help` lists all options.
 
@@ -55,7 +56,7 @@ It refuses to overwrite an existing policy unless you pass `--force`, and never 
 You can give a coding agent the provider-neutral setup task template in
 [docs/install-with-agent.md](docs/install-with-agent.md), after replacing its target-repository placeholders. It tells
 the agent how to install the plugin, preserve an existing setup, inspect authoritative project files, and write
-distinct repository-specific rules for the reviewer, verifier and answerer. It also keeps sensitive and behavioral
+distinct repository-specific rules for the reviewer, verifier and decider. It also keeps sensitive and behavioral
 decisions with the user.
 
 To print the same task with an absolute target path filled in:
@@ -67,6 +68,50 @@ npx --yes --package=git+https://github.com/XUJiahua/paseo-post-turn-gate-plugin.
 
 Paste that output into the coding agent which can access the target repository. The setup turn itself is not gated:
 policy and rules are captured when a turn starts, so the plugin takes effect on the next turn that changes files.
+
+## Version 3: a decider answers for you (default)
+
+After every turn that did work, a decider agent stands in for you: it looks at what the agent did and said, and
+replies to it. When the task changed files, the checks (verifier, reviewer) start at once, while the decider waits
+for the grace period and plans; it then sends one message that covers the findings to fix and the agent's question,
+and repeats until the checks pass. You get one card per round. It hands the task to you only for key decisions:
+product trade-offs, anything irreversible or outward-facing, credentials, information only you have, a finding the
+agent disputes, checker trouble (a denied permission, edits to the tree), or a used-up budget.
+
+```json
+{
+  "version": 3,
+  "trigger": "root_and_opt_in",
+  "supervision": {
+    "checks": ["verify", "review"],
+    "speculative_checks": true,
+    "reply_delay_seconds": 60,
+    "budget": { "max_auto_sends": 12, "max_retries": 3, "max_no_progress_rounds": 2, "max_minutes": 120 }
+  },
+  "agents": { "decider": {}, "verifier": {}, "reviewer": {} }
+}
+```
+
+| Field | Meaning | Default |
+|---|---|---|
+| `supervision.checks` | the checks the decider can rely on, in order | `["verify", "review"]` |
+| `supervision.speculative_checks` | start the checks together with the decider instead of after its plan | `true` |
+| `supervision.reply_delay_seconds` | grace period after a turn: a reply from you in that time cancels the round | `60` |
+| `supervision.budget.max_auto_sends` | messages the plugin may send for one task (replies and retries); your own message starts a new budget | `12` |
+| `supervision.budget.max_retries` | automatic retries after crashes, network errors and rate limits (30s, 2min, 8min); then the decider looks at the failure | `3` |
+| `supervision.budget.max_no_progress_rounds` | rounds in a row that end on the same tree before the task comes to you | `2` |
+| `supervision.budget.max_minutes` | minutes of automation per task | `120` |
+| `agents.decider`, `verifier`, `reviewer` | the same settings as [below](#choosing-the-agents); `decider.md` falls back to `answerer.md` | inherit the source agent |
+
+Code enforces the limits the decider cannot talk its way around: "done" on changed files needs a PASS on the current
+tree, a FAIL stands until a change passes it (the checkers never see the agent's arguments), replies that would
+approve a risky action are not sent, and every message goes out only while the agent is idle. Design and status:
+[docs/completion-supervisor.md](docs/completion-supervisor.md). Verified end to end with the `kiro` provider.
+
+## Version 2 (`--v2`)
+
+A version 2 policy checks a finished turn, sends findings back for a fixed number of rounds, and answers questions
+up to a fixed limit; everything else comes to you.
 
 | Field | Values | Default |
 |---|---|---|
@@ -172,14 +217,6 @@ Every turn of a gated agent is sorted into a category, and `on_outcome` in the p
 - **Permissions:** by default, routine requests from these agents (reading, building, testing, edits inside the repo) are approved automatically, one at a time. Risky requests (`rm -rf`, `git push` including `git -C <dir> push`, `sudo`, publishing, deploy tools, secrets, paths outside the repo) are shown on the card with a reason and Yes/No buttons. A cloud or deploy tool named anywhere in a command asks you, whatever prefix runs it (`timeout 60 aws …`); only read-only commands such as `cat`, `grep` and `ls` are exempt, so `cat src/aws/client.ts` does not ask. Set `"permissions": "ask"` on a role to answer every request yourself.
 - **Where to find them:** while running, a child agent is listed under the source agent's **Subagents**; when finished it is archived and can be opened from **History**. From a terminal, `paseo logs <id> -f` follows a running one and `paseo logs <id>` shows a finished one; the card prints the command with the id.
 - **Where state lives:** in `${PASEO_HOME:-~/.paseo}/plugin-data/post-turn-gate/ledger.sqlite`.
-
-## Preview: version 3 (decider)
-
-A `version: 3` policy replaces fixed fix templates and answer limits with a decider agent that answers for you after every turn that did work: the checks run while it plans, and it sends one message that covers the findings and the agent's question, until the checks pass. It hands over only for key decisions (trade-offs, risky or outward actions, credentials, disputed findings, used-up budget). `post-turn-gate-init --supervise` writes it with every default and a `decider.md` rules template; see [docs/completion-supervisor.md](docs/completion-supervisor.md) §15 and §19.1:
-
-```json
-{ "version": 3, "supervision": { "checks": ["verify", "review"] } }
-```
 
 ## Develop
 

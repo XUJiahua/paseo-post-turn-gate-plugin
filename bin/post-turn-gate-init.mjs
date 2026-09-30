@@ -76,12 +76,13 @@ const SUPERVISED_POLICY = {
 const USAGE = `Usage: post-turn-gate-init [options]
 
 Options:
-  --check <list>   checks for a finished task, in order, comma-separated: review (code quality, default),
-                   verify (the change delivers the request), e.g. verify,review
-  --fix <rounds>   fix rounds after a failed check, 1-5 (default: 2)
-  --report         report a failed check instead of sending it back to the agent
-  --supervise      preview: write a version 3 policy, where a decider agent answers for you after every turn
-                   that did work (--check applies; default verify,review)
+  --check <list>   checks, in order, comma-separated: verify (the change delivers the request), review (code
+                   quality); default verify,review (with --v2: review)
+  --v2             write a version 2 policy: checks after a finished turn, fixed fix rounds and answer limits,
+                   instead of a decider agent that answers for you after every turn that did work
+  --fix <rounds>   --v2 only: fix rounds after a failed check, 1-5 (default: 2)
+  --report         --v2 only: report a failed check instead of sending it back to the agent
+  --supervise      the default (version 3); kept for compatibility
   --dir <path>     repository to write into (default: current directory; the git root is used)
   --force          overwrite an existing policy file (role rules files are never overwritten)
   --stdout         print the policy instead of writing files
@@ -150,6 +151,7 @@ const { values } = parseArgs({
   options: {
     check: { type: "string" },
     supervise: { type: "boolean", default: false },
+    v2: { type: "boolean", default: false },
     fix: { type: "string" },
     report: { type: "boolean", default: false },
     dir: { type: "string", default: process.cwd() },
@@ -180,13 +182,15 @@ if (values["agent-prompt"]) {
   process.exit(0);
 }
 
-const checkText = values.check ?? (values.supervise ? "verify,review" : "review");
+if (values.v2 && values.supervise) fail("--v2 and --supervise exclude each other");
+const supervise = !values.v2;
+const checkText = values.check ?? (supervise ? "verify,review" : "review");
 const checks = checkText.split(",").map((check) => check.trim());
 if (!checks.every((check) => check === "review" || check === "verify") || new Set(checks).size !== checks.length) {
   fail(`--check takes review and/or verify once each, got "${checkText}"\n\n${USAGE}`);
 }
-if (values.supervise && (values.report || values.fix !== undefined)) {
-  fail("--supervise replaces --fix and --report: the decider handles failed checks within the task budget");
+if (supervise && (values.report || values.fix !== undefined)) {
+  fail("--fix and --report need --v2: in version 3 the decider handles failed checks within the task budget");
 }
 if (values.report && values.fix !== undefined) fail("--fix and --report exclude each other");
 const rounds = values.fix === undefined ? null : Number(values.fix);
@@ -194,8 +198,8 @@ if (rounds !== null && (!Number.isInteger(rounds) || rounds < 1 || rounds > 5)) 
   fail(`--fix must be an integer from 1 to 5, got "${values.fix}"`);
 }
 
-const policy = JSON.parse(JSON.stringify(values.supervise ? SUPERVISED_POLICY : DEFAULT_POLICY));
-if (values.supervise) {
+const policy = JSON.parse(JSON.stringify(supervise ? SUPERVISED_POLICY : DEFAULT_POLICY));
+if (supervise) {
   policy.supervision.checks = checks;
 } else {
   policy.on_outcome.done = checks;
@@ -220,7 +224,7 @@ try {
 }
 
 const files = [[POLICY_PATH, text]];
-for (const name of values.supervise ? ["reviewer", "verifier", "decider"] : ROLES) {
+for (const name of supervise ? ["reviewer", "verifier", "decider"] : ROLES) {
   files.push([policy.agents[name].instructions_file, TEMPLATES[name]]);
 }
 // Role rules are the project's own work: an existing rules file is always kept. Only the policy is

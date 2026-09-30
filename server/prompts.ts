@@ -12,12 +12,39 @@ and maintainability issues. Report only real, evidenced problems.`,
 } as const;
 
 // The user reads these texts on the card, so they follow the request's language; a policy instruction can override it.
-// A real kiro run answered an English request in Spanish and Chinese under the looser "language of the original
-// request", so the rule names the text to take the language from.
-const LANGUAGE_RULE = `Write the free-text JSON values (summary, question, answer, message, reason, title, evidence,
-  suggested_fix) in the language the user wrote the request in: the text between <<<REQUEST and REQUEST>>>, not
-  these instructions (always English) and not your own habits. Additional instructions naming another language win.
-  Keep JSON keys, enum values, code, paths and commands as they are.`;
+// Real kiro runs answered English requests in Spanish and Chinese when told "the language of the request", so the
+// rule names the language when it can tell.
+const LANGUAGE_BASE = `Keep JSON keys, enum values, code, paths and commands as they are. Additional instructions naming
+  another language win.`;
+
+/** Labels and wrappers the plugin adds to request text; they are not the user's words. */
+const PLUGIN_LABELS = /Earlier messages from the user in this conversation \(context only\):|Request:|Follow-up from the user:|Answered on the user's behalf:|\[post-turn gate answered on your behalf\]|\[… \d+ characters omitted …\]/g;
+
+/**
+ * The language the user wrote in, when a cheap check can tell; null otherwise.
+ * ponytail: script ranges plus a short English word list; other Latin-script languages get the generic rule.
+ */
+export function requestLanguage(requestText: string): string | null {
+  const text = requestText.replace(PLUGIN_LABELS, " ").replace(/`[^`]*`/g, " ");
+  const scripts: Array<[string, RegExp]> = [
+    ["Japanese", /[\u3040-\u30ff]/g],
+    ["Korean", /[\uac00-\ud7af]/g],
+    ["Chinese", /[\u4e00-\u9fff]/g],
+    ["Russian", /[\u0400-\u04ff]/g],
+  ];
+  for (const [name, pattern] of scripts) if ((text.match(pattern)?.length ?? 0) >= 2) return name;
+  const english = text.match(/\b(the|and|to|of|a|an|in|is|it|that|for|with|when|should|add|fix|make|write|me|you|this|please)\b/gi);
+  return (english?.length ?? 0) >= 2 ? "English" : null;
+}
+
+export function languageRule(requestText: string): string {
+  const language = requestLanguage(requestText);
+  const target = language
+    ? `in ${language}, the language the user wrote the request in`
+    : "in the language the user wrote the request in (the text between <<<REQUEST and REQUEST>>>), not the language of these instructions";
+  return `Write the free-text JSON values (summary, question, answer, message, reason, title, evidence, suggested_fix)
+  ${target}. ${LANGUAGE_BASE}`;
+}
 
 export function buildGatePrompt(input: {
   action: "verify" | "review";
@@ -56,7 +83,7 @@ Rules:
   "blocked_permission" (a command or file you needed was denied or not answered), "ambiguous_request" (the
   request does not say what is required), "no_test_infra" (the change has no tests or runnable check that could
   show it works), "env_missing" (credentials, services or tools this machine does not have), or "other".
-- ${LANGUAGE_RULE}
+- ${languageRule(input.requestText)}
 
 Reply with ONLY one JSON object, no prose and no code fence, in exactly this shape:
 {"verdict":"PASS|FAIL|INCONCLUSIVE","summary":"...","findings":[{"severity":"CRITICAL|HIGH|MEDIUM|LOW","title":"...","evidence":"...","suggested_fix":"..."}],"inconclusive_reason":null}`;
@@ -242,7 +269,7 @@ stays inside this repository, and stays within the scope of the original request
   offers to implement);
 - you are not confident.
 For "incomplete", "refused" and "done", use decision "answer" with an empty answer.
-${LANGUAGE_RULE}
+${languageRule(input.requestText)}
 
 Reply with ONLY one JSON object, no prose and no code fence:
 {"state":"awaiting_user|incomplete|refused|done","question":"<the question, verbatim or summarized>","decision":"answer|escalate","answer":"<reply to send to the agent>","reason":"<one sentence>"}`;
@@ -345,7 +372,7 @@ Plan the next step:
 ${ESCALATE_RULES}
 
 ${REPLY_RULES}
-${LANGUAGE_RULE}
+${languageRule(input.requestText)}
 
 Reply with ONLY one JSON object, no prose and no code fence:
 {"assessment":"done|incomplete|awaiting_user|refused","question":"<the agent's question, if any>","workers":["verify","review"],"reply_now":null}`;
@@ -365,7 +392,7 @@ work is not done: send what to fix or add, together with the answer to the agent
 ${ESCALATE_RULES}
 
 ${REPLY_RULES}
-${LANGUAGE_RULE}
+${languageRule(input.requestText)}
 
 Reply with ONLY one JSON object, no prose and no code fence:
 {"kind":"send|done|escalate","message":"<the message for the agent>","answers_question":false,"question":"","reason":"<one sentence>"}`;

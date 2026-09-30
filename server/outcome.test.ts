@@ -218,7 +218,7 @@ describe("on_outcome schema", () => {
 
   test("npm run init writes every field with its default, plus the chosen options", () => {
     const run = (...args: string[]) =>
-      JSON.parse(execFileSync(process.execPath, ["bin/post-turn-gate-init.mjs", "--stdout", ...args], { encoding: "utf8" }));
+      JSON.parse(execFileSync(process.execPath, ["bin/post-turn-gate-init.mjs", "--stdout", "--v2", ...args], { encoding: "utf8" }));
     const defaults = run();
     assert.deepEqual(defaults, policySchema.parse({ version: 2 }));
     assert.deepEqual(defaults.on_fail, { fix: { max_rounds: 2 } });
@@ -233,9 +233,11 @@ describe("on_outcome schema", () => {
     assert.throws(() => run("--check", "review,review"), /Command failed/);
   });
 
-  test("npm run init --supervise writes a version 3 policy with every default", () => {
+  test("npm run init writes a version 3 policy with every default", () => {
     const run = (...args: string[]) =>
-      JSON.parse(execFileSync(process.execPath, ["bin/post-turn-gate-init.mjs", "--stdout", "--supervise", ...args], { encoding: "utf8" }));
+      JSON.parse(execFileSync(process.execPath, ["bin/post-turn-gate-init.mjs", "--stdout", ...args], { encoding: "utf8" }));
+    assert.deepEqual(run("--supervise"), run(), "--supervise is the default");
+    assert.throws(() => run("--v2", "--supervise"), /Command failed/);
     const written = run();
     assert.equal(written.version, 3);
     assert.deepEqual(written.supervision, supervisionSchema.parse({}));
@@ -256,7 +258,7 @@ describe("on_outcome schema", () => {
     assert.match(prompt, /Never use `--force`/);
     assert.match(prompt, /reviewer\.md/);
     assert.match(prompt, /verifier\.md/);
-    assert.match(prompt, /answerer\.md/);
+    assert.match(prompt, /decider\.md/);
     assert.match(prompt, /next agent turn/i);
     assert.match(prompt, /exact installed plugin checkout/i);
     assert.match(prompt, /does not contain.*bin\/post-turn-gate-init\.mjs.*stop/is);
@@ -271,4 +273,13 @@ describe("on_outcome schema", () => {
       /Command failed/,
     );
   });
+});
+
+test("requestLanguage names the language of the user's words, not the plugin's labels", async () => {
+  const { requestLanguage } = await import("./prompts.ts");
+  assert.equal(requestLanguage("Add a function mul(a, b) to add.js that returns a * b."), "English");
+  assert.equal(requestLanguage("阅读最新的代码，修正这份设计文档"), "Chinese");
+  assert.equal(requestLanguage("Request:\n修正文档\n\nFollow-up from the user: 好的"), "Chinese");
+  assert.equal(requestLanguage("Añade una función que multiplique dos números."), null);
+  assert.equal(requestLanguage("`npm test`"), null);
 });
