@@ -41,6 +41,7 @@ function createFakePaseo() {
   const cards = new Map<string, CardData>();
   const cardAppends: Array<{ agentId: string; id: string; data: CardData }> = [];
   let failCreate = false;
+  let createBarrier: Promise<void> | null = null;
   const keys = new Map<string, string>();
   const profiles: Array<Record<string, unknown>> = [];
   const api = {
@@ -75,6 +76,7 @@ function createFakePaseo() {
         agents: {
           create: async (options: Record<string, any>) => {
             created.push({ workspaceId, ...options });
+            if (createBarrier) await createBarrier;
             if (failCreate) throw new Error("provider unavailable");
             // Like the daemon (design.md V9): a key replays only its own payload.
             const payload = JSON.stringify(options);
@@ -108,6 +110,10 @@ function createFakePaseo() {
     profiles,
     setFailCreate: (value: boolean) => {
       failCreate = value;
+    },
+    /** Holds every agents.create until the promise resolves (another repository's slow work). */
+    setCreateBarrier: (barrier: Promise<void> | null) => {
+      createBarrier = barrier;
     },
   };
 }
@@ -1362,6 +1368,58 @@ describe("version 3: the decider answers after every turn that did work", () => 
     writePolicy({ version: 3, supervision: { bogus: 1 } });
     await sourceTurn({ change: edit });
     assert.match(configCard()!.error ?? "", /supervision/);
+  });
+});
+
+describe("several repositories share the plugin", () => {
+  test("a turn's baseline is taken when it starts, even while another repository's work holds the queue", async () => {
+    writePolicy({ version: 2 });
+    const other = mkdtempSync(path.join(tmpdir(), "ptg-other-"));
+    try {
+      execFileSync("git", ["init", "-q", "-b", "main"], { cwd: other });
+      writeFileSync(path.join(other, "b.txt"), "one\n");
+      mkdirSync(path.join(other, ".paseo"));
+      writeFileSync(path.join(other, ".paseo/post-turn-gate.json"), JSON.stringify({ version: 2 }));
+      execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "add", "."], { cwd: other });
+      execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"], { cwd: other });
+      const agentB = { id: "agent-b", workspaceId: "ws-2", parentAgentId: null, provider: "kiro", cwd: other, title: null };
+      fake.agents.set("agent-b", sourceAgent({ id: "agent-b", workspaceId: "ws-2" }));
+
+      // Repository A's review start hangs (a slow create), so the queue is busy.
+      let release!: () => void;
+      fake.setCreateBarrier(new Promise<void>((resolve) => (release = resolve)));
+      const agentA = hookAgent(SOURCE);
+      gate.onTurnStarted({ agent: agentA, turnId: "a" }, fake.paseo);
+      await gate.idle();
+      edit();
+      const endA = { agent: agentA, turnId: "a", outcome: { kind: "completed" as const }, timeline: [{ type: "user_message", text: "do A", messageId: "a1" }, { type: "assistant_message", text: "Done." }] };
+      gate.onTurnEnded(endA as never, fake.paseo);
+      while (fake.created.length === 0) await new Promise((resolve) => setTimeout(resolve, 20));
+
+      // Repository B's turn starts behind it and changes a file before the queue reaches it.
+      gate.onTurnStarted({ agent: agentB, turnId: "b" }, fake.paseo);
+      await new Promise((resolve) => setTimeout(resolve, 1500)); // the baseline snapshot finishes meanwhile
+      writeFileSync(path.join(other, "b.txt"), "two\n");
+      fake.setCreateBarrier(null);
+      release();
+      await gate.idle();
+      const endB = { agent: agentB, turnId: "b", outcome: { kind: "completed" as const }, timeline: [{ type: "user_message", text: "do B", messageId: "b1" }, { type: "assistant_message", text: "Done." }] };
+      gate.onTurnEnded(endB as never, fake.paseo);
+      await gate.idle();
+      assert.equal(fake.created.filter((create) => create.parent === "agent-b").length, 1, "B's change is checked, not taken into its baseline");
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  test("a turn whose baseline could not be taken says so on a card instead of going unchecked silently", async () => {
+    writePolicy({ version: 2 });
+    writeFileSync(path.join(repo, ".git/index"), "not an index"); // git add -A fails on a corrupt index
+    await sourceTurn({ change: edit });
+    const card = [...fake.cards.entries()].find(([id]) => id.startsWith(`post-turn-gate:snapshot:${SOURCE}:`));
+    assert.ok(card, "an error card");
+    assert.match(card![1].error ?? "", /could not be snapshotted/);
+    assert.equal(fake.created.length, 0);
   });
 });
 

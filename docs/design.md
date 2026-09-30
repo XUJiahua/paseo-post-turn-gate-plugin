@@ -190,6 +190,9 @@ npm run profiles -- --provider codex --model gpt-5.5 --role reviewer --thinking 
 
 ### 4.1 事件处理（全部经过串行队列）
 
+例外：`turn_started` 的基线快照在事件到达时立即开始，不等队列轮到它。队列在处理其他仓库的慢操作时，这一轮的 Agent 可能已经改了文件；等到那时再拍基线，这些改动会被算进基线而永远不被检查。handler 在队列里等待这个快照结果。拍不出基线（git 超时、index 损坏）时，这一轮结束时出一张错误卡片说明未检查，而不是静默跳过。所有 git 调用都有 120 秒超时（`server/git.ts`），一个卡住的仓库不会拖住所有仓库。
+
+
 ```text
 turn_started(agent)
   ├─ agent 是 ledger 中某个 run 的子 Agent → 忽略

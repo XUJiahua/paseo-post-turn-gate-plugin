@@ -244,6 +244,8 @@ export function createGate(options: GateOptions): Gate {
   // ponytail: in memory; after a restart a shown request's wait starts again. Upgrade path: a ledger column.
   const escalatedAt = new Map<string, number>(); // `${agentId}:${requestId}` → when it was put on a card
   const deniedAnswerers = new Set<string>(); // answerer ids whose request was denied after the wait
+  // ponytail: in memory; a failure before a restart is not reported after it (the turn is skipped as before).
+  const snapshotErrors = new Map<string, string>(); // agent id → why its turn's baseline could not be taken
 
   // Agents with a running turn per repository, and the other agents whose turns overlapped theirs. A tree
   // snapshot covers the whole working tree, so overlapping agents' changes end up in each other's diffs.
@@ -368,7 +370,27 @@ export function createGate(options: GateOptions): Gate {
   async function publishConfigError(paseo: Paseo, agentId: string, error: string, policyHash: string, fixed = false): Promise<void> {
     const id = fixed ? ledger.configError(agentId)?.card_id : `post-turn-gate:config:${agentId}:${policyHash.slice(0, 12)}`;
     if (!id) return;
-    const data: CardData = {
+    const data = errorCard(`${POLICY_PATH}: ${error}`, fixed ? "Fixed: the policy is valid again." : null, fixed);
+    if (fixed) ledger.deleteConfigError(agentId);
+    else ledger.setConfigError(agentId, id, error);
+    await paseo.agents.ref(agentId).timeline.append({ type: "plugin", id, kind: CARD_KIND, version: CARD_VERSION, data });
+  }
+
+  /** The working tree could not be snapshotted when the turn started, so its changes are not checked. */
+  async function publishSnapshotError(paseo: Paseo, agentId: string, turnId: string | null, error: string): Promise<void> {
+    log(`not checked ${agentId}: no baseline (${error})`);
+    const data = errorCard(
+      `The working tree could not be snapshotted when this turn started, so its changes were not checked: ${error}`,
+      "A slow or locked git repository is the usual cause; the next turn tries again.",
+    );
+    await paseo.agents
+      .ref(agentId)
+      .timeline.append({ type: "plugin", id: `post-turn-gate:snapshot:${agentId}:${turnId ?? now()}`, kind: CARD_KIND, version: CARD_VERSION, data })
+      .catch((cause) => log("snapshot error card failed", cause));
+  }
+
+  function errorCard(error: string, note: string | null, fixed = false): CardData {
+    return {
       status: "ERROR",
       action: null,
       round: 0,
@@ -382,16 +404,13 @@ export function createGate(options: GateOptions): Gate {
       childAgentId: null,
       childTitle: null,
       reviewerChanges: null,
-      error: truncate(`${POLICY_PATH}: ${error}`, 2000),
+      error: truncate(error, 2000),
       checks: [],
-      note: fixed ? "Fixed: the policy is valid again." : null,
+      note,
       denied: null,
       dispute: null,
       fixed,
     };
-    if (fixed) ledger.deleteConfigError(agentId);
-    else ledger.setConfigError(agentId, id, error);
-    await paseo.agents.ref(agentId).timeline.append({ type: "plugin", id, kind: CARD_KIND, version: CARD_VERSION, data });
   }
 
   async function clearConfigError(paseo: Paseo, agentId: string): Promise<void> {
@@ -1877,7 +1896,16 @@ export function createGate(options: GateOptions): Gate {
     return { snapshot, stale: false };
   }
 
-  async function handleTurnStarted(event: TurnStarted, paseo: Paseo): Promise<void> {
+  /**
+   * Whether a turn start will take a fresh policy and baseline (synchronous ledger reads only). Children of the
+   * plugin and turns that continue a chain reuse a baseline; a turn replacing a running one keeps that one's.
+   */
+  function needsFreshSnapshot(agentId: string): boolean {
+    if (ledger.child(agentId) || ledger.chainChild(agentId) || ledger.chain(agentId)) return false;
+    return !pending.get(agentId)?.policy;
+  }
+
+  async function handleTurnStarted(event: TurnStarted, paseo: Paseo, early: Promise<LoadedPolicy | null> | null = null): Promise<void> {
     const agentId = event.agent.id;
     const owned = ledger.child(agentId);
     const answerer = owned ? null : ledger.chainChild(agentId);
@@ -1895,7 +1923,13 @@ export function createGate(options: GateOptions): Gate {
     }
     // A turn that was running across a restart must keep its baseline if it is being replaced now.
     restorePending(agentId);
-    await snapshotTurn(event, paseo);
+    try {
+      await snapshotTurn(event, paseo, early);
+    } catch (error) {
+      // No baseline for this turn: it cannot be checked. Say so instead of skipping it silently.
+      snapshotErrors.set(agentId, (error as Error).message);
+      throw error;
+    }
     applyCarry(agentId);
     savePending(agentId);
     const snapshot = pending.get(agentId);
@@ -1904,7 +1938,7 @@ export function createGate(options: GateOptions): Gate {
     startActivity(agentId, agentId, snapshot.repoRoot, event.turnId);
   }
 
-  async function snapshotTurn(event: TurnStarted, paseo: Paseo): Promise<void> {
+  async function snapshotTurn(event: TurnStarted, paseo: Paseo, early: Promise<LoadedPolicy | null> | null): Promise<void> {
     const agentId = event.agent.id;
     let chain = liveChain(agentId);
     // The plugin clears these before sending its own answer or retry, so this is always the user.
@@ -1952,7 +1986,7 @@ export function createGate(options: GateOptions): Gate {
       return;
     }
     pending.delete(agentId);
-    const loaded = await loadPending(event.agent.cwd);
+    const loaded = await (early ?? loadPending(event.agent.cwd));
     if (loaded) pending.set(agentId, { ...loaded, turnId: event.turnId, chainId: null });
   }
 
@@ -1989,6 +2023,9 @@ export function createGate(options: GateOptions): Gate {
     const skip = (reason: string) => log(`skip ${agentId}: ${reason}`);
     if (taken.stale) return skip("an older turn ended after a newer one started (replaced)");
     const snapshot = taken.snapshot;
+    const snapshotError = snapshotErrors.get(agentId);
+    snapshotErrors.delete(agentId);
+    if (!snapshot && snapshotError) return publishSnapshotError(paseo, agentId, event.turnId, snapshotError);
     if (!snapshot) return skip("no policy snapshot from turn start (no policy file, not a git repo, or plugin started mid-turn)");
     if (!snapshot.baseTree) return skip("no baseline");
 
@@ -2306,7 +2343,13 @@ export function createGate(options: GateOptions): Gate {
   }
 
   return {
-    onTurnStarted: (event, paseo) => enqueue("turn_started", () => handleTurnStarted(event, paseo)),
+    onTurnStarted: (event, paseo) => {
+      // The baseline is taken now, not when the queue reaches this event: behind another repository's work the
+      // agent may already have changed files, and those changes would land in the baseline unchecked.
+      const early = needsFreshSnapshot(event.agent.id) ? loadPending(event.agent.cwd) : null;
+      early?.catch(() => undefined); // awaited (and reported) by the handler
+      enqueue("turn_started", () => handleTurnStarted(event, paseo, early));
+    },
     onTurnEnded: (event, paseo) => enqueue("turn_ended", () => handleTurnEnded(event, paseo)),
     onPermission: (event, paseo) => enqueue("permission", () => handlePermission(event, paseo)),
     reconcile: (paseo) =>

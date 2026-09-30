@@ -6,10 +6,19 @@ import { promisify } from "node:util";
 
 const run = promisify(execFile);
 
+/**
+ * Every git call is bounded: the plugin runs them in one queue, so a hung call (a stale lock, a slow network file
+ * system) would stall every repository's checks. ponytail: one fixed limit; a huge monorepo's first snapshot may need
+ * more. Upgrade path: a policy field.
+ */
+export const GIT_TIMEOUT_MS = 120_000;
+
 async function git(cwd: string, args: string[], env?: NodeJS.ProcessEnv): Promise<string> {
   const { stdout } = await run("git", ["-C", cwd, ...args], {
     env: env ? { ...process.env, ...env } : process.env,
     maxBuffer: 16 * 1024 * 1024,
+    timeout: GIT_TIMEOUT_MS,
+    killSignal: "SIGKILL",
   });
   return stdout.trim();
 }
