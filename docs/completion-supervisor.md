@@ -44,7 +44,8 @@
 
 - 以一次用户任务为持续监督边界，而不是以一次 turn 为边界。
 - 主 Agent 认为自己完成后，独立验证需求完成度与代码质量。
-- 主 Agent 因可恢复异常、遗漏或检查失败而停止时，生成有证据的继续提示；仅在宿主支持原子条件发送时自动派发。
+- 主 Agent 因可恢复异常、遗漏或检查失败而停止时，生成有证据的继续提示并自动派发；宿主支持原子条件发送时用它消除与用户输入的竞态。
+- **在同等宿主能力下是 v2 的严格超集**：今天的 Paseo 上就提供 v2 的全部自动化（检查、自动修复、代答、重试）。宿主能力只决定保证级别（§11），不决定功能有无。
 - 用户随时拥有最高控制权；用户输入、取消和需要真实决策的场景不会被自动化越权。
 - 所有自动副作用均可追踪、幂等、可在插件重启后恢复。
 - 用预算与进展检测保证监督有界，避免“永不停止”或重复消耗。
@@ -58,7 +59,7 @@
 - 不自动回答产品取舍、凭据、权限、付款、发布等必须由用户决定的事项（沿用 answerer 的 escalate 规则与 `answerRisk`）。
 - 第一阶段不在 context/quota 耗尽后创建替代主 Agent；这需要独立的上下文交接设计。
 - 不允许 verifier/reviewer/answerer 修改工作区，也不自动回滚它们造成的修改。
-- 不以普通 `send()` 的“先检查、后发送”模拟原子条件发送；宿主能力不足时退化为人工派发。
+- 不因缺少宿主能力而关闭功能。缺少时沿用 v2 已验证的缓解措施（§11），把剩余风险写在卡片和 README 上，而不是把风险的消除当成发布门槛。
 
 ## 3. 领域模型
 
@@ -116,10 +117,10 @@
 7. 终态卡片必须在子 Agent 归档前发布，避免 UI 永久停留在 Running。
 8. 任何 evaluator 或 answerer 的工作区修改都会使其结果失效，并令任务进入 `WAITING_USER`；监督器不擅自回滚，必须等待用户决定如何处理变更。
 9. 达到时间、轮次、代答、重试或无进展预算时必须停止自动发送。
-10. 同一规范化工作区内，插件派发的 Source Agent attempt 与 evaluator check 必须共同持有唯一 Workspace Lease，不得并行。
-11. 无人值守 continue/fix/answer/retry 只能通过宿主提供的原子 `sendIfIdle(expectedRevision)` 派发；没有该能力时禁止自动调用 Source Agent 的 `send()`。
+10. 同一规范化工作区内，插件派发的 Source Agent attempt 与 evaluator check 必须共同持有唯一 Workspace Lease，不得并行。插件自己派发的动作之间总能保证这一点；对用户直接启动的 turn 的排他性取决于宿主能力（§11.3）。
+11. 自动 continue/fix/answer/retry 只经过 supervisor 的统一派发器：宿主提供原子 `sendIfIdle(expectedRevision)` 时使用它；否则按 best-effort 协议，刷新后确认 Agent `idle`（retry 和 answer 也接受 `error`），与 `send()` 之间不 await 任何其他操作。确认失败即放弃该动作，不排队重发。
 12. 非终态 Task 上的用户追加输入必须继承原始请求、初始基线、Completion Contract 和未解决项；只有显式 replace 可以切换 Task。
-13. evaluator 必须运行在绑定被检快照的隔离 worktree 中；若无法创建或指定隔离目录，task 模式不得启动检查。
+13. 每个 verdict 都经过前后 tree 对比：检查期间工作区有变化，verdict 作废（不变量 8）。宿主能为 evaluator 指定 cwd 时，evaluator 运行在绑定被检快照的隔离 worktree 中，源工作目录不会被它污染；不能指定时在原工作目录运行，与 v2 相同。
 14. 用户停止 Source Agent 不等于接受其改动：停止前的改动留在 Task 范围内，由下一次检查覆盖（现状见 a3aafab）。
 
 ## 6. 模块边界
@@ -168,7 +169,7 @@ CompletionSupervisor ───────────────► TimelinePr
 - `DecisionEngine` 是纯函数：输入任务快照、outcome、check/answer 结果和预算，输出下一状态与 action，不执行副作用。
 - `SupervisorStore` 是持久化 seam；生产使用 SQLite，测试可使用内存 adapter。
 - `AgentRuntime` 封装 Paseo 的 refresh/send/create/archive/timeline/permission/config 操作。它同时有生产与测试 adapter（现有 `gate.test.ts` 的 fake paseo 可直接演化），因此值得成为 port。
-- `CheckRunner` 只能为固定快照创建隔离 worktree、创建和归档 evaluator、处理其权限等待与 nudge、收集 verdict；它不能向 Source Agent 发送消息。
+- `CheckRunner` 只能为固定快照准备工作目录（`worktree` 级别下创建隔离 worktree）、创建和归档 evaluator、处理其权限等待与 nudge、收集 verdict；它不能向 Source Agent 发送消息。
 - `AnswerRunner` 负责代答的宽限期、answerer 调用、escalate 规则、`answerRisk` 与同题检测；它只返回“答案或转交”，由 supervisor 决定是否发送。
 - `PromptBuilder` 从任务证据生成 continue/fix/answer/retry 提示，禁止自由读取隐式全局状态。
 - `TimelinePresenter` 维护每个 Task 的当前卡片序号：同一事件原地更新，新事件在当前位置新开一张并关闭旧卡（§13）。
@@ -184,8 +185,8 @@ CompletionSupervisor ───────────────► TimelinePr
 | --- | --- |
 | `SOURCE_RUNNING` | Source Agent 正在执行用户或监督器派发的 attempt。 |
 | `ASSESSING` | 分类 Source Agent 的结束原因并确定下一步；预筛命中提问时在此运行 answerer（含宽限期）。 |
-| `CHECKING` | 持有 Workspace Lease，在绑定同一快照的隔离 worktree 中串行执行 completion/quality checks。 |
-| `READY_TO_CONTINUE` | 已生成继续动作；原子条件发送可用时等待自动派发，否则等待用户人工派发。 |
+| `CHECKING` | 持有 Workspace Lease，串行执行 completion/quality checks；隔离 worktree 可用时在其中运行，否则在原工作目录（§11.1）。 |
+| `READY_TO_CONTINUE` | 已生成继续动作，等待派发器发送（到期的宽限期或重试延迟）；`dispatch: "assisted"` 时等待用户人工提交。 |
 | `WAITING_USER` | 需要真实用户输入，暂停所有自动化。 |
 | `PAUSED` | 用户主动暂停，或一个无需补充业务信息的可恢复操作条件暂时不满足；禁止自动副作用。 |
 | `COMPLETED` | 完成契约全部通过。 |
@@ -232,8 +233,9 @@ flowchart TD
     H -->|Resume + check 快照有效| C
     H -->|Resume 条件失效| W
     H -->|用户追加约束| Q
-    N -->|原子条件发送成功| R
-    N -->|能力不足| M[展示人工 Continue / Fix]
+    N -->|派发成功| R
+    N -->|Agent 已不空闲：放弃动作，按用户 turn 处理| Q
+    N -->|dispatch = assisted| M[展示人工 Continue / Fix]
     M -->|用户提交提示| R
     R -->|用户追加约束（含 replaced）| Q[继承 Task 并递增 contract revision]
     C -->|用户追加约束| Q
@@ -249,10 +251,10 @@ flowchart TD
 | Source outcome | 默认动作 | 说明 |
 | --- | --- | --- |
 | `done` | 工作区相对 Task 基线有变化时运行 completion + quality checks | 与现状一致：从未改动工作区的纯分析、纯聊天任务直接 `COMPLETED`，不启动 evaluator；有未检查改动（继承的基线）时照常检查。 |
-| `incomplete` | 生成带缺口证据的 continue 提示 | 由现有预筛信号（`truncated`、`tool_last`、`todo_pending`）加 answerer 的 `incomplete` 判定得出。自动派发要求原子条件发送，否则由用户提交；计入 source-turn 与 no-progress 预算。 |
+| `incomplete` | 生成带缺口证据的 continue 提示 | 由现有预筛信号（`truncated`、`tool_last`、`todo_pending`）加 answerer 的 `incomplete` 判定得出。经统一派发器发送（§11.2）；计入 source-turn 与 no-progress 预算。 |
 | `awaiting_user` | 先等 `delay_seconds` 宽限期，再由 answerer 判定；能从需求与仓库确定的由它作答，真实选择进入 `WAITING_USER` | 沿用现有 escalate 规则、`answerRisk`、同题相似度 ≥ 0.5 即转交；不把“继续”伪装成用户决定。宽限期内的用户输入取消代答。 |
 | `refused` | `BLOCKED` | 与现状一致，不代答、不重试。若策略明确声明为可恢复的技术性拒绝，应直接进入 `READY_TO_CONTINUE`，不能先进入 `BLOCKED` 再 Resume。 |
-| `crashed` / `network` / `rate_limited` | 延迟后 bounded retry | 现状为固定 `delay_seconds`、每类最多 3 次、默认不重试；supervisor 可改为指数退避。自动 retry 同样要求原子条件发送；使用同一 Task 和确定性 message id。失败后 Agent 状态为 `error` 也允许重试（E5、E6）。 |
+| `crashed` / `network` / `rate_limited` | 延迟后 bounded retry | 现状为固定 `delay_seconds`、每类最多 3 次、默认不重试；supervisor 可改为指数退避。经统一派发器发送；使用同一 Task 和确定性 message id。失败后 Agent 状态为 `error` 也允许重试（E5、E6）。 |
 | `quota_exhausted` / `context_exhausted` | `BLOCKED` | 同一 Agent 无法可靠恢复；schema 已禁止对它们配置 retry。未来可接入 successor handoff。 |
 | `error`（provider 失败，文本未命中任何类别） | `WAITING_USER` | 保留错误原文，不猜测重试；用户回复后同一 Task 继续。插件自身的故障才是 `ERROR` 状态。 |
 | `user_canceled` | `WAITING_USER` | 不发送任何自动消息；停止前的改动留在 Task 内，用户下一条消息继续同一 Task（不变量 14）。 |
@@ -388,9 +390,21 @@ answerer 的 key 带子 Agent id 而不是序号：一次被转交或失败的�
 5. 用可观察事实确认结果，再把 action 标记 `confirmed`。
 6. 若进程在任意步骤崩溃，`reconcile` 根据 action id、lease generation 和 Agent 时间线决定确认、重试或放弃。
 
-### 11.1 Source Agent 条件发送
+### 11.1 保证级别
 
-无人值守 task 模式的发布前置条件是 `AgentRuntime` 明确报告并实现原子条件发送。建议的宿主语义为：
+supervisor 的每项能力都按宿主提供的原语选择保证级别。缺少原语时降到 v2 已在用的做法，功能不关闭；原语到位后自动升级，不需要改策略：
+
+| 能力 | 宿主提供时 | 宿主不提供时（今天的 Paseo，等同 v2） | 剩余风险 |
+| --- | --- | --- | --- |
+| 向 Source Agent 发送 | `atomic`：原子 `sendIfIdle` | `best-effort`：refresh 后确认空闲，立即 `send()` | 两步之间用户正好发消息，会被插件的消息取消（V5） |
+| evaluator 工作目录 | `worktree`：绑定快照的隔离 worktree | `in-place`：原工作目录 + 前后 tree 对比 | evaluator 的改动会短暂出现在源工作目录；verdict 已作废，改动不回滚 |
+| 同工作区排他 | `exclusive`：能列举运行中的 Agent | `plugin-only`：插件派发的动作之间串行，外部 turn 靠内存重叠检测 | 插件启动前就在运行的外部 turn 看不到，其改动可能混进 diff |
+
+卡片始终显示当前生效的级别（§13），剩余风险写进 README。启动时和每次 reconcile 时做一次 capability probe，结果只影响级别，不影响 Task 状态。
+
+### 11.2 Source Agent 发送
+
+建议的宿主原子语义：
 
 ```ts
 send({
@@ -401,22 +415,32 @@ send({
 });
 ```
 
-宿主必须在一个不可分割的操作中验证 Agent idle（或失败后的 `error`）且 timeline revision 未变化；条件不满足时不得取消、替换或修改任何 turn，并返回可区分的 conflict 结果。只有该原语成功后 action 才能进入 `executing`/`confirmed`。
+宿主必须在一个不可分割的操作中验证 Agent idle（或失败后的 `error`）且 timeline revision 未变化；条件不满足时不得取消、替换或修改任何 turn，并返回可区分的 conflict 结果。conflict 表示用户已经接手：放弃该 action，按用户 turn 处理（§3）。
 
-当前 Paseo 普通 `send()` 会取消运行中的 turn（V5），且不具备上述原子条件。现有 v2 实现的 fix、answer、retry 都是“refresh 后立即 send”，并用宽限期和“两步之间不 await”缩小窗口；这是 v2 `mode: "turn"` 下保留的已知风险（README “Sending on your behalf”），不能带入 task 模式。运行时缺少该 capability 时，Task 自动进入 **assisted dispatch**：监督器继续生成检查结果和提示词，但卡片只提供 `Prepare Continue` / `Prepare Fix` / `Prepare Answer`，用于复制或预填到用户输入框；由用户检查并亲自提交。插件不得在 assisted dispatch 中调用 Source Agent 的 `send()`。这不是临时的 check-then-send 降级路径，而是必须测试的不发送保证。
+没有该原语时使用 best-effort 协议，即现有 v2 的 fix、answer、retry 已在用、并经过真实 kiro 端到端验证的做法：
 
-### 11.2 共享工作区调度
+1. action 先以 `planned` 落盘，messageId 确定（`pts:<task>:source:<attempt>`）；
+2. refresh Source Agent，确认状态为 `idle`（retry 和 answer 也接受失败后的 `error`），且 Task 与 contract revision 未变；
+3. 与 `send()` 之间不 await 任何其他操作（卡片更新放在发送之后）；
+4. 确认失败即放弃该 action，不排队重发；用户的 turn 会按 §3 追加到 Task；
+5. 代答保留 `delay_seconds` 宽限期（默认 60 秒）：用户最可能在 Agent 刚停下时回复，宽限期让这段时间里不发生自动发送；
+6. 重启后按 messageId 在 timeline 中对账，找不到才用同一 messageId 重发。
 
-Workspace Lease 覆盖同一工作区内所有插件派发的 source attempts、verifier 和 reviewer；同一 Task 的 checks 也严格串行。每个 evaluator 还必须在由 `snapshot_id` 构造的临时隔离 worktree 中运行，不能把构建产物、测试写入或意外编辑带回 Source Agent 工作目录。隔离 worktree 虽有临时路径，调度时仍继承 Source Task 的 `workspace_key` 和 lease。answerer 只读代码、不跑构建，可以留在原工作目录，但仍按现状在结束时比对 tree。调度前必须同时满足：
+两种协议共用同一个派发器和同一套 action 状态，差别只在第 2–3 步是否由宿主原子完成。`dispatch: "assisted"` 是用户可选的第三种方式：只在卡片上提供 `Prepare Continue` / `Prepare Fix` / `Prepare Answer`，用于复制或预填到输入框，插件不调用 Source Agent 的 `send()`。它适合希望逐条确认的用户，不是缺少宿主能力时的降级。
+
+### 11.3 共享工作区调度
+
+Workspace Lease 覆盖同一工作区内所有插件派发的 source attempts、verifier 和 reviewer；同一 Task 的 checks 也严格串行（两个 evaluator 同时构建和测试会互相干扰，与 v2 相同）。调度前必须同时满足：
 
 - lease 可安全获取；
 - 已知的同工作区 Source Agent 均不在运行；
-- 当前 fingerprint、Task 和 contract revision 与 planned action 一致；
-- 固定快照已完整包含本次任务需要验证的 tracked 与 untracked 内容（现有 `snapshotTree` 的临时 index 快照满足这一点，可直接用 `git worktree add` 或 `read-tree` 物化），且 evaluator cwd 可绑定到隔离 worktree。
+- 当前 fingerprint、Task 和 contract revision 与 planned action 一致。
+
+`worktree` 级别下，evaluator 在由 `snapshot_id` 构造的临时隔离 worktree 中运行（现有 `snapshotTree` 的临时 index 快照已包含 tracked 与未忽略的 untracked 内容，可直接用 `git worktree add` 或 `read-tree` 物化），构建产物、测试写入或意外编辑都不会带回 Source Agent 工作目录；隔离 worktree 仍继承 Source Task 的 `workspace_key` 和 lease，不增加并发度。`in-place` 级别下，evaluator 在原工作目录运行，前后 tree 对比发现改动即作废 verdict、进入 `WAITING_USER`（不变量 8），与 v2 相同；未被 git 忽略的构建产物也会触发这一条，应加进 `.gitignore`。两种级别下 verdict 都绑定快照 tree。answerer 只读代码、不跑构建，始终留在原工作目录，并在结束时比对 tree。
 
 用户直接启动的 turn 不受插件 lease 阻塞。若这类 turn 在 check 或自动 source attempt 期间出现，监督器立即把 lease 标为 contended，停止派发新动作，并尽力取消 evaluator；即使隔离 worktree 防止了文件互扰，该 cycle 的所有 verdict 仍无条件 stale。待所有已知同工作区 Source Agent idle 后重新读取 fingerprint：若变更无法归属到唯一 Task，相关 Task 进入 `WAITING_USER` 并请求用户选择归属，不自动合并或完成。
 
-现有实现只能在内存中看到插件启动后开始的 turn（`startActivity`），重启前已在运行的 turn 不可见，也不能为子 Agent 指定 cwd（子 Agent 通过 `workspaces.ref(id).agents.create` 落在源 Agent 的 workspace）。因此：如果 Paseo 无法列举同工作区运行中的 Agent，插件不能证明 lease 排他性；如果不能为 evaluator 指定隔离 cwd，插件也不能证明检查不会污染 Source Agent。任一能力缺失时，task 模式只能使用 assisted dispatch 且不得启动 evaluator，卡片应解释缺失能力。用户本来就在独立 git worktree 中启动的 Task 具有不同 worktree identity，可各自持有 lease 并行；监督器为 evaluator 创建的临时 worktree 则始终继承 Source Task 的 lease，不增加并发度。
+“已知”的范围取决于级别：`exclusive` 下来自宿主列举的运行中 Agent；`plugin-only` 下来自插件看到的 `turn_started`/`turn_ended`（现有 `startActivity`，supervisor 把它落盘，重启后仍记得已开始未结束的 turn）。`plugin-only` 下插件启动前就在运行的外部 turn 不可见；与 v2 一样，检查 prompt、卡片和 fix 消息会注明重叠的 Agent，并要求只修自己的改动。用户本来就在独立 git worktree 中启动的 Task 具有不同 worktree identity，可各自持有 lease 并行，这也是彻底避免互扰的推荐做法。
 
 ## 12. 崩溃恢复
 
@@ -457,11 +481,11 @@ Workspace Lease 覆盖同一工作区内所有插件派发的 source attempts、
 - `Stop supervision`：立即转为 `CANCELED`，不终止正在运行的用户主 turn，但禁止后续自动动作；
 - `Stop auto-answering`：只关闭本 Task 的代答，问题交给用户，其余监督照常（现有按钮）；
 - `Resume`：仅在 `PAUSED` 可用；保留全部计数并重新验证契约、快照、lease 和预算后，由 `DecisionEngine` 选择恢复目标；
-- `Prepare Continue` / `Prepare Fix` / `Prepare Answer`：assisted dispatch 下只复制或预填提示词，不调用 Agent `send()`；
+- `Prepare Continue` / `Prepare Fix` / `Prepare Answer`：仅 `dispatch: "assisted"` 时出现，只复制或预填提示词，不调用 Agent `send()`；
 - `Replace task`：显式结束当前 Task，下一条用户输入从新契约开始；
-- `Continue once`：宿主支持原子条件发送时可选的人工单步，不提高任何预算上限。
+- `Continue once`：`WAITING_USER` 或 `BUDGET_EXHAUSTED` 前最后一个待派发动作的人工单步，按当前保证级别发送，不提高任何预算上限。
 
-卡片必须显示 `dispatch: autonomous` 或 `dispatch: assisted`，以及进入 assisted 的缺失 capability。用户不应从“Running”误以为普通 `send()` 正在后台等待机会。
+卡片必须显示当前生效的保证级别（§11.1），例如 `dispatch: best-effort · checks: in-place · exclusivity: plugin-only`，并链接到剩余风险说明；`dispatch: assisted` 时写明需要用户提交。待发送的动作显示预计时间（宽限期、重试延迟），用户不应从“Running”误以为插件正在后台等待机会。
 
 这不是 slash command：用户无须学习额外命令，卡片只是透明度和紧急制动界面。
 
@@ -506,9 +530,9 @@ Workspace Lease 覆盖同一工作区内所有插件派发的 source attempts、
 
 推荐迁移策略：
 
-- `mode: "turn"` 保留现有 v2 行为；v2 文件按此解释，不静默启用任务级自动化。
-- 新初始化可明确询问并推荐 `mode: "task"`，同时生成项目定制的 verifier/reviewer/answerer 规则。`post-turn-gate-init` 仍输出每个字段的默认值，并保留“初始化输出与 schema 默认值一致”的测试。
-- `dispatch: "auto"` 表示请求无人值守派发，但只有 runtime capability probe 通过才可生效；否则明确降级为 assisted。也可显式配置 `"assisted"`。
+- v2 文件按 `mode: "turn"` 解释，保留现有行为，不静默切换到 task 模式。task 模式与 v2 功能对等后（§18 第 3 步），`mode: "turn"` 只作为兼容入口，内部由 supervisor 以 v2 语义实现。
+- 新初始化默认生成 `mode: "task"`，同时生成项目定制的 verifier/reviewer/answerer 规则。`post-turn-gate-init` 仍输出每个字段的默认值，并保留“初始化输出与 schema 默认值一致”的测试。
+- `dispatch: "auto"`（默认）自动派发，按 capability probe 的结果使用 `atomic` 或 `best-effort`（§11.1），不会因缺少能力而降级为人工提交；`"assisted"` 是用户显式选择的人工提交。v2 的自动修复、代答、重试对应 `"auto"`。
 - v2 到 v3 的映射：`on_outcome.done` 的检查列表 → `checks`（`notify`/`ignore` 表示不检查）；`on_fail.fix.max_rounds` → `max_fix_attempts`，`"report"` → 0；`on_inconclusive` → §4 的分流（`"report"` 时 `no_test_infra`/`other` 只报告，不发回）；`awaiting_user.answer.max`/`delay_seconds` → `max_answers`/`answer_delay_seconds`，`as_done` 与 `ignore` 需要显式对应；各失败类的 `retry.max` → `max_retries`（v3 若要按类别区分，保留 per-category 结构而不是合并）；`retry.message` 保留。解析时若语义冲突应报错，不能猜测。
 - 升级期间，已有 v2 run 和 chain 允许按旧实现结束，已有 carry 由 v2 路径消费；v3 只接管升级后新创建的 Task，避免双重发送。
 - 插件版本与远程 initializer revision 必须一致，防止旧插件读取新 schema；现有插件遇到存储的策略格式过旧会把 run 转 `ERROR`、丢弃 chain，v3 需要同样的保护。
@@ -539,12 +563,14 @@ Workspace Lease 覆盖同一工作区内所有插件派发的 source attempts、
 - resume 只接受 `PAUSED`，并分别覆盖恢复到 `READY_TO_CONTINUE`、`ASSESSING`、`CHECKING` 及条件失效的路径；
 - resume 不重置计数，暂停时间不计入 `max_minutes`，其他预算已耗尽时直接 `BUDGET_EXHAUSTED`；
 - `BLOCKED` 上的 resume 被拒绝，且终态不会产生任何新 source/check action；
-- 原子 continue 与用户输入竞争时，条件失败且用户 turn 不被取消；
-- 缺少原子发送 capability 时，任何路径都不会调用 Source Agent `send()`；
+- `atomic` 级别下 continue 与用户输入竞争时，条件失败且用户 turn 不被取消；
+- `best-effort` 级别下 refresh 与 `send()` 之间没有 await；refresh 看到 Agent 不空闲时放弃动作，用户的 turn 追加到 Task；宽限期内的用户输入取消代答；
+- `dispatch: "assisted"` 时任何路径都不会调用 Source Agent `send()`；
+- capability probe 结果变化只改变保证级别，不改变 Task 状态；
 - 执行中和检查中追加约束时，原 Task 的请求、基线和未解决项被继承，旧 checks/actions 失效；
 - 只有显式 replace 才创建不继承契约的新 Task；
 - 同工作区两个 Source Agent 的自动 source/check 动作严格串行；用户 turn 造成 lease contention 时 cycle 失效；
-- evaluator 只能在绑定固定 snapshot 的隔离 worktree 运行，不能污染 Source Agent 目录；
+- `worktree` 级别下 evaluator 在绑定固定 snapshot 的隔离 worktree 运行，不污染 Source Agent 目录；`in-place` 级别下 evaluator 的改动使 verdict 作废，结果与 v2 一致；
 - 独立 worktree 的任务可以并行；
 - 权限请求超过 `permission_wait_minutes` 被代拒，evaluator 被追问一次并得到 `blocked_permission`；
 - evaluator 结束、终态卡发布、再归档；新事件的卡片出现在当前位置，旧卡被关闭；
@@ -566,8 +592,8 @@ Workspace Lease 覆盖同一工作区内所有插件派发的 source attempts、
 实现可发布前必须证明：
 
 1. 一个包含两次修复的任务任一时刻只有一张活动卡片，旧卡都已关闭并指向新卡，最终给出绑定当前 tree 的 PASS 证据。
-2. 宿主提供原子条件发送时，主 Agent 提前停止或报告可恢复异常后，监督器能在预算内继续而无需用户发送聊天消息；宿主不提供时只生成供用户提交的提示。
-3. 原子发送与用户输入竞争时，用户 turn 不会被取消或替换；capability 缺失时不存在后台普通 `send()`。
+2. 在今天的 Paseo 上（无原子发送、无 cwd、无运行中 Agent 列表），task 模式提供 v2 的全部自动化：检查、自动修复、代答、重试，主 Agent 提前停止或报告可恢复异常后，监督器能在预算内继续而无需用户发送聊天消息。v2 的端到端场景在 task 模式下全部通过。
+3. 宿主提供原子发送时，自动派发与用户输入竞争，用户 turn 不会被取消或替换；只有 best-effort 时，竞态窗口不大于 v2（refresh 与 send 之间无 await），且卡片如实显示级别。
 4. 用户在执行中或检查中追加约束后，Task 保留原始请求、初始基线和未解决项，并只接受最新 contract revision 的检查结果。
 5. 同一工作区的自动 source/check 流程不会并行，外部用户 turn 造成的污染不会产生有效 verdict。
 6. `PAUSED` 不执行自动副作用；合法 Resume 保留所有计数并根据当前事实进入唯一恢复目标，`BLOCKED` 永远不可 Resume。
@@ -582,11 +608,12 @@ Workspace Lease 覆盖同一工作区内所有插件派发的 source attempts、
 
 1. **建立模块 seam**：引入 `CompletionSupervisor`、per-workspace 队列、store/runtime adapters；把 `gate.ts` 中的 dispatch/finalize、代答、重试拆到 `CheckRunner`、`AnswerRunner`，先保持 v2 外部行为不变。
 2. **统一任务记录与卡片**：新增 task/requirement/attempt/check/children/lease/action 表，把 run、chain、carry、turn snapshot 的生命周期和终态发布顺序迁入统一状态机。
-3. **安全调度**：先实现 Workspace Lease、Requirement Revision 和 runtime capability probe；缺少原子条件发送时仅开放 assisted dispatch。
-4. **持续执行**：宿主满足原子条件发送后，把 fix、answer 和 retry 合并为由 `DecisionEngine` 产生的 source actions，加入完成契约。
+3. **统一派发与调度**：把 fix、answer 和 retry 合并为由 `DecisionEngine` 产生的 source actions，经同一个派发器按 best-effort 协议发送；实现 Workspace Lease（`plugin-only`）、Requirement Revision 和 capability probe。到这一步 task 模式已在今天的 Paseo 上与 v2 功能对等。
+4. **完成契约**：加入 §4 的完成定义与 INCONCLUSIVE 分流。
 5. **有界自治**：实现进展 fingerprint、全套预算、用户 stop/resume 和 human boundary。
 6. **恢复加固**：覆盖 crash cut-point、发送竞争和 daemon reload；推动 Paseo 增加 ready hook。
-7. **v3 启用**：更新 initializer、迁移文档和 provider smoke test，明确 opt-in 到 task 模式。
+7. **v3 启用**：更新 initializer（新仓库默认 task 模式）、迁移文档和 provider smoke test；已有 v2 仓库仍需显式迁移。
+8. **宿主能力升级**：Paseo 提供 `sendIfIdle`、cwd、运行中 Agent 列表后，capability probe 自动把保证级别升到 `atomic`、`worktree`、`exclusive`，无需改策略。这一步不阻塞前面任何一步。
 
 每一阶段都应保持现有 v2 测试（`server/*.test.ts`）通过。迁移完成前，旧 Gate 和新 Supervisor 不能同时拥有 Source Agent 的发送权。
 
@@ -598,6 +625,7 @@ Workspace Lease 覆盖同一工作区内所有插件派发的 source attempts、
 - **整个任务只用一张原地更新的卡片**：更新时间线上方很远的旧卡用户看不到，现有实现已因此改为每个新事件一张。本设计保留“一个 Task 只有一张活动卡”，由 `card_seq` 关联，避免每轮卡片各自为政、子 Agent 结束后某张卡仍显示 Running。
 - **让 reviewer 直接修代码**：破坏独立验证，也使 verdict 与被验证快照不一致。
 - **把被检查者的反驳交给检查者复审**：被检查的 Agent 可以说服检查者给出 PASS（d2d75a0 已删除 `on_dispute` 复审）；反驳只给用户看。
+- **缺少宿主能力就关闭自动派发或检查**：早先版本把原子发送和隔离 worktree 定为硬性前提，结果在今天的 Paseo 上 task 模式只剩人工提交、不做检查，比 v2 还弱。竞态和污染都是低概率、可发现、可恢复的风险，v2 的缓解措施已经在真实环境验证过；用保证级别如实标出，比用禁用功能来消除风险更合适。
 - **把所有错误都重试**：会掩盖权限、上下文、配额和真实用户决策等不可恢复边界。
 
 ## 20. 尚需验证的宿主能力
@@ -614,4 +642,4 @@ Workspace Lease 覆盖同一工作区内所有插件派发的 source attempts、
 - 是否有可靠的 Agent terminal/archived 事件，减少轮询；
 - card action RPC 是否能在 daemon reload 后保持稳定路由。
 
-原子 `sendIfIdle(expectedRevision)` 是无人值守派发的硬性发布条件；可指定 cwd 与可列举运行中 Agent 是 task 模式启动 evaluator 的硬性条件。不具备时只能发布 assisted 模式。启动 SDK/ready hook 不阻止有人值守原型，但阻止“daemon 重启后无需任何新事件即可恢复”的保证。文档和 UI 必须如实暴露尚未获得的能力。
+以上都不是发布条件。前三项只提升保证级别（§11.1）：`sendIfIdle` 消除自动发送与用户输入的竞态，cwd 让 evaluator 不再接触源工作目录，运行中 Agent 列表让 lease 覆盖外部 turn；缺少时沿用 v2 的做法，功能不变。启动 SDK/ready hook 阻止的只是“daemon 重启后无需任何新事件即可恢复”的保证。文档和卡片必须如实显示当前生效的级别和尚未获得的能力。
