@@ -12,30 +12,34 @@ const ROLES = ["reviewer", "verifier", "answerer"];
 const DEFAULT_POLICY = {
   version: 2,
   trigger: "root_and_opt_in",
-  on_fail: { fix: { max_rounds: 2 } },
+  on_fail: { fix: { max_rounds: 2, on_dispute: "human" } },
+  on_inconclusive: "report",
   agents: {
     reviewer: {
       profile: null,
       instructions_file: ".paseo/post-turn-gate/reviewer.md",
       permissions: "auto",
       timeout_minutes: 30,
+      permission_wait_minutes: 5,
     },
     verifier: {
       profile: null,
       instructions_file: ".paseo/post-turn-gate/verifier.md",
       permissions: "auto",
       timeout_minutes: 30,
+      permission_wait_minutes: 5,
     },
     answerer: {
       profile: null,
       instructions_file: ".paseo/post-turn-gate/answerer.md",
       permissions: "auto",
       timeout_minutes: 10,
+      permission_wait_minutes: 5,
     },
   },
   on_outcome: {
     done: ["review"],
-    awaiting_user: { answer: { max: 3 } },
+    awaiting_user: { answer: { max: 3, delay_seconds: 60 } },
     refused: "notify",
     user_canceled: "ignore",
     replaced: "ignore",
@@ -153,7 +157,7 @@ if (rounds !== null && (!Number.isInteger(rounds) || rounds < 1 || rounds > 5)) 
 const policy = JSON.parse(JSON.stringify(DEFAULT_POLICY));
 policy.on_outcome.done = checks;
 if (values.report) policy.on_fail = "report";
-if (rounds !== null) policy.on_fail = { fix: { max_rounds: rounds } };
+if (rounds !== null) policy.on_fail.fix.max_rounds = rounds;
 const text = `${JSON.stringify(policy, null, 2)}\n`;
 
 if (values.stdout) {

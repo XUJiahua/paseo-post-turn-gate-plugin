@@ -4,6 +4,22 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- `agents.<role>.permission_wait_minutes` (default 5): a request on the card that nobody answers is denied, and the checker is asked once for a verdict from its evidence.
+- `awaiting_user.answer.delay_seconds` (default 60): the answerer waits for your own reply first.
+- `on_inconclusive` (`report` | `fail`) and `inconclusive_reason` in the verdict; blocked or ambiguous checks show NEEDS HUMAN.
+- `on_fail.fix.on_dispute` (`human` | `rereview`) for fix turns that change nothing and disagree with the findings.
+
+### Changed
+
+- Failed turns are reported or retried even when they changed no files; a stop after tool calls is auto-answered even before files change.
+- A finished report ending with a closing offer ("Let me know if you need anything else.") is `done`, not a question.
+- A fix turn that changes nothing is no longer checked again: a question goes to the answerer, a disagreement to you (or the checker).
+- Outcome cards: each new question, failure or retry gets a new card at the current timeline position.
+- Config error cards appear only for gated turns that changed files, once per policy version, and are marked fixed once the policy is valid.
+- Cloud/deploy tools named in a command still need you whatever prefix runs them, but read-only commands (`cat src/aws/x.ts`, `grep helm …`) no longer do; `git -C <dir> push` and `sh -c` scripts are recognized.
+
 ## [0.1.0] - 2026-09-30
 
 Initial release of the Paseo Post Turn Gate plugin. Requires Paseo 0.10.0 or later with plugins enabled.

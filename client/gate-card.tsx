@@ -35,6 +35,14 @@ const CHECK_STYLE: Record<CheckState, (styles: ReturnType<typeof cardStyles>) =>
   skipped: (styles) => styles.muted,
 };
 
+const REASONS: Record<NonNullable<CardData["checks"][number]["reason"]>, string> = {
+  blocked_permission: "a permission it needed was denied or not answered",
+  ambiguous_request: "the request does not say what is required",
+  no_test_infra: "no tests or runnable check",
+  env_missing: "missing credentials, services or tools",
+  other: "not enough evidence",
+};
+
 const FINISHED: RunStatus[] = ["PASSED", "INCONCLUSIVE", "FAILED", "NEEDS_HUMAN", "ERROR", "SUPERSEDED"];
 
 export function cardStyles(theme: PluginTimelineItemProps["theme"]) {
@@ -86,16 +94,17 @@ export function GateCard({ item, theme }: PluginTimelineItemProps<CardData>) {
   const styles = useMemo(() => cardStyles(theme), [theme]);
 
   let statusStyle = styles.running;
-  if (data.status === "PASSED") statusStyle = styles.success;
+  if (data.status === "PASSED" || data.fixed) statusStyle = styles.success;
   if (data.status === "INCONCLUSIVE" || data.status === "SUPERSEDED") statusStyle = styles.warning;
-  if (data.status === "FAILED" || data.status === "ERROR" || data.status === "NEEDS_HUMAN") statusStyle = styles.danger;
+  if (!data.fixed && (data.status === "FAILED" || data.status === "ERROR" || data.status === "NEEDS_HUMAN")) statusStyle = styles.danger;
 
   const name = (check: string) => (check === "verify" ? "Verify" : "Review");
   // Cards written before multi-check runs have no rows; fall back to the single action.
   const role =
     data.checks.length > 0 ? data.checks.map((row) => name(row.check)).join(" → ") : data.action ? name(data.action) : "Gate";
   const rounds = data.maxFixRounds > 0 ? ` · round ${data.round}/${data.maxFixRounds + 1}` : "";
-  const status = data.waiting ? "Waiting for permission" : LABELS[data.status];
+  const status = data.fixed ? "Fixed" : data.waiting ? "Waiting for permission" : LABELS[data.status];
+  const unverified = data.checks.filter((row) => row.state === "INCONCLUSIVE");
 
   return (
     <View style={styles.card} accessible accessibilityLabel={`Post-turn gate ${role}: ${status}`}>
@@ -118,6 +127,18 @@ export function GateCard({ item, theme }: PluginTimelineItemProps<CardData>) {
         ))
       ) : data.summary ? (
         <Text style={styles.body}>{data.summary}</Text>
+      ) : null}
+      {unverified.map((row) => (
+        <Text key={`unverified-${row.check}`} style={styles.warning}>
+          Not verified ({name(row.check)}): {row.reason ? REASONS[row.reason] : REASONS.other}
+        </Text>
+      ))}
+      {data.denied ? <Text style={styles.warning} selectable>Denied permission: {data.denied}</Text> : null}
+      {data.dispute ? (
+        <Text style={styles.body} selectable>
+          The agent replied without changing files:{"\n"}
+          {data.dispute}
+        </Text>
       ) : null}
       {data.note ? <Text style={styles.muted}>{data.note}</Text> : null}
       {data.findings.map((finding, index) => (
@@ -142,7 +163,7 @@ export function GateCard({ item, theme }: PluginTimelineItemProps<CardData>) {
         </Text>
       ) : null}
       {data.error ? (
-        <Text style={styles.danger} selectable>
+        <Text style={data.fixed ? styles.muted : styles.danger} selectable>
           {data.error}
         </Text>
       ) : null}

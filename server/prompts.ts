@@ -24,7 +24,18 @@ export function buildGatePrompt(input: {
   endTree: string;
   instructions?: string;
   concurrentAgents?: readonly string[];
+  /** The agent's reply when it changed nothing in a fix round and disputed the findings (on_dispute: rereview). */
+  dispute?: string | null;
 }): string {
+  const dispute = input.dispute
+    ? `
+A previous check of this change reported findings. The agent changed nothing and replied instead:
+<<<AGENT_REPLY
+${input.dispute}
+AGENT_REPLY>>>
+Judge the change on its merits: drop a finding the reply shows to be wrong, keep one it does not refute.
+`
+    : "";
   const concurrent = input.concurrentAgents?.length
     ? `\nOther agents (${input.concurrentAgents.join(", ")}) were working in this repository at the same time, so the diff
 may include their changes and the working tree may change while you check. Judge only changes that belong to the
@@ -49,10 +60,21 @@ Rules:
 - Severity: CRITICAL/HIGH block acceptance; MEDIUM/LOW do not.
 - verdict is FAIL when any CRITICAL or HIGH finding exists, PASS when none exists,
   INCONCLUSIVE only when you could not gather enough evidence.
+- inconclusive_reason is null unless the verdict is INCONCLUSIVE; then say why:
+  "blocked_permission" (a command or file you needed was denied or not answered), "ambiguous_request" (the
+  request does not say what is required), "no_test_infra" (the change has no tests or runnable check that could
+  show it works), "env_missing" (credentials, services or tools this machine does not have), or "other".
 - ${LANGUAGE_RULE}
-
+${dispute}
 Reply with ONLY one JSON object, no prose and no code fence, in exactly this shape:
-{"verdict":"PASS|FAIL|INCONCLUSIVE","summary":"...","findings":[{"severity":"CRITICAL|HIGH|MEDIUM|LOW","title":"...","evidence":"...","suggested_fix":"..."}]}`;
+{"verdict":"PASS|FAIL|INCONCLUSIVE","summary":"...","findings":[{"severity":"CRITICAL|HIGH|MEDIUM|LOW","title":"...","evidence":"...","suggested_fix":"..."}],"inconclusive_reason":null}`;
+}
+
+/** Sent to a checker whose permission request was denied and whose turn ended without a verdict. */
+export function buildNudgePrompt(denied: string): string {
+  return `The permission request "${denied}" was denied. Do not retry it or work around it.
+Reply now with the verdict JSON based on the evidence you already have. If that is not enough to decide, use
+verdict INCONCLUSIVE with inconclusive_reason "blocked_permission" and say in the summary what you could not check.`;
 }
 
 export function buildFixPrompt(
@@ -67,6 +89,10 @@ export function buildFixPrompt(
         `${index + 1}. [${finding.severity}] ${finding.title}\n   Evidence: ${finding.evidence}\n   Suggested fix: ${finding.suggested_fix}`,
     )
     .join("\n");
+  const task =
+    verdict.verdict === "INCONCLUSIVE"
+      ? "The check could not verify the change (see the summary). Add what is missing, such as tests or a runnable check, then stop."
+      : "Fix the CRITICAL and HIGH findings, then stop.";
   return `The post-turn gate reviewed your last change and it did not pass (fix round ${round} of ${maxFixRounds}).
 
 Summary: ${verdict.summary}
@@ -74,7 +100,8 @@ Summary: ${verdict.summary}
 Findings:
 ${findings || "(none listed)"}
 
-Fix the CRITICAL and HIGH findings, then stop. The change will be reviewed again automatically.${
+${task} The change will be reviewed again automatically. If you believe a finding is wrong, change nothing and
+explain why in your reply.${
     concurrentAgents.length
       ? `\n\nOther agents were changing this repository at the same time. Fix only findings caused by your own changes;
 for a finding in someone else's work, say so instead of changing their code.`
@@ -149,10 +176,11 @@ export function parseJsonReply<Schema extends ZodType>(text: string, schema: Sch
  * wrote, as the prompt's rule says; a blocking finding under PASS would otherwise slip through.
  */
 export function parseVerdict(text: string): Verdict | null {
-  const verdict = parseJsonReply(text, verdictSchema);
-  if (!verdict || verdict.verdict === "FAIL") return verdict;
-  const blocking = verdict.findings.some((finding) => finding.severity === "CRITICAL" || finding.severity === "HIGH");
-  return blocking ? { ...verdict, verdict: "FAIL" } : verdict;
+  const parsed = parseJsonReply(text, verdictSchema);
+  if (!parsed) return null;
+  const blocking = parsed.findings.some((finding) => finding.severity === "CRITICAL" || finding.severity === "HIGH");
+  const verdict = blocking ? "FAIL" : parsed.verdict;
+  return { ...parsed, verdict, inconclusive_reason: verdict === "INCONCLUSIVE" ? parsed.inconclusive_reason : null };
 }
 
 export function parseAnswer(text: string): AnswerReply | null {

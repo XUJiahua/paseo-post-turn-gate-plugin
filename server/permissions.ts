@@ -2,6 +2,7 @@
 // The gate exists to cut repeated confirmations, so routine work (reading, building, testing,
 // editing inside the repository) is approved; anything irreversible, outward-facing, or
 // privilege-changing is left for the user to answer on the card.
+import path from "node:path";
 
 export interface PermissionLike {
   kind: string;
@@ -13,8 +14,8 @@ export interface PermissionLike {
   actions?: ReadonlyArray<{ id: string; behavior: "allow" | "deny" }>;
 }
 
-// ponytail: pattern list, not a shell parser; an obfuscated command (eval, base64, variables)
-// can slip through. The ceiling is the same as the source agent's mode; upgrade path is a
+// ponytail: pattern list plus a small tokenizer, not a shell parser; an obfuscated command (eval, base64,
+// variables) can slip through. The ceiling is the same as the source agent's mode; upgrade path is a
 // provider-level sandbox profile for reviewers.
 const DANGEROUS: ReadonlyArray<[RegExp, string]> = [
   [/\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|--recursive)\b/i, "recursive delete"],
@@ -23,7 +24,6 @@ const DANGEROUS: ReadonlyArray<[RegExp, string]> = [
   [/\b(sudo|su|doas)\b/i, "privilege escalation"],
   [/\bchmod\s+-R\b|\bchown\b/i, "permission change"],
   [/\b(npm|pnpm|yarn|cargo|gem|twine)\s+publish\b|\bgh\s+(release|pr\s+(create|merge)|repo\s+delete)\b/i, "publishing"],
-  [/\b(kubectl|helm|terraform|pulumi|aws|gcloud|az|flyctl|vercel|netlify)\b/i, "cloud or deployment tool"],
   [/\b(curl|wget)\b[^|]*\|\s*(sh|bash|zsh|python)/i, "piping a download into a shell"],
   [/\b(drop\s+(table|database)|truncate\s+table|delete\s+from)\b/i, "destructive SQL"],
   [/\bdd\s+if=|\bmkfs\b|\bshutdown\b|\breboot\b|\bkillall\b/i, "system-level command"],
@@ -31,33 +31,137 @@ const DANGEROUS: ReadonlyArray<[RegExp, string]> = [
   [/(^|[\s/'"=])\.env\b|\.(pem|p12|key)\b|\bid_(rsa|ed25519)\b|\.aws\/credentials|\.netrc\b/i, "secret or credential file"],
 ];
 
+// Conservative: any word of a simple command that names a cloud or deploy tool (by basename) needs a human,
+// whatever prefix runs it (`timeout 60 aws …`, `watch kubectl …`, `env -u X terraform …`). The only exception
+// is a read-only program whose arguments are paths or search terms: `cat src/aws/client.ts`, `ls infra/terraform`.
+const CLOUD_TOOLS = new Set(["kubectl", "helm", "terraform", "pulumi", "aws", "gcloud", "az", "flyctl", "vercel", "netlify"]);
+const CLOUD_WORD = /\b(kubectl|helm|terraform|pulumi|aws|gcloud|az|flyctl|vercel|netlify)\b/i;
+const READ_ONLY = new Set(["cat", "less", "more", "head", "tail", "ls", "tree", "wc", "file", "stat", "grep", "egrep", "fgrep", "rg", "ag", "diff"]);
+// Prefixes that run the next word as the program.
+const WRAPPERS = new Set(["env", "command", "exec", "time", "nice", "nohup", "npx", "pnpx", "bunx", "xargs"]);
+const SHELLS = new Set(["sh", "bash", "zsh", "dash"]);
+// git global options that take a value as the next word (`git -C /repo push`).
+const GIT_VALUE_OPTIONS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--exec-path"]);
+
+function tokenize(command: string): string[][] {
+  const segments: string[][] = [];
+  let argv: string[] = [];
+  let word: string | null = null;
+  let quote: string | null = null;
+  const endWord = () => {
+    if (word !== null && word !== "$") argv.push(word);
+    word = null;
+  };
+  const endSegment = () => {
+    endWord();
+    if (argv.length > 0) segments.push(argv);
+    argv = [];
+  };
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    if (quote) {
+      if (char === quote) quote = null;
+      else if (char === "\\" && quote === '"' && index + 1 < command.length) word = (word ?? "") + command[++index];
+      else word = (word ?? "") + char;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+      word ??= "";
+    } else if (char === "\\" && index + 1 < command.length) {
+      word = (word ?? "") + command[++index];
+    } else if (/\s/.test(char) && char !== "\n") {
+      endWord();
+    } else if (";&|\n()`".includes(char)) {
+      endSegment();
+    } else {
+      word = (word ?? "") + char;
+    }
+  }
+  endSegment();
+  return segments;
+}
+
+/**
+ * Splits a shell command into the simple commands it runs, each as argv with the program's basename first:
+ * environment assignments and wrappers (env, npx, …) are dropped, `sh -c` scripts are expanded, and git's
+ * global options are removed so `git -C /repo push` reads as `git push`.
+ */
+export function commandSegments(command: string, depth = 0): string[][] {
+  const result: string[][] = [];
+  for (let argv of tokenize(command)) {
+    for (;;) {
+      while (argv.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[0])) argv = argv.slice(1);
+      if (argv.length === 0 || !WRAPPERS.has(path.basename(argv[0]))) break;
+      argv = argv.slice(1);
+      while (argv.length > 0 && argv[0].startsWith("-")) argv = argv.slice(1);
+    }
+    if (argv.length === 0) continue;
+    const program = path.basename(argv[0]);
+    const script = argv.findIndex((arg, index) => index > 0 && /^-[a-z]*c$/.test(arg));
+    if (SHELLS.has(program) && script !== -1 && argv[script + 1] && depth < 3) {
+      result.push(...commandSegments(argv[script + 1], depth + 1));
+      continue;
+    }
+    let rest = argv.slice(1);
+    if (program === "git") {
+      while (rest.length > 0 && rest[0].startsWith("-")) rest = rest.slice(GIT_VALUE_OPTIONS.has(rest[0]) ? 2 : 1);
+    }
+    result.push([program, ...rest]);
+  }
+  return result;
+}
+
+/** The first risk found in a command, checking both its raw text and its normalized simple commands. */
+function commandRisk(command: string): string | null {
+  const segments = commandSegments(command).map((argv) =>
+    // Titles read like "Running: grep -rn helm …": the label is not the program.
+    argv.length > 1 && argv[0].endsWith(":") ? commandSegments(argv.slice(1).join(" ")).flat() : argv,
+  );
+  // A word that is itself a script (`node -e "…execSync('kubectl …')"`, `python3 -c "os.system('aws …')"`) is
+  // tokenized again, so a tool named inside it is found like one on the command line.
+  const namesTool = (words: readonly string[], depth = 0): boolean =>
+    words.some(
+      (word) =>
+        CLOUD_TOOLS.has(path.basename(word)) ||
+        (depth < 3 && /[\s;&|()'"`]/.test(word) && namesTool(tokenize(word).flat(), depth + 1)),
+    );
+  if (segments.some((argv) => !READ_ONLY.has(argv[0]) && namesTool(argv))) {
+    return "cloud or deployment tool";
+  }
+  for (const text of [command, ...segments.map((argv) => argv.join(" "))]) {
+    for (const [pattern, reason] of DANGEROUS) {
+      if (pattern.test(text)) return reason;
+    }
+  }
+  return null;
+}
+
 // Natural-language red flags for answers given on the user's behalf (second check after the answerer).
 const RISKY_ANSWER =
   /\bforce[- ]push|\bdeploy(ing)? to (prod|production|staging)|\bpublish(ing)? (to|on) (npm|pypi|crates|the store)|\bdrop (the )?(table|database)|\bdelete (the )?(database|data|branch|repo(sitory)?|bucket|production|user data)|\b(password|credential|secret|api[ -]?key|private key)s?\b|\b(pay|purchase|billing|credit card)\b|删除(数据|分支|仓库)|强制推送|发布到|部署到|密码|密钥|付费|付款/i;
 
 /** Why an auto-answer must go to the user instead; null when nothing risky was found. */
 export function answerRisk(text: string): string | null {
-  for (const [pattern, reason] of DANGEROUS) {
-    if (pattern.test(text)) return reason;
-  }
+  // Answers are prose ("yes, run aws s3 rm …"), so a cloud tool counts anywhere in them.
+  const risk = commandRisk(text) ?? (CLOUD_WORD.test(text) ? "cloud or deployment tool" : null);
+  if (risk) return risk;
   return RISKY_ANSWER.test(text) ? "involves an irreversible, outward-facing or credential decision" : null;
 }
 
-function requestText(request: PermissionLike): string {
+function requestTexts(request: PermissionLike): string[] {
   const detail = request.detail as { command?: unknown; filePath?: unknown } | undefined;
   const input = request.input ?? {};
+  const text = (value: unknown) =>
+    typeof value === "string" ? value : Array.isArray(value) && value.every((part) => typeof part === "string") ? value.join(" ") : null;
   return [
     request.title,
     request.description,
-    typeof detail?.command === "string" ? detail.command : null,
-    typeof detail?.filePath === "string" ? detail.filePath : null,
-    typeof input.command === "string" ? input.command : null,
-    typeof input.cmd === "string" ? input.cmd : null,
-    typeof input.path === "string" ? input.path : null,
-    typeof input.file_path === "string" ? input.file_path : null,
-  ]
-    .filter(Boolean)
-    .join("\n");
+    text(detail?.command),
+    text(detail?.filePath),
+    text(input.command),
+    text(input.cmd),
+    text(input.path),
+    text(input.file_path),
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
 }
 
 export type AutoDecision =
@@ -67,9 +171,9 @@ export type AutoDecision =
 export function decideAutoApproval(request: PermissionLike, repoRoot: string): AutoDecision {
   // Plans, questions and mode switches are decisions, not routine tool use.
   if (request.kind !== "tool") return { approve: false, reason: `${request.kind} request needs a human decision` };
-  const text = requestText(request);
-  for (const [pattern, reason] of DANGEROUS) {
-    if (pattern.test(text)) return { approve: false, reason };
+  for (const text of requestTexts(request)) {
+    const reason = commandRisk(text);
+    if (reason) return { approve: false, reason };
   }
   const filePath = (request.detail as { filePath?: unknown } | undefined)?.filePath;
   if (typeof filePath === "string" && filePath.startsWith("/") && !filePath.startsWith(repoRoot)) {

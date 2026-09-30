@@ -84,7 +84,7 @@
 | 先建无 Prompt 子 Agent 再 `send` | `outputSchema` 只随初始 prompt 生效，这样做会丢掉它，还多一次竞态 | 预分配 `agentId`，先写 ledger，再带 prompt 和 `outputSchema` 一次创建（V8–V11） |
 | YAML 策略 | 需要依赖和 build 步骤 | 改用 JSON：`JSON.parse` + zod（zod 由宿主提供），零依赖，无 build |
 | “Reviewer 不得修改代码” | 各 provider 的只读手段各不相同（kiro 需要单独配置 agent，拒绝权限还会终止整轮，见 K6–K8）；而且 Verify 本身需要跑构建和测试 | 不强制只读，只在 prompt 中要求。review 前后对比 tree，发现改动时丢弃 verdict、转 `NEEDS_HUMAN` 并附 diffstat，不回滚（§5） |
-| 一个 turn 就 review 一次 | 调度型根 Agent 每轮都会触发 | `turn_started` 记录 git 基线，工作区没有变化就跳过 |
+| 一个 turn 就 review 一次 | 调度型根 Agent 每轮都会触发 | `turn_started` 记录 git 基线，工作区没有变化就不检查（失败通知和“已干活后的提问”除外，见 turn-outcomes.md §2.1） |
 | fix 轮当作新 turn | 会产生新的 run，并重新读策略 | fix 消息带 `messageId = ptg:<run_id>:fix:<n>`（V6），据此归入原 run |
 | 直接 `send` fix | 会打断用户（V5） | 源 Agent 不是 `idle` 就判 `SUPERSEDED` |
 | 卡片上带子 Agent 链接 | renderer 没有 navigation（V16） | 卡片显示子 Agent 标题和 id；用户去“历史”页打开 |
@@ -97,7 +97,8 @@
 {
   "version": 2,
   "trigger": "root_and_opt_in",
-  "on_fail": { "fix": { "max_rounds": 2 } },
+  "on_fail": { "fix": { "max_rounds": 2, "on_dispute": "human" } },
+  "on_inconclusive": "report",
   "agents": { "reviewer": {}, "verifier": {}, "answerer": {} },
   "on_outcome": { "done": ["review"] }
 }
@@ -108,7 +109,8 @@
 | 字段 | 取值 | 默认 |
 |---|---|---|
 | `trigger` | `root_only` / `root_and_opt_in` / `all` | `root_and_opt_in` |
-| `on_fail` | `{ "fix": { "max_rounds": 1..5 } }` / `report` | `{ "fix": { "max_rounds": 2 } }`：插件的目的是让 agent 自动循环到通过 |
+| `on_fail` | `{ "fix": { "max_rounds": 1..5, "on_dispute": "human" \| "rereview" } }` / `report` | `{ "fix": { "max_rounds": 2, "on_dispute": "human" } }`：插件的目的是让 agent 自动循环到通过；`on_dispute` 见 §4.3 |
+| `on_inconclusive` | `report` / `fail` | `report`：INCONCLUSIVE 只报告；`fail` 时，Agent 自己能补的缺口（`no_test_infra`、`other`）按 FAIL 发回修复，见 §4.3 |
 | `on_outcome.done` | 检查列表（`review`、`verify` 的非空、不重复的有序组合）/ `notify` / `ignore` | `["review"]` |
 | `agents.reviewer` / `agents.verifier` / `agents.answerer` | 见 §3.1 | 不使用 profile，继承源 Agent 启动配置并加载各自的仓库规则文件 |
 
@@ -122,7 +124,7 @@
 - 不并行：两个子 Agent 在同一工作区跑构建和测试会互相干扰，两份 findings 也难合并成一个修复提示。
 
 - 不在 git 仓库里，或文件不存在：不执行 Gate。
-- `JSON.parse` 或 zod 校验失败：不创建子 Agent，在源 timeline 写一张 `ERROR` 卡片，并附上具体错误。
+- `JSON.parse` 或 zod 校验失败：不创建子 Agent，在源 timeline 写一张 `ERROR` 卡片，并附上具体错误。只有“本来会被检查”的轮次才写：`trigger` 从无效策略里单独宽松读取（读不到用默认值），不命中的 Agent 不写；工作区没变化的轮次也不写。卡片 id 为 `post-turn-gate:config:<agent>:<policy_hash 前 12 位>`：同一份错误策略原地更新，换一份错误策略在当前位置新开一张；策略恢复有效后，最后一张错误卡更新为“已修复”（ledger 的 `config_errors` 表记录它）。
 - 策略在 `turn_started` 时读取并冻结；本轮内对它的修改只影响后续轮次。fix 轮沿用原 run 的快照。
 - 这是质量流程，不是安全边界：Agent 可以改写策略文件，关掉后续轮次的 Gate。
 
@@ -148,6 +150,7 @@
 | `profile` | `null`：不用 profile，继承源 Agent 的启动配置 |
 | `permissions` | `auto` |
 | `timeout_minutes` | reviewer、verifier 30；answerer 10 |
+| `permission_wait_minutes` | 5：上交到卡片的权限请求等这么久没人回答就自动拒绝（§5） |
 | `instructions_file` | `.paseo/post-turn-gate/<role>.md`（不存在则忽略） |
 | `provider`、`model`、`mode`、`thinking`、`features`、`instructions` | 无 |
 
@@ -165,6 +168,7 @@
 - **`instructions`**：内联规则，接在文件内容之后。两者合计不超过 20000 字符，追加在内置角色 prompt 之后、JSON 输出约束之前，不能替换结论格式。
 - 规则文件在 `turn_started` 时和策略一起读取并冻结到 run/chain 里：Agent 在本轮改规则文件，不影响对本轮的检查。
 - **`timeout_minutes`**：包括等待授权的时间。reviewer / verifier 超时判 `ERROR`；answerer 超时把问题交给用户。
+- **`permission_wait_minutes`**：卡片上的权限请求最多等这么久，之后插件代为拒绝，让子 Agent 基于已有证据给出结论，而不是一直卡到 `timeout_minutes`（§5）。
 
 #### 创建 profile 的脚本
 
@@ -200,14 +204,16 @@ turn_ended(agent, outcome, timeline)
   ├─ 最后一条 user_message.messageId 形如 "ptg:<run_id>:fix:<n>" → onFixTurnEnded(run, outcome)
   ├─ pending 属于更早的 turn（已被新一轮替换，基线已交给新一轮）→ 结束
   ├─ 没有 pending（例如插件中途重载）→ 记日志，结束
-  ├─ 策略无效 → 写 ERROR 卡片，结束
-  ├─ refresh() 源 Agent → 按 labels + trigger 过滤（managed=true 永远跳过）
+  ├─ refresh() 源 Agent → 按 labels + trigger 过滤（managed=true 永远跳过；无效策略也读得出 trigger）
+  ├─ 策略无效 → 工作区有变化才写 ERROR 卡片（§3），结束；策略有效 → 之前的错误卡标为“已修复”
   └─ classify(outcome) → 按 on_outcome 分派（turn-outcomes.md）：
        ├─ replaced → 结束；user_canceled → 结束任务链
-       ├─ 计算 endTree；与 baseTree 相同 → 结束任务链，不检查、不代答、不重试
+       ├─ 失败类（crashed / network / …）→ 不看工作区，照常通知或重试（任务链）
+       ├─ 计算 endTree；与 baseTree 相同：
+       │    done / as_done，或 awaiting_user 但任务没干过活（无 tool_call、链里没有代答/重试/修复）→ 结束任务链
        ├─ done（或 awaiting_user 且配置为 as_done）→ claim：INSERT gate_runs（source_turn_key UNIQUE）；
-       │    冲突 → 结束；成功 → dispatch(run, round=1, step=0)
-       └─ 其他类别 → 任务链：代答 / 重试 / 通知，基线沿用链起点
+       │    冲突 → 结束；成功 → dispatch(run, round=链已用轮次+1, step=0)
+       └─ 其他类别 → 任务链：代答（有宽限期）/ 重试 / 通知，基线沿用链起点
 ```
 
 `source_turn_key = <agentId>:<lastUser.messageId>`。缺少 messageId 时退化为 `<agentId>:turn:<turnId>:<timeline.length>`。
@@ -246,19 +252,25 @@ dispatch(run, round):
   - 仓库规则：`instructions_file` 和 `instructions`（§3.1，turn 开始时读取）；
   - 只输出纯 JSON 的要求（K5）。
 - ledger 在创建之前写入。崩溃后可以用同一个 id 和 key 重放，不会重复发 prompt（V9、V10）。
-- 权限请求：默认按 §5 自动处理，常规请求自动批准，高风险请求显示在卡片上由用户回答；`permissions: "ask"` 时全部交给用户。插件监听子 Agent 的 `permission_requested` / `permission_resolved`，把卡片切换为“等待授权”或恢复“进行中”。插件从不代为拒绝，因为 kiro 收到拒绝会直接终止整轮（K6）。
+- 权限请求：默认按 §5 自动处理，常规请求自动批准，高风险请求显示在卡片上由用户回答；`permissions: "ask"` 时全部交给用户。插件监听子 Agent 的 `permission_requested` / `permission_resolved`，把卡片切换为“等待授权”或恢复“进行中”。卡片上的请求超过 `permission_wait_minutes` 没人回答，插件代为拒绝；kiro 收到拒绝会直接结束整轮（K6），所以插件随后追问一次结论（§4.3）。
 
 ### 4.3 结果处理
 
 ```text
 finalizeReview(run, outcome, childTimeline):
   run 已是终态 → 忽略
+  子 Agent 有被拒绝的权限请求且还没追问过，并且 outcome ≠ completed 或没有合法 verdict
+    → 给子 Agent 发一条追问（ptg:nudge:…）：不要重试，按已有证据输出 verdict，不够就 INCONCLUSIVE/blocked_permission；
+      截止时间至少顺延 5 分钟；只追问一次
   outcome ≠ completed → ERROR("reviewer turn <kind>")
   afterTree ≠ end_tree → 记录 reviewer_changes = git diff --stat end_tree afterTree，丢弃 verdict → NEEDS_HUMAN（不回滚）
   解析最后一条 assistant_message 为 Verdict；失败 → ERROR（不得当作 PASS）
   verdict 不是 FAIL 但有 CRITICAL/HIGH finding → 按 FAIL 处理（prompt 的判定规则由代码执行）
+  INCONCLUSIVE 没写原因但有被拒绝的请求 → 原因记为 blocked_permission
+  INCONCLUSIVE 且 on_inconclusive=fail 且原因是 no_test_infra / other / 未写 → 按 FAIL 处理
   PASS / INCONCLUSIVE:
     done 列表里还有下一项检查 → step+1，dispatch 下一项
+    否则，本轮有 blocked_permission / ambiguous_request → NEEDS_HUMAN，写入 carry（下一轮重新检查整个任务）
     否则 → 本轮有 INCONCLUSIVE 则 INCONCLUSIVE，全部 PASS 则 PASSED
   FAIL（本轮后面的检查不再执行）:
     report → FAILED
@@ -277,8 +289,15 @@ sendFix(run):
 
 onFixTurnEnded(run, outcome):
   outcome ≠ completed → SUPERSEDED（base_tree 和请求留给下一轮，见 4.1）
+  当前 tree = run.end_tree（修复轮什么都没改）→ 不重新检查、不消耗轮次：
+    回复像提问（awaiting_user，refused 除外）→ SUPERSEDED，按 run 的基线和请求开任务链，记下已用轮次，走代答
+    否则视为不同意 findings（on_fail.fix.on_dispute）：
+      human（默认）→ NEEDS_HUMAN，卡片显示 Agent 的回复，写入 carry
+      rereview → 把回复交给 reviewer 再判一次（round + 1，占一轮）
   end_tree = 当前 tree → dispatch(run, round + 1, step=0)   // diff 仍然以原 base_tree 为基准，从第一项检查重新开始
 ```
+
+修复消息同时告诉 Agent：认为某条 finding 不对时，不要改文件，直接在回复里说明理由。
 
 ### 4.4 基线 tree
 
@@ -305,9 +324,10 @@ Reviewer 不强制只读，与源 Agent 采用相同的权限模型：
 - **权限请求**：默认自动处理（`agents.<role>.permissions: "auto"`）。引入 gate 的目的就是减少人工反复确认，因此：
   - 常规工具调用（读文件、搜索、构建、跑测试、仓库内编辑）由插件以 `allow_once` 自动批准，不留长期授权；
   - 不可逆、对外、提权、涉及凭据的请求（`rm -rf`、`git push/reset --hard`、`sudo`、发布、云/部署工具、`curl | sh`、破坏性 SQL、仓库外路径、`.env`/私钥等），以及 plan、question、mode 类请求，不自动批准，显示在卡片上，附带原因和按钮，由用户决定；
-  - 规则在 `server/permissions.ts`，是模式列表而不是 shell 解析器，用 `ponytail:` 注明了上限；
+  - 规则在 `server/permissions.ts`：命令先按 `&& || ; |` 和换行切成简单命令，去掉 `VAR=x`、`env`、`npx` 等前缀，展开 `sh -c '…'`，去掉 git 的全局选项（`git -C /repo push` 按 `git push` 判断），再比对模式。云/部署工具从严匹配：简单命令里任何一个词的 basename 是 `aws`、`kubectl`、`terraform` 等就上交，不管前面是什么前缀（`timeout 60 aws …`、`watch kubectl …`、`env -u X terraform …`）；唯一的例外是只读程序（`cat`、`grep`、`rg`、`ls`、`head` 等），它们的参数只是路径或搜索词，所以 `cat src/aws/client.ts` 不会被上交。这仍是模式列表而不是完整的 shell 解析器，用 `ponytail:` 注明了上限；
   - `agents.<role>.permissions: "ask"` 可恢复为每个请求都问用户；
-  - 卡片显示已自动批准的次数。等待用户回答的时间也计入 `timeout_minutes`，超时判 `ERROR`（§7）。
+  - 卡片显示已自动批准的次数，以及被拒绝的请求。
+- **等待上限**：卡片上的请求超过 `agents.<role>.permission_wait_minutes`（默认 5）没人回答，对账时插件代为拒绝（优先选请求自带的 deny 选项），并告诉子 Agent 不要重试。reviewer / verifier 随后被追问一次结论（§4.3），结果通常是 `INCONCLUSIVE / blocked_permission` → NEEDS_HUMAN，而不是等到 `timeout_minutes` 变成 ERROR。answerer 的请求被拒后，问题照常交给用户，卡片写明原因。你在卡片上点“拒绝”也按同样的方式处理。`ponytail:` 请求何时上卡只记在内存里，插件重启后等待时间从头算。
 
 `ponytail:` 这里只能事后发现改动，不能事前阻止。需要硬约束时，可以按 provider 增加只读 mode 映射，作为后续可选项。kiro 已验证可行的做法（K7、K8）：单独建一个 agent，`tools` 中不包含 `write`；shell 设置 `allowedCommands: ["git (status|diff|log|show)( .*)?"]` 和 `denyByDefault: true`；`includeMcpJson: false`。这样做的代价是 Verify 无法再运行测试。
 
@@ -326,10 +346,16 @@ run 进入终态后，插件调用 `archive()` 归档子 Agent（不使用创建
 
 ```text
 DISPATCHING → REVIEWING ─┬─ PASS → PASSED
-                         ├─ INCONCLUSIVE → INCONCLUSIVE
+                         ├─ INCONCLUSIVE ─┬─ blocked_permission / ambiguous_request → NEEDS_HUMAN
+                         │                ├─ on_inconclusive=fail 且 Agent 能补（no_test_infra / other）→ 同 FAIL
+                         │                └─ 其他 → INCONCLUSIVE
                          ├─ FAIL ─┬─ report → FAILED
-                         │        ├─ fix 且还有轮次 → FIXING → DISPATCHING (round+1)
+                         │        ├─ fix 且还有轮次 → FIXING ─┬─ 有改动 → DISPATCHING (round+1)
+                         │        │                           ├─ 无改动且提问 → SUPERSEDED（转任务链代答）
+                         │        │                           └─ 无改动不提问 → NEEDS_HUMAN（on_dispute=human）
+                         │        │                                            或 DISPATCHING（rereview，round+1）
                          │        └─ 轮次用尽 → NEEDS_HUMAN
+                         ├─ 权限被拒后无结论 → 追问一次（仍是 REVIEWING）
                          └─ 取消 / 解析失败 / 超时 → ERROR
 REVIEWING | FIXING ── 用户插话 / fix 轮被取消 ──→ SUPERSEDED
 ```
@@ -367,7 +393,9 @@ CREATE TABLE gate_runs (
   result_json     TEXT,
   reviewer_changes TEXT,             -- 检查期间工作区改动的 diffstat（有则 verdict 作废）
   concurrent_agents TEXT,            -- 与本任务重叠运行、同一仓库的其他 Agent id（JSON 数组）
-  rounds_json     TEXT NOT NULL DEFAULT '[]',
+  blocked_json    TEXT,              -- 本轮检查者被拒绝的权限请求及是否已追问（JSON）
+  dispute         TEXT,              -- 修复轮没改文件时 Agent 的回复（on_dispute）
+  rounds_json     TEXT NOT NULL DEFAULT '[]', -- 每项检查的 verdict、summary、inconclusive 原因
   error           TEXT,
   created_at      INTEGER NOT NULL,  -- epoch 毫秒
   updated_at      INTEGER NOT NULL
@@ -382,7 +410,11 @@ CREATE TABLE carries (agent_id TEXT PRIMARY KEY, repo_root TEXT NOT NULL, base_t
 -- 任务链与 answerer 子 Agent，见 turn-outcomes.md §4
 CREATE TABLE chains (agent_id TEXT PRIMARY KEY, chain_id TEXT NOT NULL UNIQUE, ...);
 CREATE TABLE chain_children (child_agent_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, chain_id TEXT NOT NULL);
+-- 每个 Agent 最后一张配置错误卡，策略恢复有效后标为“已修复”（§3）
+CREATE TABLE config_errors (agent_id TEXT PRIMARY KEY, card_id TEXT NOT NULL, error TEXT NOT NULL);
 ```
+
+旧版 ledger 缺少的列在启动时用 `ALTER TABLE … ADD COLUMN` 补上。
 
 在 claim 之前，`turn_started` 到 `turn_ended` 之间的策略快照只放在内存里。hook 本身不会重放，把它持久化没有意义。
 
@@ -390,7 +422,7 @@ CREATE TABLE chain_children (child_agent_id TEXT PRIMARY KEY, agent_id TEXT NOT 
 
 - **触发时机**：第一次拿到 `context.paseo` 时（任意 hook 或 RPC）；之后只要存在未终结的 run，就每 60 秒检查一次。只扫描 ledger，不扫描历史 Agent。
 - **`DISPATCHING`**：用 `dispatch_json` 中记录的同一份参数（同 id、同 key）重放 create（V9、V10）。成功 → `REVIEWING`；失败时先查询子 Agent，存在则进入 `REVIEWING`，否则 `ERROR`。如果还没来得及记录 `dispatch_json`，就重新 dispatch。
-- **`REVIEWING`**：`refresh(child)`。仍在 running → 继续等（等待授权也不顺延截止时间，§7）；已 idle → 用 `timeline.refetch({ direction: "tail" })` 取结果并 finalize；超时 → `ERROR`。
+- **`REVIEWING`**：`refresh(child)`。仍在 running → 继续等（等待授权也不顺延截止时间，§7），卡片上的请求超过 `permission_wait_minutes` 则代为拒绝（§5）；已 idle → 用 `timeline.refetch({ direction: "tail" })` 取结果并 finalize；超时 → `ERROR`。
 - **`FIXING`**：`refresh(source)`。已 idle 时在 timeline 中查找 `ptg:…:fix:<n>`：
   - 找不到 → 用同一个 messageId 重发；
   - 找到，但之后还有其他用户消息 → `SUPERSEDED`；
@@ -403,10 +435,16 @@ CREATE TABLE chain_children (child_agent_id TEXT PRIMARY KEY, agent_id TEXT NOT 
 ```ts
 timeline.append({ type: "plugin", id: "post-turn-gate:<run_id>:round:<round>", kind: "post-turn-gate", version: 1, data })
 data = { status, action, round, maxFixRounds, waiting, permission, autoApproved, summary, findings,
-         otherFindings, childAgentId, childTitle, reviewerChanges, error, checks }   // 以 shared/schema.ts 的 cardSchema 为准
+         otherFindings, childAgentId, childTitle, reviewerChanges, error, checks, note,
+         denied, dispute, fixed }   // 以 shared/schema.ts 的 cardSchema 为准；checks[] 带 inconclusive 原因
 ```
 
-每轮使用独立的 timeline item id：同一轮的状态原位更新，修复后的下一轮在时间线当前位置新增卡片。
+原则：同一件事的进度原地更新，每一件需要用户关注的新事件在时间线当前位置新开一张卡片。
+
+- run 卡片：每轮独立 id，同一轮原位更新，修复后的下一轮在当前位置新增卡片。
+- 任务链卡片：`post-turn-gate:outcome:<chain_id>:<card_seq>`，每个新事件（新的提问、失败、重试）`card_seq + 1`；旧卡片最后更新一次，进行中的状态改为“已在下方新卡片继续”（turn-outcomes.md §5）。
+- 配置错误卡片：见 §3。
+- INCONCLUSIVE 的检查逐项显示“未验证：<原因>”，颜色与 PASS 区分；被拒绝的权限请求、修复轮里 Agent 的反驳（`dispute`）也显示在卡片上。
 
 `findings` 只保留阻塞项（CRITICAL/HIGH），其余只给计数，保证数据小于 64 KiB。客户端用 `addTimelineRenderer` 渲染，颜色取 `theme.colors.status*`。
 
@@ -418,9 +456,20 @@ data = { status, action, round, maxFixRounds, waiting, permission, autoApproved,
   "summary": "...",
   "findings": [
     { "severity": "CRITICAL | HIGH | MEDIUM | LOW", "title": "...", "evidence": "...", "suggested_fix": "..." }
-  ]
+  ],
+  "inconclusive_reason": "blocked_permission | ambiguous_request | no_test_infra | env_missing | other | null"
 }
 ```
+
+`inconclusive_reason` 只在 INCONCLUSIVE 时有值，其余为 `null`（写成 nullable 而不是 optional，严格的结构化输出也能接受；缺省时按 `null` 解析）。各原因的去向：
+
+| 原因 | 含义 | 处理 |
+|---|---|---|
+| `blocked_permission` | 需要的命令或文件被拒绝、没人回答 | NEEDS_HUMAN，卡片附上被拒绝的请求 |
+| `ambiguous_request` | 需求没说清楚要什么 | NEEDS_HUMAN，请用户在对话里澄清 |
+| `no_test_infra` | 没有测试或可运行的检查 | 报告；`on_inconclusive: "fail"` 时按 FAIL 发回，让 Agent 补测试 |
+| `env_missing` | 缺凭证、服务或工具 | 报告（Agent 修不了） |
+| `other` / 未写 | 证据不足 | 同 `no_test_infra` |
 
 - Verify：关注需求是否逐项达成，并运行构建、测试，检查可观察到的行为。
 - Review：关注 correctness、regression、error handling、security、tests、maintainability。
@@ -451,14 +500,16 @@ server/*.test.ts           # 真实 git + sqlite、fake paseo 的测试（node:t
 
 ## 13. 验收标准
 
-- [ ] 读取并校验 `.paseo/post-turn-gate.json`；无效时显示 ERROR 卡片，不创建子 Agent。
+- [ ] 读取并校验 `.paseo/post-turn-gate.json`；无效时只对本来会被检查的轮次显示 ERROR 卡片（每份策略一张，修好后标为已修复），不创建子 Agent。
 - [ ] `turn_started` 冻结策略和基线 tree。
 - [ ] 支持 `done` 检查列表（review、verify，按顺序）；只检查以 `done`（或 `awaiting_user` 配置为 `as_done`）结束、且任务改动了工作区的 turn。
 - [ ] 默认只触发根 Agent，以及带 `post-turn-gate.target=true` 的子 Agent；`managed=true` 永远不触发。
 - [ ] Reviewer 与源 Agent 在同一 workspace，以源 Agent 为 parent；默认继承 provider/model/mode/thinking/features，可用 agent profile 或显式字段覆盖。
 - [ ] `scripts/create-agent-profiles.mjs` 能创建、更新 reviewer/verifier profile 并热加载。
-- [ ] Reviewer 改动工作区时，卡片显示警告和 diffstat；解析失败 → ERROR；Reviewer 等待授权时，卡片显示“等待授权”和按钮；等待时间计入 `timeout_minutes`，超时 → ERROR 并写明原因。
-- [ ] 卡片按 `post-turn-gate:<run_id>:round:<round>` 每轮一张、同轮原地更新；run 到终态后归档子 Agent，并且可以在“历史”页找到。
+- [ ] Reviewer 改动工作区时，卡片显示警告和 diffstat；解析失败 → ERROR；Reviewer 等待授权时，卡片显示“等待授权”和按钮；超过 `permission_wait_minutes` 自动拒绝并追问一次结论；等待时间计入 `timeout_minutes`，超时 → ERROR 并写明原因。
+- [ ] INCONCLUSIVE 带原因：blocked_permission / ambiguous_request → NEEDS_HUMAN；`on_inconclusive: "fail"` 时 Agent 能补的缺口按 FAIL 处理。
+- [ ] 修复轮没有改动时不重新检查：提问转代答，否则按 `on_dispute` 交给用户或带着反驳重审。
+- [ ] 卡片按 `post-turn-gate:<run_id>:round:<round>` 每轮一张、同轮原地更新；任务链卡片每个新事件一张；run 到终态后归档子 Agent，并且可以在“历史”页找到。
 - [ ] `report` 只报告；`fix` 在源 Agent 空闲时发送 findings，修复后按原基线重新 review；轮次用尽 → NEEDS_HUMAN。
 - [ ] 用户插话会让进行中的 run 变为 SUPERSEDED，不会打断用户的 turn。
 - [ ] 同一个 source turn 只有一个 run；同一轮只创建一个子 Agent。

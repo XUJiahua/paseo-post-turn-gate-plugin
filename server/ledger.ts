@@ -10,6 +10,7 @@ export interface RoundRecord {
   childAgentId: string;
   verdict: Verdict["verdict"] | null;
   summary: string | null;
+  reason?: Verdict["inconclusive_reason"];
 }
 
 export interface Run {
@@ -34,6 +35,10 @@ export interface Run {
   reviewer_changes: string | null;
   /** JSON array of other agents whose turns overlapped this task in the same repository. */
   concurrent_agents: string | null;
+  /** JSON {title, nudged}: the current checker's denied permission request, and whether it was nudged for a verdict. */
+  blocked_json: string | null;
+  /** The agent's reply when a fix round changed nothing and disputed the findings. */
+  dispute: string | null;
   rounds_json: string;
   error: string | null;
   created_at: number;
@@ -60,6 +65,14 @@ export interface Chain {
   answer_dispatch_json: string | null;
   answer_deadline_at: number | null;
   card_json: string | null;
+  /** Outcome cards of the chain are numbered: each new event gets a card at the current timeline position. */
+  card_seq: number;
+  /** Fix rounds a gate run of this chain already used (a fix turn that asked a question continues as a chain). */
+  rounds_used: number;
+  /** A scheduled answerer start (answer.delay_seconds), with the reply and signal it will be given. */
+  answer_at: number | null;
+  answer_reply: string | null;
+  answer_signal: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -90,6 +103,11 @@ const CHAIN_COLUMNS = [
   "answer_dispatch_json",
   "answer_deadline_at",
   "card_json",
+  "card_seq",
+  "rounds_used",
+  "answer_at",
+  "answer_reply",
+  "answer_signal",
 ] as const;
 
 export type NewRun = Pick<
@@ -128,6 +146,8 @@ const COLUMNS = [
   "result_json",
   "reviewer_changes",
   "concurrent_agents",
+  "blocked_json",
+  "dispute",
   "rounds_json",
   "error",
   "created_at",
@@ -168,6 +188,8 @@ export class Ledger {
         result_json TEXT,
         reviewer_changes TEXT,
         concurrent_agents TEXT,
+        blocked_json TEXT,
+        dispute TEXT,
         rounds_json TEXT NOT NULL DEFAULT '[]',
         error TEXT,
         created_at INTEGER NOT NULL,
@@ -194,6 +216,11 @@ export class Ledger {
         answer_dispatch_json TEXT,
         answer_deadline_at INTEGER,
         card_json TEXT,
+        card_seq INTEGER NOT NULL DEFAULT 0,
+        rounds_used INTEGER NOT NULL DEFAULT 0,
+        answer_at INTEGER,
+        answer_reply TEXT,
+        answer_signal TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -207,6 +234,11 @@ export class Ledger {
         run_id TEXT NOT NULL,
         round INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS config_errors (
+        agent_id TEXT PRIMARY KEY,
+        card_id TEXT NOT NULL,
+        error TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS carries (
         agent_id TEXT PRIMARY KEY,
         repo_root TEXT NOT NULL,
@@ -215,14 +247,26 @@ export class Ledger {
         created_at INTEGER NOT NULL
       );
     `);
-    // Ledgers created before multi-check runs lack `step`.
-    const columns = this.db.prepare("PRAGMA table_info(gate_runs)").all() as Array<{ name: string }>;
-    if (!columns.some((column) => column.name === "step")) {
-      this.db.exec("ALTER TABLE gate_runs ADD COLUMN step INTEGER NOT NULL DEFAULT 0");
-    }
-    if (!columns.some((column) => column.name === "concurrent_agents")) {
-      this.db.exec("ALTER TABLE gate_runs ADD COLUMN concurrent_agents TEXT");
-    }
+    // Ledgers created by older releases lack newer columns.
+    const migrate = (table: string, added: Record<string, string>) => {
+      const existing = new Set((this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name));
+      for (const [column, type] of Object.entries(added)) {
+        if (!existing.has(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+      }
+    };
+    migrate("gate_runs", {
+      step: "INTEGER NOT NULL DEFAULT 0",
+      concurrent_agents: "TEXT",
+      blocked_json: "TEXT",
+      dispute: "TEXT",
+    });
+    migrate("chains", {
+      card_seq: "INTEGER NOT NULL DEFAULT 0",
+      rounds_used: "INTEGER NOT NULL DEFAULT 0",
+      answer_at: "INTEGER",
+      answer_reply: "TEXT",
+      answer_signal: "TEXT",
+    });
   }
 
   /** Records a reviewer/verifier agent id before it is created, so its events are never mistaken for a source. */
@@ -242,14 +286,14 @@ export class Ledger {
     return run ? { run, round: row.round } : null;
   }
 
-  /** Inserts a DISPATCHING run; false when this source turn already has one. */
-  claim(run: NewRun, now: number): boolean {
+  /** Inserts a DISPATCHING run starting at `round`; false when this source turn already has one. */
+  claim(run: NewRun, now: number, round = 1): boolean {
     const result = this.db
       .prepare(
         `INSERT OR IGNORE INTO gate_runs
           (run_id, source_agent_id, source_turn_key, workspace_id, repo_root, policy_hash, policy_json,
            request_text, base_tree, end_tree, concurrent_agents, status, round, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DISPATCHING', 1, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DISPATCHING', ?, ?, ?)`,
       )
       .run(
         run.run_id,
@@ -263,6 +307,7 @@ export class Ledger {
         run.base_tree,
         run.end_tree,
         run.concurrent_agents,
+        round,
         now,
         now,
       );
@@ -366,6 +411,23 @@ export class Ledger {
       .prepare("SELECT agent_id, chain_id FROM chain_children WHERE child_agent_id = ?")
       .get(childAgentId) as { agent_id: string; chain_id: string } | undefined;
     return row ? { agentId: row.agent_id, chainId: row.chain_id } : null;
+  }
+
+  // ---------- config error cards ----------
+
+  /** The config error card last shown to an agent, so it can be marked fixed once the policy is valid. */
+  configError(agentId: string): { card_id: string; error: string } | null {
+    return (this.db.prepare("SELECT card_id, error FROM config_errors WHERE agent_id = ?").get(agentId) as
+      | { card_id: string; error: string }
+      | undefined) ?? null;
+  }
+
+  setConfigError(agentId: string, cardId: string, error: string): void {
+    this.db.prepare("INSERT OR REPLACE INTO config_errors (agent_id, card_id, error) VALUES (?, ?, ?)").run(agentId, cardId, error);
+  }
+
+  deleteConfigError(agentId: string): void {
+    this.db.prepare("DELETE FROM config_errors WHERE agent_id = ?").run(agentId);
   }
 
   // ---------- carries ----------

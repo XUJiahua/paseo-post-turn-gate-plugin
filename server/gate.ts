@@ -28,6 +28,7 @@ import {
   defaultInstructionsFile,
   gateChecks,
   maxFixRounds,
+  onDispute,
   policySchema,
 } from "../shared/schema.ts";
 import { diffStat, snapshotTree, toplevel } from "./git.ts";
@@ -38,6 +39,7 @@ import {
   buildAnswerPrompt,
   buildFixPrompt,
   buildGatePrompt,
+  buildNudgePrompt,
   latestAssistantText,
   parseAnswer,
   parseVerdict,
@@ -68,6 +70,8 @@ interface LoadedPolicy {
   policyHash: string;
   error: string | null;
   baseTree: string | null;
+  /** The policy's trigger, read leniently from an invalid policy too: its error card only goes to gated agents. */
+  trigger: Policy["trigger"];
 }
 
 /** Policy and baseline frozen when a turn starts; chainId is set when the turn continues a task chain. */
@@ -91,7 +95,23 @@ interface Task {
   turnKey: string;
   /** Other agents whose turns overlapped this task in the same repository. */
   concurrent: readonly string[];
+  /** The task did work (tool calls, or earlier turns of its chain), even if the tree did not change. */
+  worked?: boolean;
+  /** Round a new gate run starts at: fix rounds a fix turn used before it asked a question carry over. */
+  startRound?: number;
 }
+
+/** A checker's permission requests that were denied, and whether it was asked for a verdict afterwards. */
+interface Blocked {
+  child: string;
+  titles: string[];
+  nudged: boolean;
+}
+
+// Failed turns are reported (or retried) whether or not they changed files: the user may not be watching.
+const FAILURES: ReadonlySet<Category> = new Set(["crashed", "network", "rate_limited", "quota_exhausted", "context_exhausted", "error"]);
+// Minutes a checker gets to reply with a verdict after it was told a permission was denied.
+const NUDGE_MINUTES = 5;
 
 type AnswerConfig = Extract<OnOutcome["awaiting_user"], { answer: unknown }>["answer"];
 
@@ -185,6 +205,9 @@ export function createGate(options: GateOptions): Gate {
   // Pending permission of each run's current child, shown on the card so it can be answered there.
   const waiting = new Map<string, PermissionCard>();
   const autoApproved = new Map<string, number>(); // run id → requests approved without a human
+  // ponytail: in memory; after a restart a shown request's wait starts again. Upgrade path: a ledger column.
+  const escalatedAt = new Map<string, number>(); // `${agentId}:${requestId}` → when it was put on a card
+  const deniedAnswerers = new Set<string>(); // answerer ids whose request was denied after the wait
 
   // Agents with a running turn per repository, and the other agents whose turns overlapped theirs. A tree
   // snapshot covers the whole working tree, so overlapping agents' changes end up in each other's diffs.
@@ -248,10 +271,13 @@ export function createGate(options: GateOptions): Gate {
     const records = (JSON.parse(run.rounds_json) as RoundRecord[]).filter((record) => record.round === run.round);
     const checks = gateChecks(policy).map((check, index) => {
       const record = records.find((entry) => entry.check === check);
-      if (record?.verdict) return { check, state: record.verdict, summary: record.summary ? truncate(record.summary, 1000) : null };
+      if (record?.verdict) {
+        return { check, state: record.verdict, summary: record.summary ? truncate(record.summary, 1000) : null, reason: record.reason ?? null };
+      }
       const state = isTerminal(run.status) ? ("skipped" as const) : index === run.step ? ("running" as const) : ("pending" as const);
-      return { check, state, summary: null };
+      return { check, state, summary: null, reason: null };
     });
+    const denied = blockedOf(run).flatMap((entry) => entry.titles);
     return {
       status: run.status,
       action: checkOf(run),
@@ -269,7 +295,22 @@ export function createGate(options: GateOptions): Gate {
       childTitle: dispatch?.title ?? null,
       reviewerChanges: run.reviewer_changes ? truncate(run.reviewer_changes, 2000) : null,
       error: run.error ? truncate(run.error, 2000) : null,
+      denied: denied.length > 0 ? truncate(denied.join("; "), 600) : null,
+      dispute: run.dispute ? truncate(run.dispute, 1500) : null,
+      fixed: false,
     };
+  }
+
+  const blockedOf = (run: Run): Blocked[] => (run.blocked_json ? (JSON.parse(run.blocked_json) as Blocked[]) : []);
+
+  /** Records a denied permission request of a run's checker (denied by you on the card, or after the wait). */
+  function recordDenied(run: Run, child: string, title: string): Run {
+    const entries = blockedOf(run);
+    const entry = entries.find((candidate) => candidate.child === child);
+    if (entry?.titles.includes(title)) return run;
+    if (entry) entry.titles.push(title);
+    else entries.push({ child, titles: [title], nudged: false });
+    return ledger.update(run.run_id, { blocked_json: JSON.stringify(entries) }, now());
   }
 
   async function publishCard(paseo: Paseo, run: Run): Promise<void> {
@@ -284,7 +325,13 @@ export function createGate(options: GateOptions): Gate {
     });
   }
 
-  async function publishConfigError(paseo: Paseo, agentId: string, error: string): Promise<void> {
+  /**
+   * One card per agent and policy version: the same broken policy updates its card in place, a new one gets a
+   * card at the current position, and the card is marked fixed once the agent's policy is valid again.
+   */
+  async function publishConfigError(paseo: Paseo, agentId: string, error: string, policyHash: string, fixed = false): Promise<void> {
+    const id = fixed ? ledger.configError(agentId)?.card_id : `post-turn-gate:config:${agentId}:${policyHash.slice(0, 12)}`;
+    if (!id) return;
     const data: CardData = {
       status: "ERROR",
       action: null,
@@ -301,15 +348,19 @@ export function createGate(options: GateOptions): Gate {
       reviewerChanges: null,
       error: truncate(`${POLICY_PATH}: ${error}`, 2000),
       checks: [],
-      note: null,
+      note: fixed ? "Fixed: the policy is valid again." : null,
+      denied: null,
+      dispute: null,
+      fixed,
     };
-    await paseo.agents.ref(agentId).timeline.append({
-      type: "plugin",
-      id: `post-turn-gate:config:${agentId}`,
-      kind: CARD_KIND,
-      version: CARD_VERSION,
-      data,
-    });
+    if (fixed) ledger.deleteConfigError(agentId);
+    else ledger.setConfigError(agentId, id, error);
+    await paseo.agents.ref(agentId).timeline.append({ type: "plugin", id, kind: CARD_KIND, version: CARD_VERSION, data });
+  }
+
+  async function clearConfigError(paseo: Paseo, agentId: string): Promise<void> {
+    const shown = ledger.configError(agentId);
+    if (shown) await publishConfigError(paseo, agentId, shown.error, "", true).catch((error) => log("config card update failed", error));
   }
 
   async function transition(paseo: Paseo, run: Run, patch: Partial<Run>): Promise<Run> {
@@ -374,24 +425,28 @@ export function createGate(options: GateOptions): Gate {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
     }
-    const base = { repoRoot, policyHash: createHash("sha256").update(raw).digest("hex") };
+    // Always taken: on_outcome (answers, retries) works even when `done` does not gate, and an invalid policy's
+    // card is only shown for a turn that changed files.
+    const baseTree = await snapshotTree(repoRoot);
+    const base = { repoRoot, policyHash: createHash("sha256").update(raw).digest("hex"), baseTree };
+    const invalid = (error: string, json: unknown) => {
+      const trigger = policySchema.shape.trigger.safeParse((json as { trigger?: unknown } | null)?.trigger);
+      return { ...base, policy: null, policyJson: raw, error, trigger: trigger.success ? trigger.data : ("root_and_opt_in" as const) };
+    };
     let json: unknown;
     try {
       json = JSON.parse(raw);
     } catch (error) {
-      return { ...base, policy: null, policyJson: raw, error: `invalid JSON: ${(error as Error).message}`, baseTree: null };
+      return invalid(`invalid JSON: ${(error as Error).message}`, null);
     }
     const parsed = policySchema.safeParse(json);
     if (!parsed.success) {
-      const error = parsed.error.issues.map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`).join("; ");
-      return { ...base, policy: null, policyJson: raw, error, baseTree: null };
+      return invalid(parsed.error.issues.map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`).join("; "), json);
     }
     const policy = parsed.data;
     const rulesError = await loadRules(repoRoot, policy);
-    if (rulesError) return { ...base, policy: null, policyJson: raw, error: rulesError, baseTree: null };
-    // Always taken: on_outcome (answers, retries) works even when `done` does not gate.
-    const baseTree = await snapshotTree(repoRoot);
-    return { ...base, policy, policyJson: JSON.stringify(policy), error: null, baseTree };
+    if (rulesError) return invalid(rulesError, json);
+    return { ...base, policy, policyJson: JSON.stringify(policy), error: null, trigger: policy.trigger };
   }
 
   /**
@@ -420,10 +475,10 @@ export function createGate(options: GateOptions): Gate {
     return null;
   }
 
-  function triggers(policy: Policy, agent: AgentSnapshot, isRoot: boolean): boolean {
+  function triggers(trigger: Policy["trigger"], agent: AgentSnapshot, isRoot: boolean): boolean {
     if (agent.labels[MANAGED_LABEL] === "true") return false;
-    if (policy.trigger === "all") return true;
-    if (policy.trigger === "root_only") return isRoot;
+    if (trigger === "all") return true;
+    if (trigger === "root_only") return isRoot;
     return isRoot || agent.labels[TARGET_LABEL] === "true";
   }
 
@@ -471,6 +526,7 @@ export function createGate(options: GateOptions): Gate {
         endTree: run.end_tree,
         instructions: spec.instructions,
         concurrentAgents: concurrentOf(run),
+        dispute: run.dispute,
       }),
       clientMessageId: key,
       outputSchema: VERDICT_JSON_SCHEMA,
@@ -496,6 +552,8 @@ export function createGate(options: GateOptions): Gate {
       dispatch_json: JSON.stringify({ workspaceId: run.workspace_id, ...(note ? { note } : {}), ...payload }),
       deadline_at: now() + timeoutOf(run),
       reviewer_changes: null,
+      // Denied requests are shown for the whole round; a new round starts clean.
+      ...(run.step === 0 ? { blocked_json: null } : {}),
     });
     await createChild(paseo, claimed);
   }
@@ -527,7 +585,23 @@ export function createGate(options: GateOptions): Gate {
     if (run.status !== "REVIEWING" || run.child_agent_id !== childAgentId) return;
     const round = run.round;
     const check = checkOf(run);
+    const blocked = blockedOf(run).find((entry) => entry.child === childAgentId);
+    // A denied request often ends the checker's turn without a verdict (kiro ends the turn on a denial).
+    // Ask once for a verdict from the evidence it has, instead of waiting for the timeout.
+    const nudge = async () => {
+      const entries = blockedOf(run).map((entry) => (entry.child === childAgentId ? { ...entry, nudged: true } : entry));
+      const next = ledger.update(
+        run.run_id,
+        { blocked_json: JSON.stringify(entries), deadline_at: Math.max(run.deadline_at ?? 0, now() + NUDGE_MINUTES * minuteMs) },
+        now(),
+      );
+      await publishCard(paseo, next).catch((error) => log("card update failed", error));
+      await paseo.agents.ref(childAgentId).send(buildNudgePrompt(blocked!.titles.join("; ")), {
+        messageId: `${FIX_PREFIX}nudge:${run.run_id}:${round}:${run.step}`,
+      });
+    };
     if (outcome.kind !== "completed") {
+      if (blocked && !blocked.nudged) return nudge();
       const reason = outcome.kind === "failed" ? outcome.error.message : outcome.reason;
       return fail(paseo, run, `reviewer turn ${outcome.kind}: ${reason}`);
     }
@@ -548,12 +622,17 @@ export function createGate(options: GateOptions): Gate {
       carryOver(run);
       return archiveChild(paseo, childAgentId);
     }
-    const verdict = parseVerdict(latestAssistantText(timeline));
+    let verdict = parseVerdict(latestAssistantText(timeline));
+    if (!verdict && blocked && !blocked.nudged) return nudge();
     if (!verdict) {
       return fail(paseo, run, "reviewer reply is not a valid verdict JSON", { reviewer_changes: reviewerChanges });
     }
+    if (verdict.verdict === "INCONCLUSIVE" && !verdict.inconclusive_reason && blocked) {
+      verdict = { ...verdict, inconclusive_reason: "blocked_permission" };
+    }
+    const reason = verdict.inconclusive_reason;
     const rounds = JSON.parse(run.rounds_json) as RoundRecord[];
-    rounds.push({ round, check, childAgentId, verdict: verdict.verdict, summary: verdict.summary });
+    rounds.push({ round, check, childAgentId, verdict: verdict.verdict, summary: verdict.summary, reason });
     const policy = JSON.parse(run.policy_json) as Policy;
     const base = {
       verdict: verdict.verdict,
@@ -561,7 +640,12 @@ export function createGate(options: GateOptions): Gate {
       reviewer_changes: reviewerChanges,
       rounds_json: JSON.stringify(rounds),
     };
-    if (verdict.verdict !== "FAIL") {
+    // on_inconclusive "fail" covers gaps the agent can close itself (tests, other evidence); a blocked
+    // permission, an ambiguous request or a missing environment are not the agent's to fix.
+    const failing =
+      verdict.verdict === "FAIL" ||
+      (verdict.verdict === "INCONCLUSIVE" && policy.on_inconclusive === "fail" && (reason === null || reason === "no_test_infra" || reason === "other"));
+    if (!failing) {
       // Checks run in order until one fails; INCONCLUSIVE does not block the next check.
       const next = run.step + 1;
       if (next < gateChecks(policy).length) {
@@ -572,8 +656,21 @@ export function createGate(options: GateOptions): Gate {
         await archiveChild(paseo, childAgentId);
         return dispatch(paseo, dispatching);
       }
-      const inconclusive = rounds.some((record) => record.round === round && record.verdict === "INCONCLUSIVE");
-      await transition(paseo, run, { ...base, status: inconclusive ? "INCONCLUSIVE" : "PASSED" });
+      const current = rounds.filter((record) => record.round === round);
+      const needsYou = current.find((record) => record.reason === "blocked_permission" || record.reason === "ambiguous_request");
+      if (needsYou) {
+        const what = needsYou.check === "verify" ? "verifier" : "reviewer";
+        const error =
+          needsYou.reason === "blocked_permission"
+            ? `The ${what} could not finish: a permission request it needed was denied or not answered. Allow it next time, or tell the agent how to proceed; its next turn checks the whole task again.`
+            : `The ${what} could not tell what the request requires. Clarify it in the chat; the agent's next turn checks the whole task again.`;
+        await transition(paseo, run, { ...base, status: "NEEDS_HUMAN", error });
+        // Unverified changes stay unaccepted: the agent's next turn checks the whole task again.
+        carryOver(run);
+      } else {
+        const inconclusive = current.some((record) => record.verdict === "INCONCLUSIVE");
+        await transition(paseo, run, { ...base, status: inconclusive ? "INCONCLUSIVE" : "PASSED" });
+      }
     } else if (maxFixRounds(policy) === 0) {
       await transition(paseo, run, { ...base, status: "FAILED" });
     } else if (round - 1 >= maxFixRounds(policy)) {
@@ -607,7 +704,13 @@ export function createGate(options: GateOptions): Gate {
 
   const fixMessageId = (run: Run) => `${FIX_PREFIX}${run.run_id}:fix:${run.round}`;
 
-  async function onFixTurnEnded(paseo: Paseo, run: Run, outcome: TurnEnded["outcome"], concurrent: readonly string[] = []): Promise<void> {
+  async function onFixTurnEnded(
+    paseo: Paseo,
+    run: Run,
+    outcome: TurnEnded["outcome"],
+    concurrent: readonly string[],
+    timeline: readonly TimelineItem[],
+  ): Promise<void> {
     if (run.status !== "FIXING") return;
     if (concurrent.length > 0) {
       run = ledger.update(run.run_id, { concurrent_agents: encodeConcurrent([...concurrentOf(run), ...concurrent]) }, now());
@@ -617,14 +720,60 @@ export function createGate(options: GateOptions): Gate {
       return;
     }
     const endTree = await snapshotTree(run.repo_root);
+    if (endTree === run.end_tree) return onFixWithoutChanges(paseo, run, timeline);
     // A fix can break a check that passed earlier, so the next round starts from the first check.
     // Leaves FIXING in the same write, so a crash here cannot count the fix turn twice on recovery.
     const next = ledger.update(
       run.run_id,
-      { end_tree: endTree, round: run.round + 1, step: 0, status: "DISPATCHING", dispatch_json: null, child_agent_id: null },
+      { end_tree: endTree, round: run.round + 1, step: 0, status: "DISPATCHING", dispatch_json: null, child_agent_id: null, dispute: null },
       now(),
     );
     await dispatch(paseo, next);
+  }
+
+  /**
+   * The agent changed nothing in its fix turn: checking the same tree again would only use up a round.
+   * A question goes to the answerer (or you); any other reply disputes the findings (on_fail.fix.on_dispute).
+   */
+  async function onFixWithoutChanges(paseo: Paseo, run: Run, timeline: readonly TimelineItem[]): Promise<void> {
+    const policy = JSON.parse(run.policy_json) as Policy;
+    const items = currentTurnItems(timeline);
+    const reply = replyText(items).trim();
+    const { category, detail } = classify({ outcome: { kind: "completed" }, turnItems: items, statusAtEnd: null });
+    if (category === "awaiting_user" && detail !== "refused" && policy.on_outcome.awaiting_user !== "as_done") {
+      await transition(paseo, run, { status: "SUPERSEDED", error: "The agent asked a question instead of fixing; the task continues from the answer." });
+      // The task continues as a chain from the run's baseline; its next gate run keeps counting fix rounds.
+      const chain = ensureChain({
+        agentId: run.source_agent_id,
+        workspaceId: run.workspace_id,
+        repoRoot: run.repo_root,
+        policy,
+        policyJson: run.policy_json,
+        policyHash: run.policy_hash,
+        baseTree: run.base_tree,
+        requestText: run.request_text,
+        turnKey: `${run.run_id}:fix:${run.round}`,
+        concurrent: concurrentOf(run),
+      });
+      const current = ledger.updateChain(chain.agent_id, { rounds_used: run.round }, now()) ?? chain;
+      return handleAwaitingUser(paseo, current, reply, detail);
+    }
+    if (onDispute(policy) === "rereview") {
+      const next = ledger.update(
+        run.run_id,
+        { round: run.round + 1, step: 0, status: "DISPATCHING", dispatch_json: null, child_agent_id: null, dispute: truncate(reply || "(no reply)", 4000) },
+        now(),
+      );
+      return dispatch(paseo, next);
+    }
+    await transition(paseo, run, {
+      status: "NEEDS_HUMAN",
+      dispute: truncate(reply || "(no reply)", 4000),
+      error:
+        `The agent changed nothing in fix round ${run.round} and replied instead (below). Decide who is right, ` +
+        "then send the agent a message: its next turn checks the whole task again.",
+    });
+    carryOver(run);
   }
 
   // ---------- task chains, answers and retries (docs/turn-outcomes.md) ----------
@@ -675,7 +824,8 @@ export function createGate(options: GateOptions): Gate {
       .ref(chain.agent_id)
       .timeline.append({
         type: "plugin",
-        id: `post-turn-gate:outcome:${chain.chain_id}`,
+        // Numbered: each new event of the task gets a card where the user is looking (see newCard).
+        id: `post-turn-gate:outcome:${chain.chain_id}:${chain.card_seq}`,
         kind: OUTCOME_CARD_KIND,
         version: OUTCOME_CARD_VERSION,
         data: card,
@@ -684,13 +834,37 @@ export function createGate(options: GateOptions): Gate {
     return next;
   }
 
-  /** Drops a scheduled retry or a running answerer; the chain itself stays. */
+  /**
+   * Starts a new outcome card for a new event of the task (a new question, failure or retry), so it appears at
+   * the current timeline position instead of updating a card far above. The previous card is closed first.
+   */
+  async function newCard(paseo: Paseo, chain: Chain): Promise<Chain> {
+    if (!chain.card_json) return chain;
+    const open = ["answer_scheduled", "answering", "retry_scheduled", "retrying"].includes(chainCard(chain).state);
+    const closed = await publishChainCard(paseo, chain, {
+      canStopAnswering: false,
+      permission: null,
+      nextRetryAt: null,
+      ...(open ? { state: "resolved" as const, message: "Continued in a newer card below." } : {}),
+    });
+    return ledger.updateChain(chain.agent_id, { card_seq: closed.card_seq + 1, card_json: null }, now()) ?? closed;
+  }
+
+  /** Drops a scheduled retry or answer, or a running answerer; the chain itself stays. */
   async function cancelChainWork(paseo: Paseo, chain: Chain): Promise<Chain> {
     if (chain.answer_child_id) await archiveChild(paseo, chain.answer_child_id);
     return (
       ledger.updateChain(
         chain.agent_id,
-        { next_retry_at: null, answer_child_id: null, answer_dispatch_json: null, answer_deadline_at: null },
+        {
+          next_retry_at: null,
+          answer_child_id: null,
+          answer_dispatch_json: null,
+          answer_deadline_at: null,
+          answer_at: null,
+          answer_reply: null,
+          answer_signal: null,
+        },
         now(),
       ) ?? chain
     );
@@ -741,6 +915,7 @@ export function createGate(options: GateOptions): Gate {
       requestText: chain.request_text,
       turnKey: `${chain.agent_id}:chain:${chain.chain_id}:${chain.answers}:${chain.retries}`,
       concurrent: [...(taskConcurrent.get(chain.agent_id) ?? [])],
+      startRound: chain.rounds_used + 1,
     };
   }
 
@@ -790,7 +965,7 @@ export function createGate(options: GateOptions): Gate {
       end_tree: endTree,
       concurrent_agents: encodeConcurrent(task.concurrent),
     };
-    if (!ledger.claim(run, now())) return log(`skip ${task.agentId}: run already exists for this turn`);
+    if (!ledger.claim(run, now(), task.startRound ?? 1)) return log(`skip ${task.agentId}: run already exists for this turn`);
     log(`gate ${run.run_id} for ${task.agentId}: ${checks.join(" → ")}`);
     await dispatch(paseo, ledger.get(run.run_id)!);
   }
@@ -807,29 +982,34 @@ export function createGate(options: GateOptions): Gate {
     if (category === "user_canceled") {
       return endChain(paseo, task.agentId, { state: "stopped", message: "You stopped the agent." });
     }
-    // A task that has not changed the working tree (a question, an explanation) is left alone:
-    // no checks, no answerer, no retry. The user is in the conversation and answers it.
-    const endTree = await snapshotTree(task.repoRoot);
-    if (endTree === task.baseTree) {
-      log(`skip ${task.agentId}: working tree unchanged (${category})`);
-      return endChain(paseo, task.agentId, { state: "resolved", message: "The task ended without changing files." });
+    // A task that did nothing (a chat question, an explanation) is left alone: no checks, no answerer. One that
+    // worked without changing files yet (it read code, then asks how to proceed) can still be answered, and a
+    // failed turn is always reported: the user may not be watching.
+    let endTree: string | undefined;
+    if (!FAILURES.has(category)) {
+      endTree = await snapshotTree(task.repoRoot);
+      const unchanged = endTree === task.baseTree;
+      const asDone = category === "done" || action === "as_done";
+      if (unchanged && (asDone || !task.worked)) {
+        log(`skip ${task.agentId}: working tree unchanged (${category})`);
+        return endChain(paseo, task.agentId, { state: "resolved", message: "The task ended without changing files." });
+      }
     }
     if (category === "done" || (category === "awaiting_user" && action === "as_done")) {
       if (gateChecks(task.policy).length > 0) await startGate(paseo, task, endTree);
       else if (task.policy.on_outcome.done === "notify") {
-        await publishChainCard(paseo, ensureChain(task), { category: "done", state: "notice", message: "The agent finished its turn." });
+        const chain = await newCard(paseo, ensureChain(task));
+        await publishChainCard(paseo, chain, { category: "done", state: "notice", message: "The agent finished its turn." });
+        return endChain(paseo, task.agentId, null);
       }
       return endChain(paseo, task.agentId, { state: "resolved", message: "The task continued and finished." });
     }
-    const chain = ensureChain(task);
-    if (action === "ignore") return;
-    if (category === "awaiting_user") {
-      const cfg = answerConfig(task.policy);
-      if (!cfg) return needsUser(paseo, chain, reply.slice(-600), "auto-answer is off for this repository");
-      if (chain.stop_answering) return needsUser(paseo, chain, reply.slice(-600), "auto-answering was stopped for this task");
-      if (chain.answers >= cfg.max) return needsUser(paseo, chain, reply.slice(-600), `auto-answer limit reached (${cfg.max})`);
-      return dispatchAnswerer(paseo, chain, reply, cfg, detail);
+    if (action === "ignore") {
+      ensureChain(task);
+      return;
     }
+    const chain = await newCard(paseo, ensureChain(task));
+    if (category === "awaiting_user") return handleAwaitingUser(paseo, chain, reply, detail);
     const base = {
       category,
       message: detail,
@@ -855,6 +1035,66 @@ export function createGate(options: GateOptions): Gate {
     await publishChainCard(paseo, chain, { ...base, state: "notice", attempt: 0, maxAttempts: 0, nextRetryAt: null });
   }
 
+  /** A stop that may wait for the user: answer it (after the grace period), or hand it to the user. */
+  async function handleAwaitingUser(paseo: Paseo, chain: Chain, reply: string, signal: string | null): Promise<void> {
+    const cfg = answerConfig(JSON.parse(chain.policy_json) as Policy);
+    if (!cfg) return needsUser(paseo, chain, reply.slice(-600), "auto-answer is off for this repository");
+    if (chain.stop_answering) return needsUser(paseo, chain, reply.slice(-600), "auto-answering was stopped for this task");
+    if (chain.answers >= cfg.max) return needsUser(paseo, chain, reply.slice(-600), `auto-answer limit reached (${cfg.max})`);
+    if (cfg.delay_seconds === 0) return dispatchAnswerer(paseo, chain, reply, cfg, signal);
+    // The user is often still there: give them delay_seconds to reply before an agent answers for them.
+    const at = now() + cfg.delay_seconds * 1000;
+    const next = ledger.updateChain(chain.agent_id, { answer_at: at, answer_reply: reply, answer_signal: signal }, now())!;
+    await publishChainCard(paseo, next, {
+      category: "awaiting_user",
+      state: "answer_scheduled",
+      question: truncate(reply.slice(-600), 2000),
+      answer: null,
+      message: null,
+      suggestion: SUGGESTIONS.awaiting_user,
+      attempt: next.answers + 1,
+      maxAttempts: cfg.max,
+      nextRetryAt: at,
+      childAgentId: null,
+      canStopAnswering: true,
+      permission: null,
+    });
+    wakeAt(paseo, at);
+  }
+
+  /** The reconcile loop also starts due work (after restarts); the timer only makes short delays exact. */
+  function wakeAt(paseo: Paseo, at: number): void {
+    const timer = setTimeout(() => {
+      retryTimers.delete(timer);
+      enqueue("scheduled work", () => startDueWork(paseo));
+    }, Math.max(0, at - now()) + 100);
+    timer.unref?.();
+    retryTimers.add(timer);
+  }
+
+  async function startDueWork(paseo: Paseo): Promise<void> {
+    for (const chain of ledger.chains()) {
+      try {
+        if (chain.next_retry_at !== null && chain.next_retry_at <= now()) await sendRetry(paseo, chain);
+        else if (chain.answer_at !== null && chain.answer_at <= now()) await startScheduledAnswer(paseo, chain);
+      } catch (error) {
+        log(`scheduled work for ${chain.agent_id} failed`, error);
+      }
+    }
+  }
+
+  async function startScheduledAnswer(paseo: Paseo, chain: Chain): Promise<void> {
+    const current = ledger.updateChain(chain.agent_id, { answer_at: null }, now()) ?? chain;
+    const cfg = answerConfig(JSON.parse(current.policy_json) as Policy);
+    const source = await refreshAgent(paseo, current.agent_id);
+    if (!source) return ledger.deleteChain(current.agent_id);
+    if (!cfg || !sendable(source.status)) {
+      await publishChainCard(paseo, current, { state: "stopped", canStopAnswering: false, nextRetryAt: null, message: "The agent was busy again; the automatic answer was skipped." });
+      return;
+    }
+    await dispatchAnswerer(paseo, current, current.answer_reply ?? "", cfg, current.answer_signal);
+  }
+
   // ----- retries -----
 
   async function scheduleRetry(
@@ -866,21 +1106,7 @@ export function createGate(options: GateOptions): Gate {
     const at = now() + cfg.delay_seconds * 1000;
     const next = ledger.updateChain(chain.agent_id, { next_retry_at: at, retry_message: cfg.message ?? DEFAULT_RETRY_MESSAGE }, now())!;
     await publishChainCard(paseo, next, { ...card, state: "retry_scheduled", attempt: next.retries + 1, maxAttempts: cfg.max, nextRetryAt: at });
-    // The reconcile loop also sends due retries (after restarts); the timer only makes short delays exact.
-    const timer = setTimeout(() => {
-      retryTimers.delete(timer);
-      enqueue("retry", () => sendDueRetries(paseo));
-    }, cfg.delay_seconds * 1000 + 100);
-    timer.unref?.();
-    retryTimers.add(timer);
-  }
-
-  async function sendDueRetries(paseo: Paseo): Promise<void> {
-    for (const chain of ledger.chains()) {
-      if (chain.next_retry_at !== null && chain.next_retry_at <= now()) {
-        await sendRetry(paseo, chain).catch((error) => log(`retry for ${chain.agent_id} failed`, error));
-      }
-    }
+    wakeAt(paseo, at);
   }
 
   async function sendRetry(paseo: Paseo, chain: Chain): Promise<void> {
@@ -998,7 +1224,8 @@ export function createGate(options: GateOptions): Gate {
     if (!chain || chain.chain_id !== owner.chainId || chain.answer_child_id !== childId) return; // stale
     const startTree = (JSON.parse(chain.answer_dispatch_json ?? "{}") as { endTree?: string }).endTree;
     let current = await cancelChainWork(paseo, chain);
-    if (outcome.kind !== "completed") return needsUser(paseo, current, undefined, `the answerer turn ${outcome.kind}`);
+    const denied = deniedAnswerers.delete(childId) ? "a permission request of the answerer was not answered in time and was denied; " : "";
+    if (outcome.kind !== "completed") return needsUser(paseo, current, undefined, `${denied}the answerer turn ${outcome.kind}`);
     // Like a reviewer's (finalizeReview), an answerer's edits would pass as the source agent's work.
     const afterTree = startTree ? await snapshotTree(current.repo_root) : null;
     if (startTree && afterTree !== startTree) {
@@ -1011,7 +1238,7 @@ export function createGate(options: GateOptions): Gate {
       );
     }
     const reply = parseAnswer(latestAssistantText(timeline));
-    if (!reply) return needsUser(paseo, current, undefined, "the answerer reply is not valid JSON");
+    if (!reply) return needsUser(paseo, current, undefined, `${denied}the answerer reply is not valid JSON`);
     if (reply.state === "done") {
       await startGate(paseo, taskFromChain(current));
       return endChain(paseo, owner.agentId, { state: "resolved", message: "The agent had finished; nothing to answer." });
@@ -1077,7 +1304,7 @@ export function createGate(options: GateOptions): Gate {
     const chain = ledger.chainById(chainId);
     if (!chain) return false;
     let current = ledger.updateChain(chain.agent_id, { stop_answering: 1 }, now())!;
-    const wasAnswering = current.answer_child_id !== null;
+    const wasAnswering = current.answer_child_id !== null || current.answer_at !== null;
     if (wasAnswering) current = await cancelChainWork(paseo, current);
     await publishChainCard(paseo, current, {
       canStopAnswering: false,
@@ -1124,7 +1351,7 @@ export function createGate(options: GateOptions): Gate {
     const agentId = event.agent.id;
     let chain = liveChain(agentId);
     // The plugin clears these before sending its own answer or retry, so this is always the user.
-    if (chain && (chain.answer_child_id || chain.next_retry_at !== null)) {
+    if (chain && (chain.answer_child_id || chain.next_retry_at !== null || chain.answer_at !== null)) {
       chain = await cancelChainWork(paseo, chain);
       chain = await publishChainCard(paseo, chain, {
         state: "stopped",
@@ -1154,6 +1381,7 @@ export function createGate(options: GateOptions): Gate {
         policyHash: chain.policy_hash,
         error: null,
         baseTree: chain.base_tree,
+        trigger: (JSON.parse(chain.policy_json) as Policy).trigger,
         turnId: event.turnId,
         chainId: chain.chain_id,
       });
@@ -1186,7 +1414,7 @@ export function createGate(options: GateOptions): Gate {
     if (fix) {
       const run = ledger.get(fix[1]);
       if (run && run.source_agent_id === agentId && run.round === Number(fix[2])) {
-        return onFixTurnEnded(paseo, run, event.outcome, concurrent);
+        return onFixTurnEnded(paseo, run, event.outcome, concurrent, event.timeline);
       }
       return;
     }
@@ -1195,13 +1423,18 @@ export function createGate(options: GateOptions): Gate {
     if (taken.stale) return skip("an older turn ended after a newer one started (replaced)");
     const snapshot = taken.snapshot;
     if (!snapshot) return skip("no policy snapshot from turn start (no policy file, not a git repo, or plugin started mid-turn)");
-    if (snapshot.error) return publishConfigError(paseo, agentId, snapshot.error);
-    const policy = snapshot.policy;
-    if (!policy || !snapshot.baseTree) return skip("no baseline");
+    if (!snapshot.baseTree) return skip("no baseline");
 
     const source = await refreshAgent(paseo, agentId);
     if (!source) return skip("agent not found");
-    if (!triggers(policy, source, event.agent.parentAgentId === null)) return skip(`not a trigger target (${policy.trigger})`);
+    if (!triggers(snapshot.trigger, source, event.agent.parentAgentId === null)) return skip(`not a trigger target (${snapshot.trigger})`);
+    const policy = snapshot.policy;
+    if (!policy) {
+      // Only a turn that would have been gated (it changed files) gets the error card.
+      if ((await snapshotTree(snapshot.repoRoot)) === snapshot.baseTree) return skip("invalid policy; no changes to gate");
+      return publishConfigError(paseo, agentId, snapshot.error ?? "invalid policy", snapshot.policyHash);
+    }
+    await clearConfigError(paseo, agentId);
     const workspaceId = source.workspaceId ?? event.agent.workspaceId;
     if (!workspaceId) return skip("agent has no workspace");
 
@@ -1222,6 +1455,12 @@ export function createGate(options: GateOptions): Gate {
       requestText: chainRequestText(chain?.request_text ?? snapshot.carriedRequest ?? null, event.timeline, lastUser),
       turnKey: `${agentId}:${messageId ?? `turn:${event.turnId}:${event.timeline.length}`}`,
       concurrent: [...taskOverlap],
+      // Worked: it used tools this turn, or earlier turns of the task did. A chain from a failure alone does not count.
+      worked:
+        items.some((item) => item.type === "tool_call") ||
+        snapshot.carriedRequest !== undefined ||
+        (chain !== null && (chain.answers > 0 || chain.retries > 0 || chain.rounds_used > 0)),
+      startRound: (chain?.rounds_used ?? 0) + 1,
     };
     await applyOutcome(paseo, task, category, detail, replyText(items));
     // Handled: a run, a chain (both keep the carried baseline) or nothing left to check. A replaced turn's
@@ -1279,15 +1518,54 @@ export function createGate(options: GateOptions): Gate {
     if (!owned || owned.run.child_agent_id !== agentId || isTerminal(owned.run.status)) return;
     const runId = owned.run.run_id;
     if ("request" in event) return checkerPermission(paseo, owned.run, agentId, event.request);
-    if (waiting.get(runId)?.requestId !== event.requestId) return;
+    const shown = waiting.get(runId);
+    if (shown?.requestId !== event.requestId) return;
     waiting.delete(runId);
-    await publishCard(paseo, owned.run);
+    escalatedAt.delete(`${agentId}:${event.requestId}`);
+    // A denial (yours on the card, or after the wait) is remembered: the checker is then asked for a verdict.
+    const run = event.resolution.behavior === "deny" ? recordDenied(owned.run, agentId, shown.title) : owned.run;
+    await publishCard(paseo, run);
+  }
+
+  /** A request shown on a card for longer than permission_wait_minutes; null while it may still wait. */
+  function overdue(card: PermissionCard | null | undefined, waitMinutes: number): PermissionCard | null {
+    if (!card) return null;
+    const key = `${card.agentId}:${card.requestId}`;
+    const since = escalatedAt.get(key);
+    if (since === undefined) {
+      escalatedAt.set(key, now()); // shown before a restart: its wait starts now
+      return null;
+    }
+    return now() - since > waitMinutes * minuteMs ? card : null;
+  }
+
+  /** Denies a request nobody answered, so the agent finishes with what it has instead of timing out. */
+  async function denyOverdue(paseo: Paseo, card: PermissionCard, waitMinutes: number): Promise<boolean> {
+    const deny = card.actions.find((action) => action.behavior === "deny");
+    try {
+      await paseo.agents.ref(card.agentId).respondToPermission({
+        requestId: card.requestId,
+        response: {
+          behavior: "deny",
+          ...(deny?.id ? { selectedActionId: deny.id } : {}),
+          message: `No answer within ${waitMinutes} minutes; denied automatically by the post-turn gate. Do not retry it.`,
+        },
+      });
+    } catch (error) {
+      log("auto-deny failed", error instanceof Error ? error.message : error);
+      return false;
+    }
+    escalatedAt.delete(`${card.agentId}:${card.requestId}`);
+    log(`auto-denied for ${card.agentId} after ${waitMinutes} minutes: ${card.title}`);
+    return true;
   }
 
   async function answererPermission(paseo: Paseo, chain: Chain, agentId: string, request: PermissionRequested["request"]): Promise<void> {
     const permissions = (JSON.parse(chain.policy_json) as Policy).agents.answerer.permissions;
     const result = await autoApprove(paseo, agentId, request, permissions, chain.repo_root);
-    if (!result.approved) await publishChainCard(paseo, chain, { permission: permissionCard(agentId, request, result.reason) });
+    if (result.approved) return;
+    escalatedAt.set(`${agentId}:${request.id}`, escalatedAt.get(`${agentId}:${request.id}`) ?? now());
+    await publishChainCard(paseo, chain, { permission: permissionCard(agentId, request, result.reason) });
   }
 
   async function checkerPermission(paseo: Paseo, run: Run, agentId: string, request: PermissionRequested["request"]): Promise<void> {
@@ -1297,6 +1575,7 @@ export function createGate(options: GateOptions): Gate {
       return;
     }
     waiting.set(run.run_id, permissionCard(agentId, request, result.reason));
+    escalatedAt.set(`${agentId}:${request.id}`, escalatedAt.get(`${agentId}:${request.id}`) ?? now());
     await publishCard(paseo, run);
   }
 
@@ -1363,7 +1642,14 @@ export function createGate(options: GateOptions): Gate {
         const waitingOn = agent.pendingPermissions.length > 0 ? " (a permission request was not answered)" : "";
         return fail(paseo, run, `timed out after ${Math.round(timeoutOf(run) / 60000)} minutes${waitingOn}`);
       }
-      if (run.status === "REVIEWING") await restorePermissions(paseo, run, agent);
+      if (run.status !== "REVIEWING") return;
+      await restorePermissions(paseo, run, agent);
+      const wait = specOf(run).permission_wait_minutes;
+      const stale = overdue(waiting.get(run.run_id), wait);
+      if (stale && (await denyOverdue(paseo, stale, wait))) {
+        waiting.delete(run.run_id);
+        await publishCard(paseo, recordDenied(run, stale.agentId, stale.title));
+      }
       return;
     }
     // ponytail: only the last 500 items are searched; a fix turn longer than that would look unsent
@@ -1392,7 +1678,7 @@ export function createGate(options: GateOptions): Gate {
       await supersede(paseo, run);
       return;
     }
-    return onFixTurnEnded(paseo, run, { kind: "completed" });
+    return onFixTurnEnded(paseo, run, { kind: "completed" }, [], items);
   }
 
   async function reconcileChains(paseo: Paseo): Promise<void> {
@@ -1402,6 +1688,8 @@ export function createGate(options: GateOptions): Gate {
           await endChain(paseo, chain.agent_id, null);
         } else if (chain.next_retry_at !== null && chain.next_retry_at <= now()) {
           await sendRetry(paseo, chain);
+        } else if (chain.answer_at !== null && chain.answer_at <= now()) {
+          await startScheduledAnswer(paseo, chain);
         } else if (chain.answer_child_id) {
           await reconcileAnswerer(paseo, chain);
         }
@@ -1426,6 +1714,13 @@ export function createGate(options: GateOptions): Gate {
         await answererPermission(paseo, chain, childId, open[0]);
       } else if (open.length === 0 && shown) {
         await publishChainCard(paseo, chain, { permission: null });
+      } else {
+        const wait = (JSON.parse(chain.policy_json) as Policy).agents.answerer.permission_wait_minutes;
+        const stale = overdue(shown, wait);
+        if (stale && (await denyOverdue(paseo, stale, wait))) {
+          deniedAnswerers.add(childId);
+          await publishChainCard(paseo, chain, { permission: null });
+        }
       }
       return;
     }

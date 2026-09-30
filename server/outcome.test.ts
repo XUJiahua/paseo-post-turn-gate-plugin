@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { describe, test } from "node:test";
-import { classify, currentTurnItems, looksLikeQuestion, similarity, stopSignal } from "./outcome.ts";
+import { classify, currentTurnItems, isCourtesyOffer, looksLikeQuestion, similarity, stopSignal } from "./outcome.ts";
 import { answerRisk } from "./permissions.ts";
 import { gateChecks, maxFixRounds, policySchema } from "../shared/schema.ts";
 
@@ -108,6 +108,28 @@ describe("stopSignal (truncation, turn limit, todos, refusal)", () => {
   test("classify routes a truncated reply to the semantic check with its signal", () => {
     assert.deepEqual(turn({ kind: "completed" }, [says("```js\nfunction")]), { category: "awaiting_user", detail: "truncated" });
   });
+  test("a finished report with one closing offer is done, not a question", () => {
+    for (const text of [
+      "Implemented the parser and added tests. Let me know if you need anything else.",
+      "Fixed the bug in parse(). Anything else?",
+      "Added the CLI flag and updated the README. Want me to also add a changelog entry?",
+      "我先按 Python 写了，如果你想换语言请告诉我。",
+      "已完成修改并通过测试。需要我再补充文档吗？",
+    ]) {
+      assert.equal(isCourtesyOffer(text), true, text);
+      assert.equal(stopSignal([says(text)]), null, text);
+    }
+    for (const text of [
+      "Anything else?", // nothing reported before it
+      "Should I also update the docs?",
+      "I read the code. Would you like me to use Redis or an in-memory cache?", // a choice
+      "Which database should I use? Let me know.", // a real question before the offer
+      "Done with step 1. Should I proceed with the migration, which drops the old table?",
+    ]) {
+      assert.equal(isCourtesyOffer(text), false, text);
+      assert.equal(stopSignal([says(text)]), "question", text);
+    }
+  });
 });
 
 describe("answer guards", () => {
@@ -129,7 +151,7 @@ describe("answer guards", () => {
 describe("on_outcome schema", () => {
   test("defaults and restrictions", () => {
     const policy = policySchema.parse({ version: 2 });
-    assert.deepEqual(policy.on_outcome.awaiting_user, { answer: { max: 3 } });
+    assert.deepEqual(policy.on_outcome.awaiting_user, { answer: { max: 3, delay_seconds: 60 } });
     assert.equal(policy.on_outcome.network, "notify");
     assert.equal(policySchema.safeParse({ version: 2, on_outcome: { network: { retry: { max: 2, delay_seconds: 30 } } } }).success, true);
     assert.equal(policySchema.safeParse({ version: 2, on_outcome: { quota_exhausted: { retry: { max: 1, delay_seconds: 30 } } } }).success, false);
@@ -167,12 +189,12 @@ describe("on_outcome schema", () => {
       JSON.parse(execFileSync(process.execPath, ["bin/post-turn-gate-init.mjs", "--stdout", ...args], { encoding: "utf8" }));
     const defaults = run();
     assert.deepEqual(defaults, policySchema.parse({ version: 2 }));
-    assert.deepEqual(defaults.on_fail, { fix: { max_rounds: 2 } });
+    assert.deepEqual(defaults.on_fail, { fix: { max_rounds: 2, on_dispute: "human" } });
     assert.equal(run("--report").on_fail, "report");
     assert.deepEqual(defaults.on_outcome.done, ["review"]);
     assert.equal(defaults.agents.verifier.profile, null);
     const chosen = run("--check", "verify,review", "--fix", "3");
-    assert.deepEqual(chosen.on_fail, { fix: { max_rounds: 3 } });
+    assert.deepEqual(chosen.on_fail, { fix: { max_rounds: 3, on_dispute: "human" } });
     assert.deepEqual(chosen.on_outcome.done, ["verify", "review"]);
     assert.equal(chosen.on_outcome.network, "notify", "other fields keep their defaults");
     assert.throws(() => run("--fix", "0"), /Command failed/);

@@ -9,7 +9,7 @@
   "version": 2,
   "on_fail": { "fix": { "max_rounds": 2 } },
   "on_outcome": {
-    "awaiting_user": { "answer": { "max": 3 } },
+    "awaiting_user": { "answer": { "max": 3, "delay_seconds": 60 } },
     "network": { "retry": { "max": 2, "delay_seconds": 30 } }
   }
 }
@@ -21,14 +21,17 @@
 flowchart TD
   A[你给 agent 发消息，agent 开始干活] --> B[插件记下工作区快照 baseTree]
   B --> C[agent 这一轮结束]
-  C --> C1{"你没点停止，而且<br/>这个任务改了文件？"}
-  C1 -- 没改文件 --> N[什么都不做<br/>纯问答不派任何 agent]
-  C1 -- 改了 --> D{这一轮是怎么结束的？}
-  D -- 做完了 --> R[派 reviewer 审查改动<br/>或 verifier 核对需求]
-  D -- 停下来问你 / 没说完 --> Q[派 answerer 判断能不能替你回答]
-  D -- 网络错误 / 限流 --> T[按配置稍后自动重试]
-  D -- 额度用完 / 上下文满 / 崩溃 --> X[只发一张说明卡片]
+  C --> D{这一轮是怎么结束的？}
+  D -- 网络错误 / 限流 --> T[按配置稍后自动重试<br/>不管改没改文件]
+  D -- 额度用完 / 上下文满 / 崩溃 --> X[只发一张说明卡片<br/>不管改没改文件]
   D -- 你点了停止 --> S[结束，不打扰你]
+  D -- 做完了 --> C1{任务改了文件？}
+  C1 -- 没改 --> N[什么都不做]
+  C1 -- 改了 --> R[派 reviewer 审查改动<br/>或 verifier 核对需求]
+  D -- 停下来问你 / 没说完 --> C2{"改了文件，或者<br/>已经读过代码、跑过命令？"}
+  C2 -- 纯聊天 --> N
+  C2 -- 是 --> W[等 60 秒，你没回复]
+  W --> Q[派 answerer 判断能不能替你回答]
   R --> V{结论}
   V -- PASS --> P[卡片：PASS]
   V -- FAIL --> F[把问题发回 agent 修，修完再审]
@@ -90,6 +93,7 @@ sequenceDiagram
 - 修了 `max_rounds` 轮还是 FAIL，卡片变成 NEEDS_HUMAN，交给你处理。
 - 修复期间你自己发了消息，这次审查标为 SUPERSEDED，以你的消息为准。没通过检查的改动不会被放过：你这一轮结束后，从原来的基线开始连同原始请求一起检查。
 - 修复轮没有超时：修复由开发 agent 自己完成，多慢都会在它结束后重新检查。
+- 修复轮什么都没改：不会拿同一份代码再审一遍、白用一轮。agent 是在提问时走场景 3 的代答（代答后完成的那轮照常审查，轮次接着算）；agent 是在反驳 findings 时，卡片变成 NEEDS_HUMAN 并附上它的理由，由你裁决。策略里设 `"on_fail": { "fix": { "on_dispute": "rereview" } }` 时改为把理由交给 reviewer 再判一次（占一轮）。
 
 每个仓库的审查规则写在 `.paseo/post-turn-gate/reviewer.md` 里。`npm run init` 会生成一份立即生效的默认规则：HTML 注释只是编辑说明，注释后的 Markdown 会加入提示词。继续按项目补充并和代码一起提交，例如"金额一律用整数分"、"新接口必须有集成测试"。verifier、answerer 分别对应 `verifier.md`、`answerer.md`。
 
@@ -116,7 +120,7 @@ verifier 和 reviewer 的区别只在于问的问题：reviewer 问"代码对不
 
 ## 场景 2c：先核对需求，再审代码
 
-同一个分页需求，你既想确认需求都做到了，也想让人看看代码质量。策略里写 `"on_outcome": { "done": ["verify", "review"] }`（或 `npm run init -- --check verify,review`），`on_fail` 保持默认的 `{ "fix": { "max_rounds": 2 } }`。
+同一个分页需求，你既想确认需求都做到了，也想让人看看代码质量。策略里写 `"on_outcome": { "done": ["verify", "review"] }`（或 `npm run init -- --check verify,review`），`on_fail` 保持默认的 `{ "fix": { "max_rounds": 2, "on_dispute": "human" } }`。
 
 ```mermaid
 sequenceDiagram
@@ -141,7 +145,8 @@ sequenceDiagram
 
 - 按列表顺序执行，第一个 FAIL 就停：需求没做到时审代码意义不大，修复时代码还会改。
 - 修复后从第一项重新检查，因为修复可能破坏已经通过的检查。
-- 两项都 PASS 才算 PASS；某项 INCONCLUSIVE 时后面照常检查，最终结果为 INCONCLUSIVE。
+- 两项都 PASS 才算 PASS；某项 INCONCLUSIVE 时后面照常检查，最终结果为 INCONCLUSIVE，卡片逐项写出“Not verified: <原因>”。
+- INCONCLUSIVE 的原因决定后续：权限被拒绝或没人回答、需求本身没说清楚 → NEEDS_HUMAN；没有测试 → 默认只报告，策略里设 `"on_inconclusive": "fail"` 时发回让 agent 补测试；缺凭证或服务 → 只报告。
 - 不并行执行：两个 agent 在同一个工作区里同时构建、测试会互相干扰。
 
 ## 场景 3：agent 问了一个仓库能回答的问题
@@ -158,8 +163,10 @@ sequenceDiagram
 
   A-->>G: 这一轮结束，回复以问号结尾
   G->>G: 预筛：像在提问 → awaiting_user
+  G-->>你: 卡片 "Answering for you soon"（有 Stop auto-answering 按钮）
+  Note over G: 等 answer.delay_seconds（默认 60 秒），你一回复就取消
   G->>Q: "agent 在等用户吗？能替用户回答吗？"
-  G-->>你: 卡片 answering（有 Stop auto-answering 按钮）
+  G-->>你: 卡片 answering
   Q->>Q: 看到 package.json 用的是 node --test
   Q-->>G: {"state":"awaiting_user","decision":"answer","answer":"用 node:test，和现有测试保持一致"}
   G->>A: [post-turn gate answered on your behalf]<br/>用 node:test，和现有测试保持一致
@@ -170,6 +177,10 @@ sequenceDiagram
 ```
 
 这几轮属于同一个任务（chain），所以审查的是整个任务的累计改动，不是最后一轮。
+
+- agent 已经读过代码、但还没改文件就问（"看完了，用 Redis 还是内存 LRU？"）也会走这个流程；纯聊天式的提问（没调用任何工具）不代答。
+- 做完后顺口一句客套（"Implemented X. Let me know if you need anything else."、"需要我再补充文档吗？"）不算提问，直接审查。
+- 第 2、3 次代答各有一张新卡片，出现在时间线当前位置；旧卡片不再有按钮。
 
 ## 场景 4：问题必须由你决定
 
@@ -259,7 +270,9 @@ sequenceDiagram
   你->>R: No
 ```
 
-自动批准的范围：读文件、构建、测试、在仓库内编辑。以下请求一律交给你：`rm -rf`、`git push`、`sudo`、发布、云 / 部署工具、密钥文件、仓库外的路径。如果在 `agents.reviewer`（或 `verifier`、`answerer`）里设置 `"permissions": "ask"`，这个角色的每个请求都交给你。
+自动批准的范围：读文件、构建、测试、在仓库内编辑。以下请求一律交给你：`rm -rf`、`git push`（包括 `git -C <dir> push` 这类写法）、`sudo`、发布、云 / 部署工具、密钥文件、仓库外的路径。云工具从严判断：命令里出现 `aws`、`kubectl` 等就要你确认，不管前面加了什么前缀（`timeout 60 aws …`）；只有 `cat`、`grep`、`ls` 这类只读命令的路径或搜索词例外，所以 `cat src/aws/client.ts` 自动批准。如果在 `agents.reviewer`（或 `verifier`、`answerer`）里设置 `"permissions": "ask"`，这个角色的每个请求都交给你。
+
+你一直没回答时，请求在 `permission_wait_minutes`（默认 5 分钟）后被自动拒绝。kiro 收到拒绝会结束这一轮，插件接着让 reviewer 按已有证据给结论；通常是 INCONCLUSIVE，卡片显示 NEEDS HUMAN 和被拒绝的请求，而不是等 30 分钟后变成 ERROR。
 
 ## 场景 8：审查还没结束你就发了新消息
 
@@ -301,9 +314,9 @@ flowchart LR
 
 | 情况 | 原因 |
 |---|---|
-| agent 没改文件，包括它最后问了你一句、或者网络出错 | 工作区快照没变。你就在对话里，不需要 answerer 或自动重试 |
+| agent 做完了但没改文件，或者纯聊天（没调用工具）时问了你一句 | 没有可审查的改动；你就在对话里 |
 | 仓库里没有 `.paseo/post-turn-gate.json` | 没启用 |
-| 策略文件写错了 | 不审查，出一张配置错误卡片 |
+| 策略文件写错了 | 不审查；改了文件的轮次出一张配置错误卡片（同一份错误只出一张，改好后标为 Fixed） |
 | 普通子 agent 的轮次 | 默认只管根 agent；子 agent 需要带 `post-turn-gate.target=true` 标签 |
 | reviewer / answerer 自己的轮次 | 插件不审查自己派出的 agent |
 | 你点了停止 | `user_canceled`，默认忽略 |

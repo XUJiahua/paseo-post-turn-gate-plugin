@@ -22,6 +22,8 @@ const CATEGORY_LABELS: Record<Category, string> = {
 
 function stateLabel(data: OutcomeCardData): string {
   switch (data.state) {
+    case "answer_scheduled":
+      return "Answering for you soon";
     case "answering":
       return "Answering for you…";
     case "answered":
@@ -55,7 +57,9 @@ export function OutcomeCard({ item, theme }: PluginTimelineItemProps<OutcomeCard
 
   let statusStyle = styles.warning;
   if (data.state === "resolved" || data.state === "answered") statusStyle = styles.success;
-  if (data.state === "answering" || data.state === "retrying" || data.state === "retry_scheduled") statusStyle = styles.running;
+  if (data.state === "answer_scheduled" || data.state === "answering" || data.state === "retrying" || data.state === "retry_scheduled") {
+    statusStyle = styles.running;
+  }
   if (data.state === "needs_user" || (data.state === "notice" && data.category !== "done")) statusStyle = styles.danger;
 
   async function onStop() {
@@ -93,7 +97,13 @@ export function OutcomeCard({ item, theme }: PluginTimelineItemProps<OutcomeCard
         </Text>
       ) : null}
       {data.suggestion ? <Text style={styles.muted}>{data.suggestion}</Text> : null}
-      {data.nextRetryAt ? <Text style={styles.muted}>Next retry at {formatTime(data.nextRetryAt)}</Text> : null}
+      {data.nextRetryAt ? (
+        <Text style={styles.muted}>
+          {data.state === "answer_scheduled"
+            ? `The answerer starts at ${formatTime(data.nextRetryAt)} unless you reply first`
+            : `Next retry at ${formatTime(data.nextRetryAt)}`}
+        </Text>
+      ) : null}
       {data.canStopAnswering ? (
         <View style={styles.actions}>
           <Pressable

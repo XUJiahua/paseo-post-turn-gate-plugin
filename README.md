@@ -71,7 +71,8 @@ policy and rules are captured when a turn starts, so the plugin takes effect on 
 | Field | Values | Default |
 |---|---|---|
 | `trigger` | `root_only`, `root_and_opt_in`, `all` | `root_and_opt_in` |
-| `on_fail` | `{ "fix": { "max_rounds": 1–5 } }`: send a failed check's findings back to the agent and check again, so the agent loops until its work passes. `report`: only show the result | `{ "fix": { "max_rounds": 2 } }` |
+| `on_fail` | `{ "fix": { "max_rounds": 1–5, "on_dispute": "human" \| "rereview" } }`: send a failed check's findings back to the agent and check again, so the agent loops until its work passes. `report`: only show the result | `{ "fix": { "max_rounds": 2, "on_dispute": "human" } }` |
+| `on_inconclusive` | `report`: show an INCONCLUSIVE check. `fail`: treat gaps the agent can close itself (no tests, not enough evidence) as FAIL | `report` |
 | `agents` | launch settings and repository rules for the `reviewer`, `verifier` and `answerer`, see [below](#choosing-the-agents) | inherit the source agent; load each role's repository rules file |
 | `on_outcome` | what to do for each way a turn ends, see [below](#what-happens-when-a-turn-ends) | `done: ["review"]` |
 
@@ -89,7 +90,9 @@ policy and rules are captured when a turn starts, so the plugin takes effect on 
 ```
 
 - Checks run one after another, in the listed order. The first FAIL stops the round: reviewing the code of a change that misses a requirement is wasted work.
-- The task passes only when every check passes. An INCONCLUSIVE check does not stop the next one; the result is then INCONCLUSIVE.
+- The task passes only when every check passes. An INCONCLUSIVE check does not stop the next one; the result is then INCONCLUSIVE, and the card lists what each check could not verify.
+- An INCONCLUSIVE check says why. A permission it needed was denied or not answered, or the request is ambiguous: the card shows NEEDS HUMAN. No tests or not enough evidence: reported, or sent back like a FAIL with `"on_inconclusive": "fail"`. Missing credentials or services: always reported.
+- A fix turn that changes nothing is not checked again. If the agent asks a question, the answerer handles it and fix rounds keep counting; if it argues that a finding is wrong, the card shows NEEDS HUMAN with its reply. `"on_dispute": "rereview"` instead gives the reply to the checker for one more round.
 - With `on_fail: { "fix": … }` the failing check's findings go back to the agent. The next round starts again from the first check, because a fix can break a check that passed. `max_rounds` counts rounds for the whole task. When the rounds are used up the card shows NEEDS HUMAN; after you take over, send the agent any message and its next turn checks the whole task again.
 - One card shows every check of the current round with its result.
 - `"done": "notify"` or `"ignore"` turns checks off.
@@ -102,10 +105,10 @@ Each role has its own block under `agents`:
 
 ```json
 "agents": {
-  "reviewer": { "profile": null, "permissions": "auto", "timeout_minutes": 30 },
-  "verifier": { "profile": null, "permissions": "auto", "timeout_minutes": 30,
+  "reviewer": { "profile": null, "permissions": "auto", "timeout_minutes": 30, "permission_wait_minutes": 5 },
+  "verifier": { "profile": null, "permissions": "auto", "timeout_minutes": 30, "permission_wait_minutes": 5,
                 "instructions": "Also run the e2e suite." },
-  "answerer": { "profile": null, "permissions": "auto", "timeout_minutes": 10 }
+  "answerer": { "profile": null, "permissions": "auto", "timeout_minutes": 10, "permission_wait_minutes": 5 }
 }
 ```
 
@@ -116,6 +119,7 @@ Each role has its own block under `agents`:
 - `instructions` is inline text added after the file's rules. Both go into the role's built-in prompt (20,000 characters at most together) and cannot change the reply format. They are read when the turn starts, so an agent editing them during its turn does not affect its own check.
 - `permissions`: `auto` approves routine requests and puts risky ones on the card; `ask` puts every request on the card.
 - `timeout_minutes` includes time spent waiting for a permission answer. A reviewer or verifier that times out is an ERROR; an answerer that times out hands the question to you.
+- `permission_wait_minutes`: a request shown on the card that nobody answers in this time is denied. A reviewer or verifier is then asked once for a verdict from the evidence it has, so the card usually shows NEEDS HUMAN with the denied request instead of a timeout ERROR.
 - The agents write card text (summary, findings, questions, answers) in the language of the original request. To fix a language, say so in `instructions`, for example `"Write all text in English."`.
 
 The role prompt is always built by this plugin: its built-in job and JSON contract, followed by the project-specific `instructions_file` and `instructions`. Paseo profiles only provide launch settings; they never provide or replace these prompts.
@@ -138,11 +142,11 @@ Every turn of a gated agent is sorted into a category, and `on_outcome` in the p
 | Category | Detected from | Default |
 |---|---|---|
 | `done` | turn completed | `["review"]`: the checks to run, see [above](#review-verify-or-both). Or `notify`, `ignore` |
-| `awaiting_user` | the agent stopped to ask something, or the turn looks unfinished (unclosed code block, ended on a tool call, open todos). A rule-based pre-screen runs first, then a semantic check by the answerer | `{ "answer": { "max": 3 } }`: the answerer agent replies for you (or says "Continue."), or hands the question to you. `as_done` treats the stop as finished and applies `done` |
+| `awaiting_user` | the agent stopped to ask something, or the turn looks unfinished (unclosed code block, ended on a tool call, open todos). A rule-based pre-screen runs first, then a semantic check by the answerer. A finished report that ends with one closing offer ("Let me know if you need anything else.") counts as `done` | `{ "answer": { "max": 3, "delay_seconds": 60 } }`: after `delay_seconds` without a reply from you, the answerer agent replies for you (or says "Continue."), or hands the question to you. `as_done` treats the stop as finished and applies `done` |
 | `refused` | the answerer judged the reply a refusal | `notify` |
 | `user_canceled`, `replaced` | you stopped the agent, or sent a new message | `ignore` |
-| `crashed`, `network`, `rate_limited` | error text of a failed turn | `notify`, or `{ "retry": { "max", "delay_seconds", "message" } }` |
-| `quota_exhausted`, `context_exhausted`, `error` | error text of a failed turn | `notify` (retry is not allowed) |
+| `crashed`, `network`, `rate_limited` | error text of a failed turn, whether or not it changed files | `notify`, or `{ "retry": { "max", "delay_seconds", "message" } }` |
+| `quota_exhausted`, `context_exhausted`, `error` | error text of a failed turn, whether or not it changed files | `notify` (retry is not allowed) |
 
 ```json
 "on_outcome": {
@@ -155,16 +159,17 @@ Every turn of a gated agent is sorted into a category, and `on_outcome` in the p
 - Rules for the answerer, such as "Language and tooling choices are yours to make.", go in `agents.answerer.instructions`.
 - The plugin never waits forever: every agent has a `timeout_minutes`, see [above](#choosing-the-agents).
 - Answers are sent as `[post-turn gate answered on your behalf]` and stay visible in the timeline.
-- The outcome card has a **Stop auto-answering** button.
+- The outcome card has a **Stop auto-answering** button. Each new question, failure or retry of a task gets a new card at the current timeline position; the previous one is closed.
 - A task that spans several turns (answered questions, retries) is reviewed as a whole, starting from its first turn.
 
-- **Which turns are gated:** root agents, and sub-agents labelled `post-turn-gate.target=true`. A turn gets a check, an answerer or a retry only if its task changed the working tree; a turn that only answers a question or asks you one is left alone. So an agent that asks before it starts editing is not auto-answered: tell it in its own instructions to decide routine choices itself.
+- **Which turns are gated:** root agents, and sub-agents labelled `post-turn-gate.target=true`. A finished turn gets a check only if its task changed the working tree. A stop that asks you something is auto-answered if the task changed files or did work (tool calls) before asking; a plain chat question is left to you. Failed turns are always reported or retried.
+- **Invalid policy:** a gated turn that changed files gets one error card per broken policy version; when the policy is valid again, the card is marked fixed.
 - **The child agents:** reviewers, verifiers and answerers run in the same workspace as the source agent and are created as its children.
 - **Checkers do not edit:** if the working tree changes while a reviewer or verifier runs, its verdict is discarded and the card shows NEEDS HUMAN with a diffstat; an answerer's answer is not sent. Nothing is reverted: keep or revert the changes yourself, then send the agent any message, and its next turn checks the whole task again. Build output that git does not ignore also triggers this, so add it to `.gitignore`.
 - **What the checkers read as the request:** the task's first message, with up to five of your earlier messages in the conversation as context, plus every follow-up and automatic answer. A long task is shortened from the middle, so the original request and the newest follow-ups stay.
 - **Several agents in one repository:** snapshots cover the whole working tree, so another agent's changes can land in this task's diff. When another agent's turn overlapped the task, the card says so, the checker is told, and a fix message asks the agent to fix only its own changes. Give each agent its own worktree to avoid this.
 - **Sending on your behalf:** Paseo cannot send "only if the agent is idle". The plugin checks right before it sends a fix, answer or retry, but a message you send in that same moment can be canceled by the plugin's.
-- **Permissions:** by default, routine requests from these agents (reading, building, testing, edits inside the repo) are approved automatically, one at a time. Risky requests (`rm -rf`, `git push`, `sudo`, publishing, deploy tools, secrets, paths outside the repo) are shown on the card with a reason and Yes/No buttons. Set `"permissions": "ask"` on a role to answer every request yourself.
+- **Permissions:** by default, routine requests from these agents (reading, building, testing, edits inside the repo) are approved automatically, one at a time. Risky requests (`rm -rf`, `git push` including `git -C <dir> push`, `sudo`, publishing, deploy tools, secrets, paths outside the repo) are shown on the card with a reason and Yes/No buttons. A cloud or deploy tool named anywhere in a command asks you, whatever prefix runs it (`timeout 60 aws …`); only read-only commands such as `cat`, `grep` and `ls` are exempt, so `cat src/aws/client.ts` does not ask. Set `"permissions": "ask"` on a role to answer every request yourself.
 - **Where to find them:** while running, a child agent is listed under the source agent's **Subagents**; when finished it is archived and can be opened from **History**. From a terminal, `paseo logs <id> -f` follows a running one and `paseo logs <id>` shows a finished one; the card prints the command with the id.
 - **Where state lives:** in `${PASEO_HOME:-~/.paseo}/plugin-data/post-turn-gate/ledger.sqlite`.
 

@@ -41,6 +41,11 @@ function agentSchema(role: Role, timeoutMinutes: number) {
       /** auto: approve routine tool use, escalate risky requests to the card; ask: every request goes to the user. */
       permissions: z.enum(["auto", "ask"]).default("auto"),
       timeout_minutes: z.number().int().min(1).max(240).default(timeoutMinutes),
+      /**
+       * How long a request shown on the card waits for your answer before it is denied automatically, so the
+       * agent can finish with the evidence it has instead of running into timeout_minutes.
+       */
+      permission_wait_minutes: z.number().int().min(1).max(240).default(5),
     })
     .strict()
     .prefault({});
@@ -91,6 +96,8 @@ const answerActionSchema = z
     answer: z
       .object({
         max: z.number().int().min(1).max(10).default(3),
+        /** Grace period before the answerer starts: a reply from you in that time cancels it. */
+        delay_seconds: z.number().int().min(0).max(3600).default(60),
       })
       .strict(),
   })
@@ -112,7 +119,7 @@ export const onOutcomeSchema = z
       ])
       .default(["review"]),
     /** as_done: treat the stop as finished and apply `done`. */
-    awaiting_user: z.union([z.enum(["as_done", "notify", "ignore"]), answerActionSchema]).default({ answer: { max: 3 } }),
+    awaiting_user: z.union([z.enum(["as_done", "notify", "ignore"]), answerActionSchema]).default({ answer: { max: 3, delay_seconds: 60 } }),
     refused: passive.default("notify"),
     user_canceled: passive.default("ignore"),
     replaced: passive.default("ignore"),
@@ -145,10 +152,28 @@ export const policySchema = z
     on_fail: z
       .union([
         z.literal("report"),
-        z.object({ fix: z.object({ max_rounds: z.number().int().min(1).max(5).default(2) }).strict() }).strict(),
+        z
+          .object({
+            fix: z
+              .object({
+                max_rounds: z.number().int().min(1).max(5).default(2),
+                /**
+                 * A fix turn that changes nothing and asks nothing disagrees with the findings.
+                 * human: stop and show it to you; rereview: give the checker the agent's reply (uses a round).
+                 */
+                on_dispute: z.enum(["human", "rereview"]).default("human"),
+              })
+              .strict(),
+          })
+          .strict(),
       ])
       // The gate exists to let the agent loop until its work passes, so fixing is the default.
-      .default({ fix: { max_rounds: 2 } }),
+      .default({ fix: { max_rounds: 2, on_dispute: "human" } }),
+    /**
+     * An INCONCLUSIVE check (no tests, or another gap the agent can close): report it, or treat it as FAIL.
+     * Blocked permissions and ambiguous requests always go to you; missing environment is always reported.
+     */
+    on_inconclusive: z.enum(["report", "fail"]).default("report"),
     agents: agentsSchema,
     on_outcome: onOutcomeSchema.prefault({}),
   })
@@ -163,6 +188,7 @@ export function gateChecks(policy: Policy): Check[] {
 
 /** Fix rounds allowed after a failed gate; 0 means report only. */
 export const maxFixRounds = (policy: Policy) => (policy.on_fail === "report" ? 0 : policy.on_fail.fix.max_rounds);
+export const onDispute = (policy: Policy) => (policy.on_fail === "report" ? "human" : policy.on_fail.fix.on_dispute);
 
 export const severitySchema = z.enum(["CRITICAL", "HIGH", "MEDIUM", "LOW"]);
 
@@ -174,10 +200,16 @@ export const findingSchema = z.object({
 });
 export type Finding = z.output<typeof findingSchema>;
 
+/** Why a check could not decide; each reason has its own follow-up (docs/design.md §5). */
+export const INCONCLUSIVE_REASONS = ["blocked_permission", "ambiguous_request", "no_test_infra", "env_missing", "other"] as const;
+export type InconclusiveReason = (typeof INCONCLUSIVE_REASONS)[number];
+
 export const verdictSchema = z.object({
   verdict: z.enum(["PASS", "FAIL", "INCONCLUSIVE"]),
   summary: z.string(),
   findings: z.array(findingSchema),
+  /** Only for INCONCLUSIVE; null otherwise. Nullable rather than optional, so strict structured output accepts it. */
+  inconclusive_reason: z.enum(INCONCLUSIVE_REASONS).nullable().default(null),
 });
 export type Verdict = z.output<typeof verdictSchema>;
 
@@ -243,11 +275,19 @@ export const cardSchema = z.object({
         check: z.enum(["review", "verify"]),
         state: z.enum(["pending", "running", "PASS", "FAIL", "INCONCLUSIVE", "skipped"]),
         summary: z.string().nullable(),
+        /** What an INCONCLUSIVE check could not verify. */
+        reason: z.enum(INCONCLUSIVE_REASONS).nullable().default(null),
       }),
     )
     .default([]),
   /** Informational, e.g. a role profile that does not exist yet. */
   note: z.string().nullable().default(null),
+  /** A permission request of the checker that was denied (by you, or after permission_wait_minutes). */
+  denied: z.string().nullable().default(null),
+  /** The agent's reply to a fix request when it changed nothing and disagreed with the findings. */
+  dispute: z.string().nullable().default(null),
+  /** A config error card whose policy is valid again. */
+  fixed: z.boolean().default(false),
 });
 export type CardData = z.output<typeof cardSchema>;
 
@@ -257,7 +297,7 @@ export const OUTCOME_CARD_VERSION = 1;
 export const outcomeCardSchema = z.object({
   chainId: z.string(),
   category: z.enum(CATEGORIES),
-  state: z.enum(["notice", "retry_scheduled", "retrying", "answering", "answered", "needs_user", "stopped", "resolved"]),
+  state: z.enum(["notice", "retry_scheduled", "retrying", "answer_scheduled", "answering", "answered", "needs_user", "stopped", "resolved"]),
   message: z.string().nullable(),
   suggestion: z.string().nullable(),
   question: z.string().nullable(),

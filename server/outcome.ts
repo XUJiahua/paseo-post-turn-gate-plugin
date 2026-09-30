@@ -100,7 +100,30 @@ export function stopSignal(items: readonly (TurnItem & { items?: unknown })[]): 
   const todo = [...items].reverse().find((item) => item.type === "todo");
   const todoItems = Array.isArray(todo?.items) ? (todo.items as Array<{ completed?: boolean; status?: string }>) : [];
   if (todoItems.some((entry) => entry.completed === false && entry.status !== "completed")) return "todo_pending";
-  return looksLikeQuestion(reply) ? "question" : null;
+  return looksLikeQuestion(reply) && !isCourtesyOffer(reply) ? "question" : null;
+}
+
+// Opening of a closing offer: "Let me know if …", "Want me to also …", "需要我…吗", "如有问题…".
+const OFFER =
+  /^(let me know (if|whether)|is there anything else|anything else\b|if you('d| would)? (like|want|need|prefer)|(would|do) you (like|want) me to|want me to|shall i (also|go ahead)|should i also|happy to|feel free|i can also|需要我|要不要我|还需要|如有|如果(你|您)?(需要|想|希望|有)|有(任何|其他)?问题|随时)/i;
+// A choice between options is a real question even when phrased as an offer.
+const CHOICE = /\bor\b|\bwhich\b|还是|哪/i;
+
+/**
+ * A finished report that ends with one closing offer ("Implemented X. Let me know if you need anything
+ * else."). Treated as done: a miss only costs a review of a half-finished task (whose FAIL tells the agent to
+ * continue), while a false question costs an answerer run that may even accept the offer.
+ */
+export function isCourtesyOffer(reply: string): boolean {
+  const text = reply.replace(/```[\s\S]*?```/g, " ").replace(/[*_`>#]+/g, "").trim();
+  const sentences = text.split(/(?<=[.!?。！？])\s*/).map((sentence) => sentence.trim()).filter(Boolean);
+  const last = sentences.at(-1) ?? "";
+  // The offer may follow a clause of the same sentence: "我先按 Python 写了，如果你想换语言请告诉我。"
+  const clauses = last.split(/[，,;；]\s*/);
+  const at = clauses.findIndex((clause) => OFFER.test(clause.trim()));
+  if (at === -1 || last.length > 200 || CHOICE.test(clauses.slice(at).join(" "))) return false;
+  const before = [...sentences.slice(0, -1), ...clauses.slice(0, at)].join(" ").trim();
+  return before.length >= 8 && !looksLikeQuestion(before);
 }
 
 const ASKING =

@@ -68,6 +68,10 @@
    - 以编号选项列表结尾（`1.`、`A)` 等两项以上）。
 
    预筛不命中就是 `done`，照常走 gate，行为与现在一致。
+
+   **排除客套结尾**（`isCourtesyOffer`）：已经做完、结尾只有一句主动提议的回复不算提问，直接按 `done` 处理，例如 “Implemented X. Let me know if you need anything else.”、“Fixed it. Anything else?”、“已完成并通过测试。需要我再补充文档吗？”。判定条件：最后一句（或最后一句里逗号后的分句）以 offer 类开头（`let me know if`、`anything else`、`want me to`、`would you like me to`、`需要我`、`要不要我`、`如有`、`如果你想` 等），前面有正文且正文本身不像提问，offer 里没有选择（`or`、`which`、`还是`、`哪`）。判错的代价不对称：真问题被当成 done，review 审到半成品会 FAIL，fix 消息起到“继续”的作用，只多花一轮；客套话被当成问题，要多一次 answerer 调用，review 排在它后面，answerer 还可能接受提议造成范围蔓延。
+
+   **工作区没变化时**：纯聊天（本轮没有任何 tool_call，链里也没有代答、重试或修复）不代答，由用户在对话里回答；已经干过活（读过代码、跑过命令）但还没改文件就停下来提问的，照常走代答，覆盖“看完代码，用 A 还是 B？”这类动手前的提问。失败类（crashed、network 等）不看工作区，照常通知或重试。
 2. **语义判定（post-turn Agent，只在预筛命中时运行）**：由它判断是否真的在等用户，并在能回答时直接给出答案（§3.1）。输出：
 
    ```json
@@ -106,14 +110,14 @@
 | `notify` | 在原 Agent 的 timeline 写一张“结束原因”卡片：类别、错误摘要、建议的下一步 |
 | `ignore` | 只记日志 |
 | `{ "retry": { "max": 1-3, "delay_seconds": 5-3600, "message"? } }` | 延迟后向原 Agent 发一条“继续”消息；超过次数后按 `notify` 处理。`message` 默认为 `Continue from where you left off.` |
-| `{ "answer": { "max": 1-10 } }` | 由 post-turn Agent 代替用户回答（§3.1）；超过次数或它选择 `escalate` 时按 `notify` 处理。只对 `awaiting_user` 有效 |
+| `{ "answer": { "max": 1-10, "delay_seconds": 0-3600 } }` | 由 post-turn Agent 代替用户回答（§3.1）；超过次数或它选择 `escalate` 时按 `notify` 处理。只对 `awaiting_user` 有效。`delay_seconds`（默认 60）是宽限期：这段时间内你回复了，就不再代答 |
 
 默认值（保守，不做任何自动重试）：
 
 | 类别 | 默认 | 可配置为 retry | 卡片上的建议 |
 |---|---|---|---|
 | `done` | `["review"]` | 否 | — |
-| `awaiting_user` | `answer`，`max: 3` | 否（用 `answer`） | 放弃代答时：“Agent 在等你回答：<question>（原因：<reason>）” |
+| `awaiting_user` | `answer`，`max: 3`，`delay_seconds: 60` | 否（用 `answer`） | 放弃代答时：“Agent 在等你回答：<question>（原因：<reason>）” |
 | `user_canceled`、`replaced` | `ignore` | 否 | — |
 | `crashed` | `notify` | 是 | “Agent 进程退出。可以发消息让它继续，Paseo 会重新拉起会话。” |
 | `network` | `notify` | 是 | “网络错误，可稍后重试。” |
@@ -127,6 +131,7 @@
 - `awaiting_user` 默认由 post-turn Agent 代答；此时不做 review（还太早，E2）。代答后的那一轮完成时，照常触发 gate，基线沿用见 §4。
 - `on_outcome` 与 `trigger` 是正交的：只有被 `trigger` 选中的 Agent 才会分类和执行动作；`managed` 子 Agent 永远跳过。
 - 策略文件为空时，行为与当前版本完全一致（`done → gate`，其余跳过），差别只是失败类会多一张 notify 卡片。
+- 失败类的通知和重试不要求工作区有改动：用户很可能不在屏幕前，失败就应该告诉他。
 
 ### 3.1 代答（answer）
 
@@ -147,6 +152,8 @@ prompt 包含：
 - Agent 在索要只有用户知道的信息（账号、路径偏好、密码等）；
 - 同一个问题已经代答过一次，Agent 仍然在问（死循环保护：问题文本相似度高于阈值即 escalate）。
 
+代答的时机：先等 `answer.delay_seconds`（默认 60 秒）。卡片显示 “Answering for you soon” 和开始时间，按钮 “Stop auto-answering” 此时已可用；这段时间里你发了消息（`turn_started`），计划中的代答就被取消。到点后由定时器或 60 秒一次的对账启动 answerer（ledger 的 `answer_at`、`answer_reply`、`answer_signal`，重启后也能继续）。设为 `0` 时立即启动。宽限期同时缩小了“检查 idle 与 send 之间用户插话”的竞态窗口。
+
 代答的发送：与 fix 轮一致，源 Agent 必须是 `idle`；messageId 为 `ptg:answer:<chainId>:<n>`，消息开头注明 “[post-turn gate answered on your behalf]”，用户在 timeline 里能分清是谁回答的。卡片显示问题、答案、剩余次数，以及一个 “Stop auto-answering” 按钮（写入 carry，本链后续不再代答）。
 
 ## 4. 重试与基线
@@ -164,20 +171,23 @@ prompt 包含：
   - 超过重试次数：notify；
   - carry 存在超过 24 小时：丢弃。
 - 重试消息的 `messageId` 为 `ptg:retry:<chainId>:<n>`，与 fix 轮一样归入同一条链。发送前必须确认 Agent 为 `idle`，否则放弃重试（用户已经接手）。
-- **存储**：carry 和待执行的重试写进 ledger 表 `chains`（`agent_id` 为主键，另有 `chain_id`、`policy_json`、`base_tree`、`request_text`、`retries`、`answers`、`next_retry_at`、answerer 的派发参数和截止时间、`card_json` 等），answerer 子 Agent 登记在 `chain_children`。对账循环（60s）负责到点发送，插件重启后也能继续。
+- **存储**：carry 和待执行的重试写进 ledger 表 `chains`（`agent_id` 为主键，另有 `chain_id`、`policy_json`、`base_tree`、`request_text`、`retries`、`answers`、`next_retry_at`、计划中的代答 `answer_at`、answerer 的派发参数和截止时间、`card_json`、`card_seq`、`rounds_used` 等），answerer 子 Agent 登记在 `chain_children`。对账循环（60s）负责到点发送，插件重启后也能继续。
+- **修复轮里的提问**：修复轮没改文件、只是在提问时（design.md §4.3），run 转 `SUPERSEDED`，按 run 的基线和请求开一条链，`rounds_used` 记下已用的修复轮次；链结束时新建的 run 从 `rounds_used + 1` 轮开始，`max_rounds` 仍按整个任务计。
 
 `ponytail:` 等待用户回答期间，`awaiting_user` 会让 carry 一直保留，直到 24 小时过期。期间用户开始一个新任务，也会被算进同一条链，review 范围因此变大。可以接受：这只会多 review，不会漏。
 
 ## 5. 卡片
 
-新增一种 kind：`post-turn-gate-outcome` v1。每条任务链一张，id 为 `post-turn-gate:outcome:<chainId>`（最初设计为按轮次各一张，实现时改为按链复用，见 §7.1）：
+新增一种 kind：`post-turn-gate-outcome` v1。id 为 `post-turn-gate:outcome:<chainId>:<card_seq>`：
 
 ```ts
 data = { chainId, category, state, message, suggestion, question, answer, attempt, maxAttempts, nextRetryAt,
          childAgentId, canStopAnswering, permission }   // 以 shared/schema.ts 的 outcomeCardSchema 为准
 ```
 
-重试、代答、结束都在这张卡片上原地更新（例如“2 分钟后自动重试（1/2）”）。
+- 同一件事的进度在同一张卡片上原地更新（计划代答 → 代答中 → 已代答；“2 分钟后自动重试（1/2）” → 重试中）。
+- 每个新事件（新的提问、新的失败、下一次重试）`card_seq + 1`，在时间线当前位置新开一张。旧卡片最后更新一次：按钮去掉，仍在进行中的状态改为 “Continued in a newer card below.”。否则第 2、3 次代答会更新到上面很远的老卡片上，用户看不到。
+- `state` 新增 `answer_scheduled`（宽限期中，`nextRetryAt` 为 answerer 的开始时间）。
 
 ## 6. 局限与上游改进
 
@@ -212,7 +222,7 @@ data = { chainId, category, state, message, suggestion, question, answer, attemp
 
 与设计的差异：
 
-- 结束原因卡片按任务链复用一张（id 为 `post-turn-gate:outcome:<chainId>`），不再按轮次各写一张。重试、代答、结束都在同一张卡片上原地更新。
+- 结束原因卡片最初按任务链复用一张；后来改为每个新事件一张（§5），因为第 2 次以后的更新会落在时间线上方很远的老位置。
 - 死循环保护的相似度阈值定为 0.5（字符 bigram Jaccard），宁可多转交给用户，也不要循环。
 - **修复了一个已有 bug**：被打断的场景下（E4），新一轮的 `turn_started` 比旧一轮的 `turn_ended` 先到，旧的结束事件会把新一轮的快照删掉，导致新一轮不被 review。现在 pending 带 `turnId`，只由同一个 turn 消费；并且新一轮沿用被打断那一轮的基线，保证被打断那一轮的改动也在 review 范围内。
 - answerer 的 profile、instructions、权限和超时都在 `agents.answerer`（design.md §3.1），`answer` 里只有次数上限。
@@ -241,6 +251,7 @@ Paseo 不传 `stopReason`（S1），所以粗筛额外加入以下信号，命�
 原则：插件自己**永远不会无限等待**。只有真正需要人来判断的事才交给人；交出去时，卡片会写明该怎么继续。
 
 - **Reviewer / Verifier**：超时（`agents.<role>.timeout_minutes`，默认 30 分钟）也包括等待授权的时间，不再因为有待处理的权限请求而顺延。超时后判 `ERROR`，写明 “a permission request was not answered”，并归档 Reviewer。常规请求本来就会自动批准（design.md §5），会等待的只剩高风险请求。
+- **权限请求的等待上限**：卡片上的请求超过 `agents.<role>.permission_wait_minutes`（默认 5 分钟）没人回答，插件代为拒绝。reviewer / verifier 随后被追问一次结论，结果一般是 `INCONCLUSIVE / blocked_permission`，卡片显示 NEEDS HUMAN 和被拒绝的请求，而不是一直等到超时变 ERROR（design.md §4.3、§5）。answerer 的请求被拒后，问题交给用户。
 - **answerer**：超时（`agents.answerer.timeout_minutes`，默认 10 分钟）；超时后把问题交给用户。
 - **needs_user**：这是 Agent 本身停下来等人，并不是插件卡住。卡片提示 “Reply in the chat to continue”。你一回复，卡片立即变为 “You replied; the task continues”，这条任务链之后的轮次照常代答、review。
 - **answerer 更敢答**：Agent 自己给出了推荐选项，而且该选项可逆、在仓库内、没有超出原需求范围时，answerer 回复 “Go with your recommendation.”。超出原需求范围的（例如用户只要分析，Agent 提议动手实现）仍然转交给用户。线上第一次 needs_user 就属于这种情况，按规则转交是对的。
@@ -249,7 +260,7 @@ Paseo 不传 `stopReason`（S1），所以粗筛额外加入以下信号，命�
 
 - `awaiting_user` 默认由 post-turn Agent 代答（§3.1），不能代答时 escalate 给用户。
 - “是否在等用户”用两段式判定：规则预筛加语义判定（§2.1），不只看问号。
-- 重试文本有默认值，可以在策略里用 `retry.message` 覆盖。代答的补充规则写在 `agents.answerer.instructions` 或 `instructions_file`（design.md §3.1）；`answer` 里只有 `max`。
+- 重试文本有默认值，可以在策略里用 `retry.message` 覆盖。代答的补充规则写在 `agents.answerer.instructions` 或 `instructions_file`（design.md §3.1）；`answer` 里只有 `max` 和 `delay_seconds`。
 
 ## 9. 附：Reviewer 权限请求卡住（2026-09-29 线上问题）
 
