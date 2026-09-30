@@ -479,6 +479,7 @@ decider 协议 v1 的实现（`server/gate.ts` “decision rounds” 一节）�
 
 - 一轮一张卡之后（`f9ea91a`）：“给 add.js 加 div，只写函数”：检查 PASS，decider 判定完成，没有发送任何消息，任务结束。“给 add.js 加 mul”，仓库的 `verifier.md` 规定每个导出函数都要有测试：verify FAIL → decider 发出修复要求 → 主 Agent 补了 mul 的测试 → verify 又因为 div 没有测试 FAIL → decider 再发一次 → PASS → 完成。全程 2 条自动消息，没有人参与。
 - 检查者的 summary 曾出现不是请求语言的情况（英文请求得到西班牙语 summary）。现在按请求文字判断语言（中日韩俄按字符，英文按常见词），能判断时在 prompt 里直接写出语言名；判断不了时退回“请求所用的语言”。
+- Codex（`codex-proxy/gpt-5.6-terra`，mode `auto-review`）：“给 add.js 加 mod 并补测试”。verify、review 继承源 Agent 的 provider、model 和 mode，结构化输出（`outputSchema`）直接解析成功，检查 PASS 后任务自动结束。
 - 语言修正之后（`9d3f6f9`）：中文请求“在 add.js 里加 pow 并补测试”，verify、review 的 summary 和 decider 的理由都是中文；检查 PASS 后任务自动结束。
 
 v1 与本设计的差异，后续步骤处理：
@@ -496,7 +497,12 @@ v1 与本设计的差异，后续步骤处理：
 
 卡片上的控制：`Stop auto-answering` 会取消进行中的一轮（包括正在跑的检查）；停止后卡片显示 `Resume auto-answering`，恢复后下一轮照常由 decider 处理。Pause/Replace 未实现：停止加恢复已覆盖暂停，Replace 等价于你发一条新请求。
 
-尚未做：按工作区分队列、检查与 decider 模块从 `gate.ts` 拆分。
+尚未做：
+
+- 按工作区分队列：仍是一个全局串行队列（标了 `ponytail:`），目前没有出现过瓶颈。
+- 从 `gate.ts` 拆出 decision round 模块：试算过，它依赖 `gate.ts` 闭包里约 25 个函数（ledger、卡片、派发、任务链），拆出去只会得到一个很宽的浅接口，暂不拆。
+- 结构化 Requirement Revision 和发送 outbox：现在需求按文本累积，发送靠 messageId 对账。
+- 真实环境里的子 Agent（`post-turn-gate.target=true`）和 Claude 冒烟。
 
 ## 20. 已定的默认决策
 

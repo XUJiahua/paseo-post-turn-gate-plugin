@@ -106,7 +106,7 @@ agent disputes, checker trouble (a denied permission, edits to the tree), or a u
 Code enforces the limits the decider cannot talk its way around: "done" on changed files needs a PASS on the current
 tree, a FAIL stands until a change passes it (the checkers never see the agent's arguments), replies that would
 approve a risky action are not sent, and every message goes out only while the agent is idle. Design and status:
-[docs/completion-supervisor.md](docs/completion-supervisor.md). Verified end to end with the `kiro` provider.
+[docs/completion-supervisor.md](docs/completion-supervisor.md). Verified end to end with the `kiro` and `codex` (via `codex-proxy`) providers.
 
 ## Version 2 (`--v2`)
 
