@@ -1484,8 +1484,8 @@ export function createGate(options: GateOptions): Gate {
     if (sendsOf(chain) >= supervision.budget.max_auto_sends) {
       return handOff(`the task used its ${supervision.budget.max_auto_sends} automatic messages`);
     }
-    // ponytail: wall clock since the budget started, including time spent waiting for you. Upgrade path: pause the
-    // clock in needs-user states.
+    // Wall clock since the budget started. Time waiting for you does not count: the round after a hand-off starts
+    // with your message, which starts a new budget.
     if (now() - (chain.budget_since ?? chain.created_at) > supervision.budget.max_minutes * 60_000) {
       return handOff(`the task ran for more than ${supervision.budget.max_minutes} minutes`);
     }
