@@ -156,7 +156,7 @@ prompt 包含：
 做法：引入“任务链”（chain）。
 
 - 原始轮次在 `turn_started` 时生成 `pending { policy, baseTree }`（现有逻辑）。
-- 如果以 `retry` 或 `awaiting_user` 结束，就不丢弃 pending，改为保存为 `carry[agentId] = pending`，并记下 `attempts`。
+- 如果以 `retry` 或 `awaiting_user` 结束，就不丢弃 pending，改为保存为 `carry[agentId] = pending`，并记下重试次数（`retries`）和代答次数（`answers`）。
 - 下一轮 `turn_started` 时，若存在 `carry`，就沿用其中的 `policy` 和 `baseTree`，不再重新读取。用户在提问后回答，或者插件发出的重试消息，都属于这条链。
 - 链在以下情况结束：
   - 出现 `done`：执行 gate，base 用链起点；
@@ -164,19 +164,20 @@ prompt 包含：
   - 超过重试次数：notify；
   - carry 存在超过 24 小时：丢弃。
 - 重试消息的 `messageId` 为 `ptg:retry:<chainId>:<n>`，与 fix 轮一样归入同一条链。发送前必须确认 Agent 为 `idle`，否则放弃重试（用户已经接手）。
-- **存储**：carry 和待执行的重试写进 ledger 新表 `chains (agent_id PK, chain_id, policy_json, base_tree, attempts, next_retry_at, updated_at)`。对账循环（60s）负责到点发送，插件重启后也能继续。
+- **存储**：carry 和待执行的重试写进 ledger 表 `chains`（`agent_id` 为主键，另有 `chain_id`、`policy_json`、`base_tree`、`request_text`、`retries`、`answers`、`next_retry_at`、answerer 的派发参数和截止时间、`card_json` 等），answerer 子 Agent 登记在 `chain_children`。对账循环（60s）负责到点发送，插件重启后也能继续。
 
 `ponytail:` 等待用户回答期间，`awaiting_user` 会让 carry 一直保留，直到 24 小时过期。期间用户开始一个新任务，也会被算进同一条链，review 范围因此变大。可以接受：这只会多 review，不会漏。
 
 ## 5. 卡片
 
-新增一种 kind：`post-turn-gate-outcome` v1，id 为 `post-turn-gate:outcome:<agentId>:<turnKey>`：
+新增一种 kind：`post-turn-gate-outcome` v1。每条任务链一张，id 为 `post-turn-gate:outcome:<chainId>`（最初设计为按轮次各一张，实现时改为按链复用，见 §7.1）：
 
 ```ts
-data = { category, message, suggestion, attempt, maxAttempts, nextRetryAt }
+data = { chainId, category, state, message, suggestion, question, answer, attempt, maxAttempts, nextRetryAt,
+         childAgentId, canStopAnswering, permission }   // 以 shared/schema.ts 的 outcomeCardSchema 为准
 ```
 
-同一轮只写一张；重试进行中原地更新（例如“2 分钟后自动重试（1/2）”）。
+重试、代答、结束都在这张卡片上原地更新（例如“2 分钟后自动重试（1/2）”）。
 
 ## 6. 局限与上游改进
 
@@ -248,7 +249,7 @@ Paseo 不传 `stopReason`（S1），所以粗筛额外加入以下信号，命�
 
 - `awaiting_user` 默认由 post-turn Agent 代答（§3.1），不能代答时 escalate 给用户。
 - “是否在等用户”用两段式判定：规则预筛加语义判定（§2.1），不只看问号。
-- 重试文本有默认值，可以在策略里用 `retry.message` 覆盖；代答可以用 `answer.instructions` 补充规则。
+- 重试文本有默认值，可以在策略里用 `retry.message` 覆盖。代答的补充规则写在 `agents.answerer.instructions` 或 `instructions_file`（design.md §3.1）；`answer` 里只有 `max`。
 
 ## 9. 附：Reviewer 权限请求卡住（2026-09-29 线上问题）
 

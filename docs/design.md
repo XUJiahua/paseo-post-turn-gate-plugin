@@ -196,26 +196,31 @@ turn_started(agent)
 
 turn_ended(agent, outcome, timeline)
   ├─ agent 是 ledger 中某个 run 的子 Agent → finalizeReview(run, outcome, timeline)
-  ├─ 最后一条 user_message.messageId 以 "ptg:" 开头 → onFixTurnEnded(run, outcome)
-  ├─ outcome ≠ completed → 丢弃 pending，结束
+  ├─ agent 是某条任务链的 answerer → finalizeAnswer（turn-outcomes.md §3.1）
+  ├─ 最后一条 user_message.messageId 形如 "ptg:<run_id>:fix:<n>" → onFixTurnEnded(run, outcome)
+  ├─ pending 属于更早的 turn（已被新一轮替换，基线已交给新一轮）→ 结束
   ├─ 没有 pending（例如插件中途重载）→ 记日志，结束
-  ├─ 策略为 none 或无效 → 结束（无效时写 ERROR 卡片）
+  ├─ 策略无效 → 写 ERROR 卡片，结束
   ├─ refresh() 源 Agent → 按 labels + trigger 过滤（managed=true 永远跳过）
-  ├─ 计算 endTree；与 baseTree 相同 → 结束
-  └─ claim：INSERT gate_runs（source_turn_key UNIQUE）；冲突 → 结束；成功 → dispatch(run, round=1)
+  └─ classify(outcome) → 按 on_outcome 分派（turn-outcomes.md）：
+       ├─ replaced → 结束；user_canceled → 结束任务链
+       ├─ 计算 endTree；与 baseTree 相同 → 结束任务链，不检查、不代答、不重试
+       ├─ done（或 awaiting_user 且配置为 as_done）→ claim：INSERT gate_runs（source_turn_key UNIQUE）；
+       │    冲突 → 结束；成功 → dispatch(run, round=1, step=0)
+       └─ 其他类别 → 任务链：代答 / 重试 / 通知，基线沿用链起点
 ```
 
 `source_turn_key = <agentId>:<lastUser.messageId>`。缺少 messageId 时退化为 `<agentId>:turn:<turnId>:<timeline.length>`。
 
-判断“ptg:”前缀时，还要确认对应 run 确实存在且处于 `FIXING`，避免用户伪造 messageId。
+判断 fix 前缀时，还要确认对应 run 存在、属于该 Agent 且轮次一致；`onFixTurnEnded` 再确认 run 处于 `FIXING`，避免用户伪造 messageId。
 
 ### 4.2 派发
 
 ```text
 dispatch(run, round):
   src = refresh(source)
-  childId = randomUUID(); key = "ptg:<run_id>:<round>"
-  ledger: status=DISPATCHING, child_agent_id=childId, round
+  childId = randomUUID(); key = "ptg:<run_id>:<round>:<step>"   // step：当前检查项在 done 列表中的下标
+  ledger: status=DISPATCHING, child_agent_id=childId, round, deadline_at=now+timeout_minutes
   timeline.append(卡片 RUNNING)
   paseo.workspaces.ref(workspaceId).agents.create({
     agentId: childId, idempotencyKey: key, parent: sourceId,
@@ -225,7 +230,7 @@ dispatch(run, round):
               featureValues: featuresOf(src) },
     title: `Gate ${action} #${round} · ${src.title ?? sourceId.slice(0, 8)}`,
     prompt, clientMessageId: key, outputSchema: VERDICT_JSON_SCHEMA,
-    labels: { "post-turn-gate.managed": "true", "post-turn-gate.role": action,
+    labels: { "post-turn-gate.managed": "true", "post-turn-gate.role": role,   // reviewer / verifier
               "post-turn-gate.run-id": run_id },
   })
   ledger: status=REVIEWING
@@ -238,9 +243,10 @@ dispatch(run, round):
   - 仓库根目录；
   - 改动范围：两个 tree sha，要求模型用 `git diff <base> <end>` 查看；
   - “不要修改文件”（只是约束，不强制）；
+  - 仓库规则：`instructions_file` 和 `instructions`（§3.1，turn 开始时读取）；
   - 只输出纯 JSON 的要求（K5）。
 - ledger 在创建之前写入。崩溃后可以用同一个 id 和 key 重放，不会重复发 prompt（V9、V10）。
-- 权限请求：插件**不代为作答**，交给用户处理，和源 Agent 的体验一致。插件监听子 Agent 的 `permission_requested` / `permission_resolved`，把卡片切换为“等待授权”或恢复“进行中”。不代为拒绝，是因为 kiro 收到拒绝会直接终止整轮（K6）。
+- 权限请求：默认按 §5 自动处理，常规请求自动批准，高风险请求显示在卡片上由用户回答；`permissions: "ask"` 时全部交给用户。插件监听子 Agent 的 `permission_requested` / `permission_resolved`，把卡片切换为“等待授权”或恢复“进行中”。插件从不代为拒绝，因为 kiro 收到拒绝会直接终止整轮（K6）。
 
 ### 4.3 结果处理
 
@@ -250,9 +256,10 @@ finalizeReview(run, outcome, childTimeline):
   outcome ≠ completed → ERROR("reviewer turn <kind>")
   afterTree ≠ end_tree → 记录 reviewer_changes = git diff --stat end_tree afterTree（只警告，不改判）
   解析最后一条 assistant_message 为 Verdict；失败 → ERROR（不得当作 PASS）
-  PASS → PASSED
-  INCONCLUSIVE → INCONCLUSIVE
-  FAIL:
+  PASS / INCONCLUSIVE:
+    done 列表里还有下一项检查 → step+1，dispatch 下一项
+    否则 → 本轮有 INCONCLUSIVE 则 INCONCLUSIVE，全部 PASS 则 PASSED
+  FAIL（本轮后面的检查不再执行）:
     report → FAILED
     fix 且 round-1 < fix.max_rounds → sendFix
     否则 → NEEDS_HUMAN
@@ -269,7 +276,7 @@ sendFix(run):
 
 onFixTurnEnded(run, outcome):
   outcome ≠ completed → SUPERSEDED（base_tree 和请求留给下一轮，见 4.1）
-  end_tree = 当前 tree → dispatch(run, round + 1)   // diff 仍然以原 base_tree 为基准
+  end_tree = 当前 tree → dispatch(run, round + 1, step=0)   // diff 仍然以原 base_tree 为基准，从第一项检查重新开始
 ```
 
 ### 4.4 基线 tree
@@ -300,7 +307,7 @@ Reviewer 不强制只读，与源 Agent 采用相同的权限模型：
   - 不可逆、对外、提权、涉及凭据的请求（`rm -rf`、`git push/reset --hard`、`sudo`、发布、云/部署工具、`curl | sh`、破坏性 SQL、仓库外路径、`.env`/私钥等），以及 plan、question、mode 类请求，不自动批准，显示在卡片上，附带原因和按钮，由用户决定；
   - 规则在 `server/permissions.ts`，是模式列表而不是 shell 解析器，用 `ponytail:` 注明了上限；
   - `agents.<role>.permissions: "ask"` 可恢复为每个请求都问用户；
-  - 卡片显示已自动批准的次数。等待用户期间不计入超时（§9）。
+  - 卡片显示已自动批准的次数。等待用户回答的时间也计入 `timeout_minutes`，超时判 `ERROR`（§7）。
 
 `ponytail:` 这里只能事后发现改动，不能事前阻止。需要硬约束时，可以按 provider 增加只读 mode 映射，作为后续可选项。kiro 已验证可行的做法（K7、K8）：单独建一个 agent，`tools` 中不包含 `write`；shell 设置 `allowedCommands: ["git (status|diff|log|show)( .*)?"]` 和 `denyByDefault: true`；`includeMcpJson: false`。这样做的代价是 Verify 无法再运行测试。
 
@@ -328,8 +335,9 @@ REVIEWING | FIXING ── 用户插话 / fix 轮被取消 ──→ SUPERSEDED
 ```
 
 - 终态：`PASSED, INCONCLUSIVE, FAILED, NEEDS_HUMAN, ERROR, SUPERSEDED`。
-- `round` 从 1 开始，表示第几次 review。
-- 单次 review 超时固定为 30 分钟。子 Agent 有待处理的权限请求时（`pendingPermissions` 非空；等待期间 `status` 仍是 `running`，K11），每次对账都会重置截止时间。
+- `round` 从 1 开始，表示第几次 review；`step` 表示本轮进行到 `done` 列表的第几项检查。
+- 每项检查的截止时间在 dispatch 时设为 `agents.<role>.timeout_minutes`（默认 30 分钟），包括等待授权的时间，不会顺延（turn-outcomes.md §7.3）。子 Agent 等待授权期间 `status` 仍是 `running`（K11），超时时若 `pendingPermissions` 非空，错误信息写明 “a permission request was not answered”。
+- `FIXING` 没有截止时间：修复由源 Agent 完成，不受角色超时约束。修复轮结束时照常重新检查。
 
 ## 8. Ledger（`node:sqlite`）
 
@@ -349,7 +357,8 @@ CREATE TABLE gate_runs (
   end_tree        TEXT NOT NULL,
   status          TEXT NOT NULL,
   round           INTEGER NOT NULL,
-  child_agent_id  TEXT,              -- 当前轮
+  step            INTEGER NOT NULL DEFAULT 0, -- 本轮当前检查项在 done 列表中的下标
+  child_agent_id  TEXT,              -- 当前轮、当前检查项
   dispatch_json   TEXT,              -- 本轮 create 的完整参数，恢复时原样重放（同 key 必须同 payload，V9）
   deadline_at     INTEGER,
   verdict         TEXT,
@@ -357,13 +366,19 @@ CREATE TABLE gate_runs (
   reviewer_changes TEXT,             -- Reviewer 改动的 diffstat
   rounds_json     TEXT NOT NULL DEFAULT '[]',
   error           TEXT,
-  created_at      TEXT NOT NULL,
-  updated_at      TEXT NOT NULL
+  created_at      INTEGER NOT NULL,  -- epoch 毫秒
+  updated_at      INTEGER NOT NULL
 );
 CREATE INDEX gate_runs_child ON gate_runs(child_agent_id);
 CREATE INDEX gate_runs_source_status ON gate_runs(source_agent_id, status);
 -- 每一轮的子 Agent 在创建前登记，旧轮次子 Agent 的迟到事件也能识别为 managed
 CREATE TABLE gate_children (child_agent_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, round INTEGER NOT NULL);
+-- 被 SUPERSEDED 的 run 留下的未检查改动，交给该 Agent 下一个被检查的轮次（§4.1）
+CREATE TABLE carries (agent_id TEXT PRIMARY KEY, repo_root TEXT NOT NULL, base_tree TEXT NOT NULL,
+                      request_text TEXT NOT NULL, created_at INTEGER NOT NULL);
+-- 任务链与 answerer 子 Agent，见 turn-outcomes.md §4
+CREATE TABLE chains (agent_id TEXT PRIMARY KEY, chain_id TEXT NOT NULL UNIQUE, ...);
+CREATE TABLE chain_children (child_agent_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, chain_id TEXT NOT NULL);
 ```
 
 在 claim 之前，`turn_started` 到 `turn_ended` 之间的策略快照只放在内存里。hook 本身不会重放，把它持久化没有意义。
@@ -372,7 +387,7 @@ CREATE TABLE gate_children (child_agent_id TEXT PRIMARY KEY, run_id TEXT NOT NUL
 
 - **触发时机**：第一次拿到 `context.paseo` 时（任意 hook 或 RPC）；之后只要存在未终结的 run，就每 60 秒检查一次。只扫描 ledger，不扫描历史 Agent。
 - **`DISPATCHING`**：用 `dispatch_json` 中记录的同一份参数（同 id、同 key）重放 create（V9、V10）。成功 → `REVIEWING`；失败时先查询子 Agent，存在则进入 `REVIEWING`，否则 `ERROR`。如果还没来得及记录 `dispatch_json`，就重新 dispatch。
-- **`REVIEWING`**：`refresh(child)`。仍在 running → 继续等（有待处理的权限请求时顺延截止时间）；已 idle → 用 `timeline.refetch({ direction: "tail" })` 取结果并 finalize；超时 → `ERROR`。
+- **`REVIEWING`**：`refresh(child)`。仍在 running → 继续等（等待授权也不顺延截止时间，§7）；已 idle → 用 `timeline.refetch({ direction: "tail" })` 取结果并 finalize；超时 → `ERROR`。
 - **`FIXING`**：`refresh(source)`。已 idle 时在 timeline 中查找 `ptg:…:fix:<n>`：
   - 找不到 → 用同一个 messageId 重发；
   - 找到，但之后还有其他用户消息 → `SUPERSEDED`；
@@ -384,8 +399,8 @@ CREATE TABLE gate_children (child_agent_id TEXT PRIMARY KEY, run_id TEXT NOT NUL
 
 ```ts
 timeline.append({ type: "plugin", id: "post-turn-gate:<run_id>:round:<round>", kind: "post-turn-gate", version: 1, data })
-data = { status, action, round, maxFixRounds, waiting, summary, findings, otherFindings,
-         childAgentId, childTitle, reviewerChanges, error }
+data = { status, action, round, maxFixRounds, waiting, permission, autoApproved, summary, findings,
+         otherFindings, childAgentId, childTitle, reviewerChanges, error, checks }   // 以 shared/schema.ts 的 cardSchema 为准
 ```
 
 每轮使用独立的 timeline item id：同一轮的状态原位更新，修复后的下一轮在时间线当前位置新增卡片。
@@ -415,15 +430,18 @@ package.json               # 仅 devDependencies（typecheck）
 index.server.ts
 index.client.tsx
 shared/schema.ts           # 策略 / Verdict / 卡片 zod schema
-server/gate.ts             # 串行队列、状态机、dispatch/finalize/fix、恢复
+server/gate.ts             # 串行队列、状态机、dispatch/finalize/fix、任务链、代答、重试、恢复
 server/git.ts              # toplevel、tree 快照
 server/ledger.ts           # node:sqlite
+server/outcome.ts          # turn 结束分类、awaiting_user 预筛（turn-outcomes.md）
 server/prompts.ts
 server/reviewer.ts         # 源 Agent / profile / 显式字段的分层解析
 server/permissions.ts      # 托管 Agent 权限请求的自动批准 / 上交规则
-scripts/create-agent-profiles.mjs  # 创建 reviewer/verifier agent profile（经 paseo CLI）
-client/gate-card.tsx
-server/gate.test.ts        # 真实 git + sqlite、fake paseo 的状态机测试（node:test，npm test）
+bin/post-turn-gate-init.mjs        # 生成 .paseo/post-turn-gate.json 和角色规则模板（npm run init）
+scripts/create-agent-profiles.mjs  # 创建 reviewer/verifier/answerer agent profile（经 paseo CLI）
+client/gate-card.tsx       # 检查结果卡片
+client/outcome-card.tsx    # 任务链卡片（代答、重试、通知）
+server/*.test.ts           # 真实 git + sqlite、fake paseo 的测试（node:test，npm test）
 ```
 
 `server/` 下的测试文件不会被入口 import，因此不会打进插件包。插件模块之间的 import 带 `.ts` 后缀：Paseo 的 esbuild 能解析，node 的 `--experimental-strip-types` 也能直接运行，不需要额外的测试依赖。
@@ -432,12 +450,12 @@ server/gate.test.ts        # 真实 git + sqlite、fake paseo 的状态机测试
 
 - [ ] 读取并校验 `.paseo/post-turn-gate.json`；无效时显示 ERROR 卡片，不创建子 Agent。
 - [ ] `turn_started` 冻结策略和基线 tree。
-- [ ] 支持 `done` 检查列表（review、verify，按顺序）；只处理 `completed` 且有改动的 turn。
+- [ ] 支持 `done` 检查列表（review、verify，按顺序）；只检查以 `done`（或 `awaiting_user` 配置为 `as_done`）结束、且任务改动了工作区的 turn。
 - [ ] 默认只触发根 Agent，以及带 `post-turn-gate.target=true` 的子 Agent；`managed=true` 永远不触发。
 - [ ] Reviewer 与源 Agent 在同一 workspace，以源 Agent 为 parent；默认继承 provider/model/mode/thinking/features，可用 agent profile 或显式字段覆盖。
 - [ ] `scripts/create-agent-profiles.mjs` 能创建、更新 reviewer/verifier profile 并热加载。
-- [ ] Reviewer 改动工作区时，卡片显示警告和 diffstat；解析失败 → ERROR；Reviewer 等待授权时，卡片显示“等待授权”，且不因此超时。
-- [ ] 卡片按 `post-turn-gate:<run_id>` 原地更新；run 到终态后归档子 Agent，并且可以在“历史”页找到。
+- [ ] Reviewer 改动工作区时，卡片显示警告和 diffstat；解析失败 → ERROR；Reviewer 等待授权时，卡片显示“等待授权”和按钮；等待时间计入 `timeout_minutes`，超时 → ERROR 并写明原因。
+- [ ] 卡片按 `post-turn-gate:<run_id>:round:<round>` 每轮一张、同轮原地更新；run 到终态后归档子 Agent，并且可以在“历史”页找到。
 - [ ] `report` 只报告；`fix` 在源 Agent 空闲时发送 findings，修复后按原基线重新 review；轮次用尽 → NEEDS_HUMAN。
 - [ ] 用户插话会让进行中的 run 变为 SUPERSEDED，不会打断用户的 turn。
 - [ ] 同一个 source turn 只有一个 run；同一轮只创建一个子 Agent。
