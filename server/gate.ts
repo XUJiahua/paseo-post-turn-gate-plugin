@@ -45,6 +45,8 @@ import {
 } from "./prompts.ts";
 import { answerRisk, decideAutoApproval } from "./permissions.ts";
 import { resolveRole } from "./reviewer.ts";
+import { IDLE, IDLE_OR_ERROR, sendIfIdle } from "./dispatch.ts";
+import { decideAnswer, decideCheck, normalizeVerdict } from "./decisions.ts";
 
 export type Paseo = PluginHookContext["paseo"];
 type TurnStarted = PluginLifecycleEvents["agent.turn_started"];
@@ -668,9 +670,7 @@ export function createGate(options: GateOptions): Gate {
     if (!verdict) {
       return fail(paseo, run, "reviewer reply is not a valid verdict JSON", { reviewer_changes: reviewerChanges });
     }
-    if (verdict.verdict === "INCONCLUSIVE" && !verdict.inconclusive_reason && blocked) {
-      verdict = { ...verdict, inconclusive_reason: "blocked_permission" };
-    }
+    verdict = normalizeVerdict(verdict, blocked !== undefined);
     const reason = verdict.inconclusive_reason;
     const rounds = JSON.parse(run.rounds_json) as RoundRecord[];
     rounds.push({ round, check, childAgentId, verdict: verdict.verdict, summary: verdict.summary, reason });
@@ -681,56 +681,52 @@ export function createGate(options: GateOptions): Gate {
       reviewer_changes: reviewerChanges,
       rounds_json: JSON.stringify(rounds),
     };
-    // on_inconclusive "fail" covers gaps the agent can close itself (tests, other evidence); a blocked
-    // permission, an ambiguous request or a missing environment are not the agent's to fix.
-    const failing =
-      verdict.verdict === "FAIL" ||
-      (verdict.verdict === "INCONCLUSIVE" && policy.on_inconclusive === "fail" && (reason === null || reason === "no_test_infra" || reason === "other"));
-    if (!failing) {
-      // Checks run in order until one fails; INCONCLUSIVE does not block the next check.
-      const next = run.step + 1;
-      if (next < gateChecks(policy).length) {
+    const decision = decideCheck({ policy, verdict, step: run.step, round, records: rounds.filter((record) => record.round === round) });
+    switch (decision.kind) {
+      case "next_check": {
         // DISPATCHING without a payload: after a crash here, reconcile dispatches the next check instead of
         // re-reading the finished child's verdict and advancing twice.
-        const advanced = { ...base, step: next, status: "DISPATCHING" as const, dispatch_json: null, child_agent_id: null, deadline_at: null };
+        const advanced = { ...base, step: decision.step, status: "DISPATCHING" as const, dispatch_json: null, child_agent_id: null, deadline_at: null };
         const dispatching = await transition(paseo, run, advanced);
         await archiveChild(paseo, childAgentId);
         return dispatch(paseo, dispatching);
       }
-      const current = rounds.filter((record) => record.round === round);
-      const needsYou = current.find((record) => record.reason === "blocked_permission" || record.reason === "ambiguous_request");
-      if (needsYou) {
-        const what = needsYou.check === "verify" ? "verifier" : "reviewer";
+      case "needs_human": {
+        const what = decision.check === "verify" ? "verifier" : "reviewer";
         const error =
-          needsYou.reason === "blocked_permission"
+          decision.reason === "blocked_permission"
             ? `The ${what} could not finish: a permission request it needed was denied or not answered. Allow it next time, or tell the agent how to proceed; its next turn checks the whole task again.`
             : `The ${what} could not tell what the request requires. Clarify it in the chat; the agent's next turn checks the whole task again.`;
         await transition(paseo, run, { ...base, status: "NEEDS_HUMAN", error });
         // Unverified changes stay unaccepted: the agent's next turn checks the whole task again.
         carryOver(run);
-      } else {
-        const inconclusive = current.some((record) => record.verdict === "INCONCLUSIVE");
-        await transition(paseo, run, { ...base, status: inconclusive ? "INCONCLUSIVE" : "PASSED" });
+        break;
       }
-    } else if (maxFixRounds(policy) === 0) {
-      await transition(paseo, run, { ...base, status: "FAILED" });
-    } else if (round - 1 >= maxFixRounds(policy)) {
-      await transition(paseo, run, {
-        ...base,
-        status: "NEEDS_HUMAN",
-        error:
-          "The fix rounds are used up. Take over in the chat: if the agent's next turn changes files, the whole task is " +
-          "checked again (without new fix rounds); a turn that changes nothing leaves the changes as they are.",
-      });
-      // The failing changes stay unaccepted until a turn changes them or leaves them as they are.
-      carryOver(run, run.end_tree);
-    } else {
-      try {
-        await sendFix(paseo, ledger.update(run.run_id, base, now()), verdict, policy);
-      } finally {
-        await archiveChild(paseo, childAgentId);
-      }
-      return;
+      case "passed":
+      case "inconclusive":
+        await transition(paseo, run, { ...base, status: decision.kind === "passed" ? "PASSED" : "INCONCLUSIVE" });
+        break;
+      case "failed":
+        await transition(paseo, run, { ...base, status: "FAILED" });
+        break;
+      case "rounds_used_up":
+        await transition(paseo, run, {
+          ...base,
+          status: "NEEDS_HUMAN",
+          error:
+            "The fix rounds are used up. Take over in the chat: if the agent's next turn changes files, the whole task is " +
+            "checked again (without new fix rounds); a turn that changes nothing leaves the changes as they are.",
+        });
+        // The failing changes stay unaccepted until a turn changes them or leaves them as they are.
+        carryOver(run, run.end_tree);
+        break;
+      case "fix":
+        try {
+          await sendFix(paseo, ledger.update(run.run_id, base, now()), verdict, policy);
+        } finally {
+          await archiveChild(paseo, childAgentId);
+        }
+        return;
     }
     await archiveChild(paseo, childAgentId);
   }
@@ -738,15 +734,19 @@ export function createGate(options: GateOptions): Gate {
   async function sendFix(paseo: Paseo, run: Run, verdict: Verdict, policy: Policy): Promise<void> {
     // No deadline: the source agent does the fix, and a role's timeout_minutes does not bound its work.
     // A slow fix still ends in a turn_ended that re-checks it; timing it out would leave the fix unchecked.
-    const fixing = await transition(paseo, run, { status: "FIXING", deadline_at: null });
-    const source = await refreshAgent(paseo, run.source_agent_id);
-    if (!source || source.status !== "idle") {
-      await supersede(paseo, fixing, run.round - 1); // the fix was not sent
+    // FIXING is recorded right before send() (synchronously), and the card follows the send.
+    let fixing = run;
+    const result = await sendIfIdle(
+      paseo,
+      run.source_agent_id,
+      { text: buildFixPrompt(verdict, run.round, maxFixRounds(policy), concurrentOf(run)), messageId: fixMessageId(run) },
+      { accept: IDLE, beforeSend: () => (fixing = ledger.update(run.run_id, { status: "FIXING", deadline_at: null }, now())) },
+    );
+    if (result !== "sent") {
+      await supersede(paseo, run, run.round - 1); // the fix was not sent
       return;
     }
-    await paseo.agents.ref(run.source_agent_id).send(buildFixPrompt(verdict, run.round, maxFixRounds(policy), concurrentOf(run)), {
-      messageId: fixMessageId(fixing),
-    });
+    await publishCard(paseo, fixing).catch((error) => log("card update failed", error));
   }
 
   const fixMessageId = (run: Run) => `${FIX_PREFIX}${run.run_id}:fix:${run.round}`;
@@ -823,7 +823,7 @@ export function createGate(options: GateOptions): Gate {
   // Errs towards escalating: a false match hands the question to the user, a miss can loop.
   const SAME_QUESTION = 0.5;
   const retryTimers = new Set<ReturnType<typeof setTimeout>>();
-  const sendable = (status: string | undefined) => status === "idle" || status === "error";
+  const sendable = (status: string | undefined) => status !== undefined && IDLE_OR_ERROR.includes(status);
 
   function liveChain(agentId: string): Chain | null {
     const chain = ledger.chain(agentId);
@@ -1173,19 +1173,21 @@ export function createGate(options: GateOptions): Gate {
   }
 
   async function sendRetry(paseo: Paseo, chain: Chain): Promise<void> {
-    const source = await refreshAgent(paseo, chain.agent_id);
-    if (!source) return ledger.deleteChain(chain.agent_id);
-    if (!sendable(source.status)) {
-      const current = ledger.updateChain(chain.agent_id, { next_retry_at: null }, now()) ?? chain;
+    const attempt = chain.retries + 1;
+    let current: Chain = chain;
+    // Send first: publishing the card between the idle check and send() would widen the race.
+    const result = await sendIfIdle(
+      paseo,
+      chain.agent_id,
+      { text: chain.retry_message ?? DEFAULT_RETRY_MESSAGE, messageId: `ptg:retry:${chain.chain_id}:${attempt}` },
+      { accept: IDLE_OR_ERROR, beforeSend: () => (current = ledger.updateChain(chain.agent_id, { retries: attempt, next_retry_at: null }, now())!) },
+    );
+    if (result === "gone") return ledger.deleteChain(chain.agent_id);
+    if (result === "busy") {
+      current = ledger.updateChain(chain.agent_id, { next_retry_at: null }, now()) ?? chain;
       await publishChainCard(paseo, current, { state: "stopped", nextRetryAt: null, message: "The agent was busy again; automatic retry skipped." });
       return;
     }
-    const attempt = chain.retries + 1;
-    const current = ledger.updateChain(chain.agent_id, { retries: attempt, next_retry_at: null }, now())!;
-    // Send first: publishing the card between the idle check and send() would widen the race (finalizeAnswer).
-    await paseo.agents
-      .ref(chain.agent_id)
-      .send(chain.retry_message ?? DEFAULT_RETRY_MESSAGE, { messageId: `ptg:retry:${chain.chain_id}:${attempt}` });
     await publishChainCard(paseo, current, { state: "retrying", attempt, nextRetryAt: null });
   }
 
@@ -1302,7 +1304,14 @@ export function createGate(options: GateOptions): Gate {
     }
     const reply = parseAnswer(latestAssistantText(timeline));
     if (!reply) return needsUser(paseo, current, undefined, `${denied}the answerer reply is not valid JSON`);
-    if (reply.state === "done") {
+    const decision = decideAnswer({
+      reply,
+      fallbackQuestion: chainCard(current).question || "",
+      lastQuestion: current.last_question,
+      risk: answerRisk,
+      similar: (a, b) => similarity(a, b) >= SAME_QUESTION,
+    });
+    if (decision.kind === "done") {
       await startGate(paseo, taskFromChain(current));
       // Not a question after all: the card says "Finished", without an "Agent asked" excerpt.
       return endChain(paseo, owner.agentId, {
@@ -1312,7 +1321,7 @@ export function createGate(options: GateOptions): Gate {
         message: "The agent had finished; nothing to answer.",
       });
     }
-    if (reply.state === "refused") {
+    if (decision.kind === "refused") {
       const policy = JSON.parse(current.policy_json) as Policy;
       if (policy.on_outcome.refused === "ignore") return endChain(paseo, owner.agentId, null);
       await publishChainCard(paseo, current, {
@@ -1327,33 +1336,19 @@ export function createGate(options: GateOptions): Gate {
       });
       return;
     }
-    const question = reply.question.trim() || chainCard(current).question || "";
-    if (reply.state === "awaiting_user" && reply.decision === "escalate") {
-      return needsUser(paseo, current, question, reply.reason || "the answerer handed this to you");
-    }
-    const text = reply.state === "incomplete" ? "Continue." : reply.answer.trim();
-    if (!text) return needsUser(paseo, current, question, "the answerer gave no answer");
-    const risk = answerRisk(`${question}\n${text}`);
-    if (risk) return needsUser(paseo, current, question, `not answered automatically: ${risk}`);
-    if (reply.state === "awaiting_user" && current.last_question && similarity(question, current.last_question) >= SAME_QUESTION) {
-      return needsUser(paseo, current, question, "the agent asked the same question again after an automatic answer");
-    }
-    // Paseo has no "send only if idle": a user message between this refresh and send() would be canceled
-    // by ours (design.md V5). Nothing awaits between the two, so the window is one round trip.
-    const source = await refreshAgent(paseo, owner.agentId);
-    if (!source || !sendable(source.status)) {
+    if (decision.kind === "escalate") return needsUser(paseo, current, decision.question, decision.reason);
+    const { question, text, lastQuestion } = decision;
+    const attempt = current.answers + 1;
+    const result = await sendIfIdle(
+      paseo,
+      owner.agentId,
+      { text: `${ANSWER_PREFIX}\n${text}`, messageId: `ptg:answer:${current.chain_id}:${attempt}` },
+      { accept: IDLE_OR_ERROR, beforeSend: () => (current = ledger.updateChain(owner.agentId, { answers: attempt, last_question: lastQuestion }, now())!) },
+    );
+    if (result !== "sent") {
       await publishChainCard(paseo, current, { state: "stopped", canStopAnswering: false, message: "You replied first; the automatic answer was not sent." });
       return;
     }
-    const attempt = current.answers + 1;
-    current = ledger.updateChain(
-      owner.agentId,
-      { answers: attempt, last_question: reply.state === "awaiting_user" ? question : current.last_question },
-      now(),
-    )!;
-    await paseo.agents.ref(owner.agentId).send(`${ANSWER_PREFIX}\n${text}`, {
-      messageId: `ptg:answer:${current.chain_id}:${attempt}`,
-    });
     const cfg = answerConfig(JSON.parse(current.policy_json) as Policy);
     await publishChainCard(paseo, current, {
       state: "answered",
@@ -1764,9 +1759,13 @@ export function createGate(options: GateOptions): Gate {
       const verdict = JSON.parse(run.result_json ?? "null") as Verdict | null;
       if (!verdict) return fail(paseo, run, "fix round lost its findings");
       const policy = JSON.parse(run.policy_json) as Policy;
-      await paseo.agents.ref(run.source_agent_id).send(buildFixPrompt(verdict, run.round, maxFixRounds(policy), concurrentOf(run)), {
-        messageId: expected,
-      });
+      // Not sent while busy: the next reconcile tries again, deduplicated by messageId.
+      await sendIfIdle(
+        paseo,
+        run.source_agent_id,
+        { text: buildFixPrompt(verdict, run.round, maxFixRounds(policy), concurrentOf(run)), messageId: expected },
+        { accept: IDLE_OR_ERROR },
+      );
       return;
     }
     const later = items.slice(index + 1);

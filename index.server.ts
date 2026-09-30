@@ -1,39 +1,23 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { createGate, type Paseo } from "./server/gate.ts";
 import { Ledger, defaultLedgerPath } from "./server/ledger.ts";
+import { createSupervisor } from "./server/supervisor.ts";
 import { stopAnsweringRpc } from "./shared/schema.ts";
-
-const RECONCILE_INTERVAL_MS = 60_000;
 
 export default function contribute(server: PluginServerContext) {
   const ledger = new Ledger(defaultLedgerPath());
-  const gate = createGate({ ledger });
-  let timer: ReturnType<typeof setInterval> | null = null;
+  const supervisor = createSupervisor({ ledger });
 
-  // The server context has no SDK handle; the first hook supplies it, which also triggers recovery.
-  // ponytail: nothing is recovered until some agent event arrives after a restart.
-  function capture(paseo: Paseo): Paseo {
-    if (!timer) {
-      gate.reconcile(paseo);
-      timer = setInterval(() => gate.reconcile(paseo), RECONCILE_INTERVAL_MS);
-    }
-    return paseo;
-  }
-
-  // Handlers only enqueue and return, keeping every hook far below the 30s hook timeout.
-  server.on("agent.turn_started", (event, { paseo }) => gate.onTurnStarted(event, capture(paseo)));
-  server.on("agent.turn_ended", (event, { paseo }) => gate.onTurnEnded(event, capture(paseo)));
-  server.on("agent.permission_requested", (event, { paseo }) => gate.onPermission(event, capture(paseo)));
-  server.on("agent.permission_resolved", (event, { paseo }) => gate.onPermission(event, capture(paseo)));
+  server.on("agent.turn_started", (event, { paseo }) => supervisor.accept({ type: "turn_started", event }, paseo));
+  server.on("agent.turn_ended", (event, { paseo }) => supervisor.accept({ type: "turn_ended", event }, paseo));
+  server.on("agent.permission_requested", (event, { paseo }) => supervisor.accept({ type: "permission_requested", event }, paseo));
+  server.on("agent.permission_resolved", (event, { paseo }) => supervisor.accept({ type: "permission_resolved", event }, paseo));
 
   server.handle(stopAnsweringRpc, async ({ chainId }, { paseo }) => ({
-    stopped: await gate.stopAnswering(chainId, capture(paseo)),
+    stopped: await supervisor.control({ taskId: chainId, action: "stop_answering" }, paseo),
   }));
 
   return async () => {
-    if (timer) clearInterval(timer);
-    gate.close();
-    await gate.idle();
+    await supervisor.close();
     ledger.close();
   };
 }

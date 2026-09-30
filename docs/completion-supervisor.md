@@ -655,6 +655,16 @@ Workspace Lease 覆盖同一工作区内所有插件派发的 source attempts、
 
 每一阶段都应保持现有 v2 测试（`server/*.test.ts`）通过。迁移完成前，旧 Gate 和新 Supervisor 不能同时拥有 Source Agent 的发送权。
 
+### 18.1 实现状态
+
+第 1 步已完成，v2 外部行为不变（全部既有测试通过）：
+
+- `server/supervisor.ts`：`CompletionSupervisor` 外观，`accept(SupervisorEvent)`、`control()`、`idle()`、`close()`；接管首个事件时的恢复与 60 秒 reconcile 定时器。`index.server.ts` 只与它交互。
+- `server/dispatch.ts`：统一派发器 `sendIfIdle`（best-effort，§11.2）。fix、answer、retry 以及 FIXING 的重发都经过它；账本写入在 refresh 之后、`send()` 之前同步完成，中间不 await。唯一例外是给插件自己子 Agent 的 nudge（不变量 3）。
+- `server/decisions.ts`：`DecisionEngine` 的雏形，`decideCheck`（检查顺序、INCONCLUSIVE 分流、fix 轮次）与 `decideAnswer`（escalate、`answerRisk`、同题检测），纯函数并有决策表单测；`gate.ts` 只执行它们返回的步骤。
+
+尚未做：per-workspace 队列（仍是一个全局串行队列）、store/runtime adapter、`CheckRunner`/`AnswerRunner` 拆分；它们与第 2 步的统一 Task 表一起做更省事，因为拆分的边界由新表决定。
+
 用 supervisor 覆盖 v2 实现（删除 `gate_runs`/`chains`/`carries`/`turn_snapshots` 路径）的前提：
 
 - 第 3 步完成，v2 的全部测试场景和真实 kiro 端到端场景在 supervisor 上通过；

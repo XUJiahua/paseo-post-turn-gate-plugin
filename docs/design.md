@@ -489,7 +489,10 @@ package.json               # 仅 devDependencies（typecheck）
 index.server.ts
 index.client.tsx
 shared/schema.ts           # 策略 / Verdict / 卡片 zod schema
+server/supervisor.ts       # 入口外观：事件分发、首个事件时的恢复与 reconcile 定时器
 server/gate.ts             # 串行队列、状态机、dispatch/finalize/fix、任务链、代答、重试、恢复
+server/dispatch.ts         # 统一派发器：fix、代答、重试都经 best-effort sendIfIdle 发送
+server/decisions.ts        # 纯决策：检查结果与代答结果 → 下一步
 server/git.ts              # toplevel、tree 快照
 server/ledger.ts           # node:sqlite
 server/outcome.ts          # turn 结束分类、awaiting_user 预筛（turn-outcomes.md）
