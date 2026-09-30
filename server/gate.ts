@@ -1431,6 +1431,8 @@ export function createGate(options: GateOptions): Gate {
     runId: string | null;
     /** The checks already passed on endTree in an earlier round. */
     reused: boolean;
+    /** The turn answered your message: an earlier PASS may not cover what you asked for since. */
+    userSpoke: boolean;
     /** endTree differs from the task's baseline. */
     changed: boolean;
     endTree: string;
@@ -1457,13 +1459,14 @@ export function createGate(options: GateOptions): Gate {
     }
     let chain = ensureChain(task);
     if (task.userSpoke && chain.budget_since !== null) {
-      // You took over: your message is new direction, so the automation budget and earlier PASS start again.
-      chain = ledger.updateChain(task.agentId, { answers: 0, retries: 0, no_progress: 0, passed_tree: null, last_fingerprint: null, budget_since: now() }, now())!;
+      // You took over: the automation budget starts again. An earlier PASS stays; the decider decides whether your
+      // message needs new checks (a reply to its question usually does not).
+      chain = ledger.updateChain(task.agentId, { answers: 0, retries: 0, no_progress: 0, last_fingerprint: null, budget_since: now() }, now())!;
     } else if (chain.budget_since === null) {
       chain = ledger.updateChain(task.agentId, { budget_since: now() }, now())!;
     }
     const reused = changed && chain.passed_tree === endTree;
-    if (category === "done" && reused) {
+    if (category === "done" && reused && !task.userSpoke) {
       // e.g. the agent committed after an answer: same tree, already checked.
       return endChain(paseo, task.agentId, { state: "resolved", category: "done", question: null, message: "Completed: the checks already passed on this tree." });
     }
@@ -1488,7 +1491,7 @@ export function createGate(options: GateOptions): Gate {
     const seq = (roundOf(chain)?.seq ?? chain.card_seq) + 1;
     let runId: string | null = null;
     if (changed && !reused && supervision.speculative_checks) runId = await startGate(paseo, { ...task, turnKey: `${task.turnKey}:round:${seq}` }, endTree);
-    const round: Round = { seq, phase: "waiting", runId, reused, changed, endTree, reply, signal, plan: null, rechecked: false };
+    const round: Round = { seq, phase: "waiting", runId, reused, userSpoke: task.userSpoke ?? false, changed, endTree, reply, signal, plan: null, rechecked: false };
     chain = saveRound(ledger.chain(task.agentId) ?? chain, round);
     if (supervision.reply_delay_seconds === 0) return dispatchDecider(paseo, chain, "plan");
     const at = now() + supervision.reply_delay_seconds * 1000;
@@ -1555,7 +1558,9 @@ export function createGate(options: GateOptions): Gate {
     const { model, ...launch } = resolved.config;
     const run = round.runId ? ledger.get(round.runId) : null;
     const checks = round.reused
-      ? "they already passed on this tree; they are not run again."
+      ? round.userSpoke
+        ? `they passed on this tree before the user's latest message. List them in "workers" only if that message changes what must be verified (${gateChecks(policy).join(", ")}).`
+        : "they already passed on this tree; they are not run again."
       : !round.changed
         ? "none: the task has not changed any files."
         : run
@@ -1653,7 +1658,7 @@ export function createGate(options: GateOptions): Gate {
       if (run && !isTerminal(run.status)) await cancelRun(paseo, run);
       return applyReply(paseo, current, planned, plan.reply_now);
     }
-    if (planned.reused || !planned.changed) return dispatchDecider(paseo, current, "merge");
+    if (!planned.changed || (planned.reused && !planned.userSpoke)) return dispatchDecider(paseo, current, "merge");
     if (!run) return startRoundChecks(paseo, current, planned);
     // The speculative checks may have finished before the plan (the grace period often covers them).
     current = saveRound(current, { ...planned, phase: "checking" });
@@ -1661,6 +1666,8 @@ export function createGate(options: GateOptions): Gate {
   }
 
   async function startRoundChecks(paseo: Paseo, chain: Chain, round: Round): Promise<void> {
+    // These checks decide the round: an earlier PASS no longer counts.
+    round = { ...round, reused: false };
     let current = saveRound(chain, { ...round, phase: "checking" });
     const task = { ...taskFromChain(current), turnKey: `${chain.agent_id}:round:${chain.chain_id}:${round.seq}:${round.rechecked ? "recheck" : "plan"}` };
     const runId = await startGate(paseo, task, round.endTree);
@@ -1766,7 +1773,10 @@ export function createGate(options: GateOptions): Gate {
     const round = roundOf(chain);
     const run = round?.runId ? ledger.get(round.runId) : null;
     if (run && !isTerminal(run.status)) await cancelRun(paseo, run);
-    const current = saveRound(ledger.chain(chain.agent_id) ?? chain, null);
+    // A PASS stays valid while you decide: your answer's turn need not check the same tree again.
+    const passed = run?.status === "PASSED" && run.end_tree === round?.endTree;
+    let current = saveRound(ledger.chain(chain.agent_id) ?? chain, null);
+    if (passed) current = ledger.updateChain(chain.agent_id, { passed_tree: run!.end_tree }, now()) ?? current;
     log(`needs user for ${chain.agent_id}: ${reason}`);
     await publishChainCard(paseo, current, {
       ...roundCard(current, round),

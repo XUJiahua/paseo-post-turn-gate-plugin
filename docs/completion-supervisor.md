@@ -472,6 +472,11 @@ decider 协议 v1 的实现（`server/gate.ts` “decision rounds” 一节）�
 - 卡片：`outcomeCardSchema` 增加 `decider`、`checks`，客户端显示为 “Post-turn supervisor”。
 - 测试：`gate.test.ts` “version 3: the decider answers…”（8 个）。
 
+真实环境冒烟（Paseo 0.10.1、kiro `claude-opus-4.8`，`/tmp` 下的临时仓库，根 Agent）：
+
+- “写 add.js 和测试，完成后问我要不要 commit”：verify、review 在宽限期内推测性启动并 PASS；decider 计划等检查结果，汇总后按请求把 commit 问题交给用户，卡片带上检查结论。用户回复“Yes, commit it.”后，下一轮在同一棵 tree 上：不再启动检查，decider 直接判定完成。
+- 发现并修正：第一次运行时卡片文字是西班牙语和中文（请求是英文），语言规则改为明确以 `<<<REQUEST` 中的文字为准；用户回复后原先会重跑全部检查，现在交给用户时保留当前 tree 的 PASS，由 decider 判断用户的消息是否需要重新检查。
+
 v1 与本设计的差异，后续步骤处理：
 
 - decider 的两个阶段是两个子 Agent，而不是同一个子 Agent 收到第二条消息：Paseo 的 `send()` 不接受 `outputSchema`，第二阶段拿不到结构化输出。代价是汇总阶段要重新读一遍上下文。

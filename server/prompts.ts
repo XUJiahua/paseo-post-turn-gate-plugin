@@ -12,9 +12,12 @@ and maintainability issues. Report only real, evidenced problems.`,
 } as const;
 
 // The user reads these texts on the card, so they follow the request's language; a policy instruction can override it.
-const LANGUAGE_RULE = `Write the free-text JSON values (summary, question, answer, reason, title, evidence, suggested_fix) in the
-  language of the original request, unless the additional instructions name another language. Keep JSON keys,
-  enum values, code, paths and commands as they are.`;
+// A real kiro run answered an English request in Spanish and Chinese under the looser "language of the original
+// request", so the rule names the text to take the language from.
+const LANGUAGE_RULE = `Write the free-text JSON values (summary, question, answer, message, reason, title, evidence,
+  suggested_fix) in the language the user wrote the request in: the text between <<<REQUEST and REQUEST>>>, not
+  these instructions (always English) and not your own habits. Additional instructions naming another language win.
+  Keep JSON keys, enum values, code, paths and commands as they are.`;
 
 export function buildGatePrompt(input: {
   action: "verify" | "review";

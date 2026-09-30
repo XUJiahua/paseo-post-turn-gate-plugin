@@ -1158,6 +1158,36 @@ describe("version 3: the decider answers after every turn that did work", () => 
     assert.match(outcome().message, /checks passed/);
   });
 
+  test("after a hand-off with passing checks, your answer's turn on the same tree lets the decider skip the checks", async () => {
+    v3();
+    await sourceTurn({ change: edit, reply: "Done. Should I commit?" });
+    await childTurn(role("decider")[0].agentId, PLAN({ assessment: "awaiting_user", question: "Should I commit?" }));
+    await childTurn(role("reviewer")[0].agentId, PASS);
+    await childTurn(role("decider")[1].agentId, REPLY({ kind: "escalate", question: "Commit?", reason: "the request says to ask the user" }));
+    assert.equal(outcome().state, "needs_user");
+    await sourceTurn({ text: "Yes, commit it.", messageId: "u2", reply: "Committed." }); // a commit leaves the tree as it is
+    assert.equal(role("reviewer").length, 1, "no speculative checks on a tree that already passed");
+    assert.match(role("decider")[2].prompt, /passed on this tree before the user's latest message/);
+    await childTurn(role("decider")[2].agentId, PLAN({ workers: [], reply_now: { kind: "done" } }));
+    assert.equal(outcome().state, "resolved");
+    assert.equal(fake.sent.length, 0);
+  });
+
+  test("your new requirement on a tree that passed: the decider can ask for the checks again", async () => {
+    v3();
+    await sourceTurn({ change: edit });
+    await childTurn(role("decider")[0].agentId, PLAN({}));
+    await childTurn(role("reviewer")[0].agentId, PASS);
+    await childTurn(role("decider")[1].agentId, REPLY({ kind: "escalate", question: "Anything else?", reason: "unsure" }));
+    await sourceTurn({ text: "It must also handle negative numbers; is that covered?", messageId: "u2", reply: "Yes, it already is." });
+    await childTurn(role("decider")[2].agentId, PLAN({ workers: ["review"] }));
+    assert.equal(role("reviewer").length, 2, "checked again against the new requirement");
+    assert.match(role("reviewer")[1].prompt, /negative numbers/);
+    await childTurn(role("reviewer")[1].agentId, PASS);
+    await childTurn(role("decider")[3].agentId, REPLY({ kind: "done" }));
+    assert.equal(outcome().state, "resolved");
+  });
+
   test("a turn that stopped early gets 'Continue.' at once; the checks are canceled", async () => {
     v3();
     await sourceTurn({ change: edit, reply: "Next I will add the tests." });
@@ -1857,7 +1887,7 @@ describe("reviewer config", () => {
     assert.deepEqual(fake.created[0].config, { provider: "codex/gpt-5.5", modeId: "auto-review" });
     assert.match(fake.created[0].prompt, /Check the README too\./);
     assert.match(fake.created[0].prompt, /Reply with ONLY one JSON object/, "contract stays after instructions");
-    assert.match(fake.created[0].prompt, /language of the original request/, "card text follows the user's language");
+    assert.match(fake.created[0].prompt, /language the user wrote the request in/, "card text follows the user's language");
 
     fake.profiles.length = 0;
     await sourceTurn({ change: () => writeFileSync(path.join(repo, "b.txt"), "b"), messageId: "m2" });
