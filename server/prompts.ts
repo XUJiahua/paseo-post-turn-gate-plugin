@@ -24,18 +24,7 @@ export function buildGatePrompt(input: {
   endTree: string;
   instructions?: string;
   concurrentAgents?: readonly string[];
-  /** The agent's reply when it changed nothing in a fix round and disputed the findings (on_dispute: rereview). */
-  dispute?: string | null;
 }): string {
-  const dispute = input.dispute
-    ? `
-A previous check of this change reported findings. The agent changed nothing and replied instead:
-<<<AGENT_REPLY
-${input.dispute}
-AGENT_REPLY>>>
-Judge the change on its merits: drop a finding the reply shows to be wrong, keep one it does not refute.
-`
-    : "";
   const concurrent = input.concurrentAgents?.length
     ? `\nOther agents (${input.concurrentAgents.join(", ")}) were working in this repository at the same time, so the diff
 may include their changes and the working tree may change while you check. Judge only changes that belong to the
@@ -65,7 +54,7 @@ Rules:
   request does not say what is required), "no_test_infra" (the change has no tests or runnable check that could
   show it works), "env_missing" (credentials, services or tools this machine does not have), or "other".
 - ${LANGUAGE_RULE}
-${dispute}
+
 Reply with ONLY one JSON object, no prose and no code fence, in exactly this shape:
 {"verdict":"PASS|FAIL|INCONCLUSIVE","summary":"...","findings":[{"severity":"CRITICAL|HIGH|MEDIUM|LOW","title":"...","evidence":"...","suggested_fix":"..."}],"inconclusive_reason":null}`;
 }

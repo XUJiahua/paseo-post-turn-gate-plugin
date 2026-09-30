@@ -155,20 +155,13 @@ export const policySchema = z
         z
           .object({
             fix: z
-              .object({
-                max_rounds: z.number().int().min(1).max(5).default(2),
-                /**
-                 * A fix turn that changes nothing and asks nothing disagrees with the findings.
-                 * human: stop and show it to you; rereview: give the checker the agent's reply (uses a round).
-                 */
-                on_dispute: z.enum(["human", "rereview"]).default("human"),
-              })
+              .object({ max_rounds: z.number().int().min(1).max(5).default(2) })
               .strict(),
           })
           .strict(),
       ])
       // The gate exists to let the agent loop until its work passes, so fixing is the default.
-      .default({ fix: { max_rounds: 2, on_dispute: "human" } }),
+      .default({ fix: { max_rounds: 2 } }),
     /**
      * An INCONCLUSIVE check (no tests, or another gap the agent can close): report it, or treat it as FAIL.
      * Blocked permissions and ambiguous requests always go to you; missing environment is always reported.
@@ -188,7 +181,6 @@ export function gateChecks(policy: Policy): Check[] {
 
 /** Fix rounds allowed after a failed gate; 0 means report only. */
 export const maxFixRounds = (policy: Policy) => (policy.on_fail === "report" ? 0 : policy.on_fail.fix.max_rounds);
-export const onDispute = (policy: Policy) => (policy.on_fail === "report" ? "human" : policy.on_fail.fix.on_dispute);
 
 export const severitySchema = z.enum(["CRITICAL", "HIGH", "MEDIUM", "LOW"]);
 

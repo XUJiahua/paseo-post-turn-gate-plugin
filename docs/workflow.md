@@ -93,7 +93,7 @@ sequenceDiagram
 - 修了 `max_rounds` 轮还是 FAIL，卡片变成 NEEDS_HUMAN，交给你处理。
 - 修复期间你自己发了消息，这次审查标为 SUPERSEDED，以你的消息为准。没通过检查的改动不会被放过：你这一轮结束后，从原来的基线开始连同原始请求一起检查。
 - 修复轮没有超时：修复由开发 agent 自己完成，多慢都会在它结束后重新检查。
-- 修复轮什么都没改：不会拿同一份代码再审一遍、白用一轮。agent 是在提问时走场景 3 的代答（代答后完成的那轮照常审查，轮次接着算）；agent 是在反驳 findings 时，卡片变成 NEEDS_HUMAN 并附上它的理由，由你裁决。策略里设 `"on_fail": { "fix": { "on_dispute": "rereview" } }` 时改为把理由交给 reviewer 再判一次（占一轮）。
+- 修复轮什么都没改：不会拿同一份代码再审一遍、白用一轮。agent 是在提问时走场景 3 的代答（代答后完成的那轮照常审查，轮次接着算）；agent 是在反驳 findings 时，卡片变成 NEEDS_HUMAN 并附上它的理由，由你裁决。它的理由不会交给 reviewer，免得被检查的 Agent 说服检查者。
 
 每个仓库的审查规则写在 `.paseo/post-turn-gate/reviewer.md` 里。`npm run init` 会生成一份立即生效的默认规则：HTML 注释只是编辑说明，注释后的 Markdown 会加入提示词。继续按项目补充并和代码一起提交，例如"金额一律用整数分"、"新接口必须有集成测试"。verifier、answerer 分别对应 `verifier.md`、`answerer.md`。
 
@@ -120,7 +120,7 @@ verifier 和 reviewer 的区别只在于问的问题：reviewer 问"代码对不
 
 ## 场景 2c：先核对需求，再审代码
 
-同一个分页需求，你既想确认需求都做到了，也想让人看看代码质量。策略里写 `"on_outcome": { "done": ["verify", "review"] }`（或 `npm run init -- --check verify,review`），`on_fail` 保持默认的 `{ "fix": { "max_rounds": 2, "on_dispute": "human" } }`。
+同一个分页需求，你既想确认需求都做到了，也想让人看看代码质量。策略里写 `"on_outcome": { "done": ["verify", "review"] }`（或 `npm run init -- --check verify,review`），`on_fail` 保持默认的 `{ "fix": { "max_rounds": 2 } }`。
 
 ```mermaid
 sequenceDiagram

@@ -221,12 +221,12 @@ describe("on_outcome schema", () => {
       JSON.parse(execFileSync(process.execPath, ["bin/post-turn-gate-init.mjs", "--stdout", ...args], { encoding: "utf8" }));
     const defaults = run();
     assert.deepEqual(defaults, policySchema.parse({ version: 2 }));
-    assert.deepEqual(defaults.on_fail, { fix: { max_rounds: 2, on_dispute: "human" } });
+    assert.deepEqual(defaults.on_fail, { fix: { max_rounds: 2 } });
     assert.equal(run("--report").on_fail, "report");
     assert.deepEqual(defaults.on_outcome.done, ["review"]);
     assert.equal(defaults.agents.verifier.profile, null);
     const chosen = run("--check", "verify,review", "--fix", "3");
-    assert.deepEqual(chosen.on_fail, { fix: { max_rounds: 3, on_dispute: "human" } });
+    assert.deepEqual(chosen.on_fail, { fix: { max_rounds: 3 } });
     assert.deepEqual(chosen.on_outcome.done, ["verify", "review"]);
     assert.equal(chosen.on_outcome.network, "notify", "other fields keep their defaults");
     assert.throws(() => run("--fix", "0"), /Command failed/);

@@ -12,7 +12,7 @@ const ROLES = ["reviewer", "verifier", "answerer"];
 const DEFAULT_POLICY = {
   version: 2,
   trigger: "root_and_opt_in",
-  on_fail: { fix: { max_rounds: 2, on_dispute: "human" } },
+  on_fail: { fix: { max_rounds: 2 } },
   on_inconclusive: "report",
   agents: {
     reviewer: {

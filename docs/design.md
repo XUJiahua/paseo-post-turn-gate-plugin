@@ -97,7 +97,7 @@
 {
   "version": 2,
   "trigger": "root_and_opt_in",
-  "on_fail": { "fix": { "max_rounds": 2, "on_dispute": "human" } },
+  "on_fail": { "fix": { "max_rounds": 2 } },
   "on_inconclusive": "report",
   "agents": { "reviewer": {}, "verifier": {}, "answerer": {} },
   "on_outcome": { "done": ["review"] }
@@ -109,7 +109,7 @@
 | 字段 | 取值 | 默认 |
 |---|---|---|
 | `trigger` | `root_only` / `root_and_opt_in` / `all` | `root_and_opt_in` |
-| `on_fail` | `{ "fix": { "max_rounds": 1..5, "on_dispute": "human" \| "rereview" } }` / `report` | `{ "fix": { "max_rounds": 2, "on_dispute": "human" } }`：插件的目的是让 agent 自动循环到通过；`on_dispute` 见 §4.3 |
+| `on_fail` | `{ "fix": { "max_rounds": 1..5 } }` / `report` | `{ "fix": { "max_rounds": 2 } }`：插件的目的是让 agent 自动循环到通过；修复轮里 Agent 反驳 findings 的处理见 §4.3 |
 | `on_inconclusive` | `report` / `fail` | `report`：INCONCLUSIVE 只报告；`fail` 时，Agent 自己能补的缺口（`no_test_infra`、`other`）按 FAIL 发回修复，见 §4.3 |
 | `on_outcome.done` | 检查列表（`review`、`verify` 的非空、不重复的有序组合）/ `notify` / `ignore` | `["review"]` |
 | `agents.reviewer` / `agents.verifier` / `agents.answerer` | 见 §3.1 | 不使用 profile，继承源 Agent 启动配置并加载各自的仓库规则文件 |
@@ -294,9 +294,8 @@ onFixTurnEnded(run, outcome):
   outcome ≠ completed → SUPERSEDED（base_tree 和请求留给下一轮，见 4.1）
   当前 tree = run.end_tree（修复轮什么都没改）→ 不重新检查、不消耗轮次：
     回复像提问（awaiting_user，refused 除外）→ SUPERSEDED，按 run 的基线和请求开任务链，记下已用轮次，走代答
-    否则视为不同意 findings（on_fail.fix.on_dispute）：
-      human（默认）→ NEEDS_HUMAN，卡片显示 Agent 的回复，写入 carry（checked_tree = end_tree，规则同上）
-      rereview → 把回复交给 reviewer 再判一次（round + 1，占一轮）
+    否则视为不同意 findings → NEEDS_HUMAN，卡片显示 Agent 的回复，写入 carry（checked_tree = end_tree，规则同上）。
+      回复不交给检查者：被检查者不能参与判定，检查者的结论只来自代码本身。
   end_tree = 当前 tree → dispatch(run, round + 1, step=0)   // diff 仍然以原 base_tree 为基准，从第一项检查重新开始
 ```
 
@@ -355,8 +354,7 @@ DISPATCHING → REVIEWING ─┬─ PASS → PASSED
                          ├─ FAIL ─┬─ report → FAILED
                          │        ├─ fix 且还有轮次 → FIXING ─┬─ 有改动 → DISPATCHING (round+1)
                          │        │                           ├─ 无改动且提问 → SUPERSEDED（转任务链代答）
-                         │        │                           └─ 无改动不提问 → NEEDS_HUMAN（on_dispute=human）
-                         │        │                                            或 DISPATCHING（rereview，round+1）
+                         │        │                           └─ 无改动不提问 → NEEDS_HUMAN
                          │        └─ 轮次用尽 → NEEDS_HUMAN
                          ├─ 权限被拒后无结论 → 追问一次（仍是 REVIEWING）
                          └─ 取消 / 解析失败 / 超时 → ERROR
@@ -397,7 +395,7 @@ CREATE TABLE gate_runs (
   reviewer_changes TEXT,             -- 检查期间工作区改动的 diffstat（有则 verdict 作废）
   concurrent_agents TEXT,            -- 与本任务重叠运行、同一仓库的其他 Agent id（JSON 数组）
   blocked_json    TEXT,              -- 本轮检查者被拒绝的权限请求及是否已追问（JSON）
-  dispute         TEXT,              -- 修复轮没改文件时 Agent 的回复（on_dispute）
+  dispute         TEXT,              -- 修复轮没改文件、反驳 findings 时 Agent 的回复（只给人看）
   rounds_json     TEXT NOT NULL DEFAULT '[]', -- 每项检查的 verdict、summary、inconclusive 原因
   error           TEXT,
   created_at      INTEGER NOT NULL,  -- epoch 毫秒
@@ -512,7 +510,7 @@ server/*.test.ts           # 真实 git + sqlite、fake paseo 的测试（node:t
 - [ ] `scripts/create-agent-profiles.mjs` 能创建、更新 reviewer/verifier profile 并热加载。
 - [ ] Reviewer 改动工作区时，卡片显示警告和 diffstat；解析失败 → ERROR；Reviewer 等待授权时，卡片显示“等待授权”和按钮；超过 `permission_wait_minutes` 自动拒绝并追问一次结论；等待时间计入 `timeout_minutes`，超时 → ERROR 并写明原因。
 - [ ] INCONCLUSIVE 带原因：blocked_permission / ambiguous_request → NEEDS_HUMAN；`on_inconclusive: "fail"` 时 Agent 能补的缺口按 FAIL 处理。
-- [ ] 修复轮没有改动时不重新检查：提问转代答，否则按 `on_dispute` 交给用户或带着反驳重审。
+- [ ] 修复轮没有改动时不重新检查：提问转代答，否则交给用户裁决。
 - [ ] 卡片按 `post-turn-gate:<run_id>:round:<round>` 每轮一张、同轮原地更新；任务链卡片每个新事件一张；run 到终态后归档子 Agent，并且可以在“历史”页找到。
 - [ ] `report` 只报告；`fix` 在源 Agent 空闲时发送 findings，修复后按原基线重新 review；轮次用尽 → NEEDS_HUMAN。
 - [ ] 用户插话会让进行中的 run 变为 SUPERSEDED，不会打断用户的 turn。

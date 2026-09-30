@@ -71,7 +71,7 @@ policy and rules are captured when a turn starts, so the plugin takes effect on 
 | Field | Values | Default |
 |---|---|---|
 | `trigger` | `root_only`, `root_and_opt_in`, `all` | `root_and_opt_in` |
-| `on_fail` | `{ "fix": { "max_rounds": 1–5, "on_dispute": "human" \| "rereview" } }`: send a failed check's findings back to the agent and check again, so the agent loops until its work passes. `report`: only show the result | `{ "fix": { "max_rounds": 2, "on_dispute": "human" } }` |
+| `on_fail` | `{ "fix": { "max_rounds": 1–5 } }`: send a failed check's findings back to the agent and check again, so the agent loops until its work passes. `report`: only show the result | `{ "fix": { "max_rounds": 2 } }` |
 | `on_inconclusive` | `report`: show an INCONCLUSIVE check. `fail`: treat gaps the agent can close itself (no tests, not enough evidence) as FAIL | `report` |
 | `agents` | launch settings and repository rules for the `reviewer`, `verifier` and `answerer`, see [below](#choosing-the-agents) | inherit the source agent; load each role's repository rules file |
 | `on_outcome` | what to do for each way a turn ends, see [below](#what-happens-when-a-turn-ends) | `done: ["review"]` |
@@ -92,7 +92,7 @@ policy and rules are captured when a turn starts, so the plugin takes effect on 
 - Checks run one after another, in the listed order. The first FAIL stops the round: reviewing the code of a change that misses a requirement is wasted work.
 - The task passes only when every check passes. An INCONCLUSIVE check does not stop the next one; the result is then INCONCLUSIVE, and the card lists what each check could not verify.
 - An INCONCLUSIVE check says why. A permission it needed was denied or not answered, or the request is ambiguous: the card shows NEEDS HUMAN. No tests or not enough evidence: reported, or sent back like a FAIL with `"on_inconclusive": "fail"`. Missing credentials or services: always reported.
-- A fix turn that changes nothing is not checked again. If the agent asks a question, the answerer handles it and fix rounds keep counting; if it argues that a finding is wrong, the card shows NEEDS HUMAN with its reply. `"on_dispute": "rereview"` instead gives the reply to the checker for one more round.
+- A fix turn that changes nothing is not checked again. If the agent asks a question, the answerer handles it and fix rounds keep counting; if it argues that a finding is wrong, the card shows NEEDS HUMAN with its reply. The checker never sees the agent's arguments, so the agent being checked cannot talk it into a PASS.
 - With `on_fail: { "fix": … }` the failing check's findings go back to the agent. The next round starts again from the first check, because a fix can break a check that passed. `max_rounds` counts rounds for the whole task. When the rounds are used up the card shows NEEDS HUMAN; after you take over, send the agent a message. If its next turn changes files, the whole task is checked again, without new fix rounds; a turn that changes nothing ("leave it as it is") accepts the changes as they are. Unchecked changes are kept for at most a day.
 - One card shows every check of the current round with its result.
 - `"done": "notify"` or `"ignore"` turns checks off.

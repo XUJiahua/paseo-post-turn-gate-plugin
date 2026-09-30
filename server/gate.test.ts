@@ -766,7 +766,7 @@ describe("fix loop", () => {
     await sourceTurn({ messageId: `ptg:${runId}:fix:${round}`, change, reply });
   }
 
-  test("a fix turn that changes nothing and disputes the findings goes to you (on_dispute: human)", async () => {
+  test("a fix turn that changes nothing and disputes the findings goes to you", async () => {
     writePolicy({ version: 2 });
     await sourceTurn({ change: edit });
     await childTurn(fake.created[0].agentId, FAIL);
@@ -777,16 +777,7 @@ describe("fix loop", () => {
     // The unchecked change stays in scope: your next message re-checks the whole task.
     await sourceTurn({ text: "ok, fix it anyway", messageId: "u2", change: () => writeFileSync(path.join(repo, "a.txt"), "three\n") });
     assert.equal(fake.created.length, 2);
-  });
-
-  test("on_dispute rereview gives the agent's reply to the checker and uses a round", async () => {
-    writePolicy({ version: 2, on_fail: { fix: { max_rounds: 2, on_dispute: "rereview" } } });
-    await sourceTurn({ change: edit });
-    await childTurn(fake.created[0].agentId, FAIL);
-    await fixTurn(1, undefined, "The off-by-one is intended.");
-    assert.equal(fake.created.length, 2);
-    assert.match(fake.created[1].prompt, /changed nothing and replied instead[\s\S]*intended/);
-    assert.equal(onlyRun().round, 2);
+    assert.doesNotMatch(fake.created[1].prompt, /intended/, "the checker never sees the agent's arguments");
   });
 
   test("a fix turn that asks a question goes to the answerer; the follow-up run keeps counting rounds", async () => {

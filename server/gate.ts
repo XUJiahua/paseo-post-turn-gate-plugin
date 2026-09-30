@@ -28,7 +28,6 @@ import {
   defaultInstructionsFile,
   gateChecks,
   maxFixRounds,
-  onDispute,
   policySchema,
 } from "../shared/schema.ts";
 import { diffStat, snapshotTree, toplevel } from "./git.ts";
@@ -569,7 +568,6 @@ export function createGate(options: GateOptions): Gate {
         endTree: run.end_tree,
         instructions: spec.instructions,
         concurrentAgents: concurrentOf(run),
-        dispute: run.dispute,
       }),
       clientMessageId: key,
       outputSchema: VERDICT_JSON_SCHEMA,
@@ -774,7 +772,7 @@ export function createGate(options: GateOptions): Gate {
     // Leaves FIXING in the same write, so a crash here cannot count the fix turn twice on recovery.
     const next = ledger.update(
       run.run_id,
-      { end_tree: endTree, round: run.round + 1, step: 0, status: "DISPATCHING", dispatch_json: null, child_agent_id: null, dispute: null },
+      { end_tree: endTree, round: run.round + 1, step: 0, status: "DISPATCHING", dispatch_json: null, child_agent_id: null },
       now(),
     );
     await dispatch(paseo, next);
@@ -782,7 +780,8 @@ export function createGate(options: GateOptions): Gate {
 
   /**
    * The agent changed nothing in its fix turn: checking the same tree again would only use up a round.
-   * A question goes to the answerer (or you); any other reply disputes the findings (on_fail.fix.on_dispute).
+   * A question goes to the answerer (or you); any other reply disputes the findings and goes to you: the checker never
+   * sees the agent's arguments, so its verdict stays independent of the agent it checks.
    */
   async function onFixWithoutChanges(paseo: Paseo, run: Run, timeline: readonly TimelineItem[]): Promise<void> {
     const policy = JSON.parse(run.policy_json) as Policy;
@@ -806,14 +805,6 @@ export function createGate(options: GateOptions): Gate {
       });
       const current = ledger.updateChain(chain.agent_id, { rounds_used: run.round }, now()) ?? chain;
       return handleAwaitingUser(paseo, current, reply, detail);
-    }
-    if (onDispute(policy) === "rereview") {
-      const next = ledger.update(
-        run.run_id,
-        { round: run.round + 1, step: 0, status: "DISPATCHING", dispatch_json: null, child_agent_id: null, dispute: truncate(reply || "(no reply)", 4000) },
-        now(),
-      );
-      return dispatch(paseo, next);
     }
     await transition(paseo, run, {
       status: "NEEDS_HUMAN",

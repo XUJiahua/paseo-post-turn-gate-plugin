@@ -9,7 +9,6 @@ All notable changes to this project are documented here.
 - `agents.<role>.permission_wait_minutes` (default 5): a request on the card that nobody answers is denied, and the checker is asked once for a verdict from its evidence.
 - `awaiting_user.answer.delay_seconds` (default 60): the answerer waits for your own reply first.
 - `on_inconclusive` (`report` | `fail`) and `inconclusive_reason` in the verdict; blocked or ambiguous checks show NEEDS HUMAN.
-- `on_fail.fix.on_dispute` (`human` | `rereview`) for fix turns that change nothing and disagree with the findings.
 
 ### Changed
 
@@ -17,7 +16,7 @@ All notable changes to this project are documented here.
 - Stopping the agent no longer drops what it changed: the changes are checked with its next turn.
 - Failed turns are reported or retried even when they changed no files; a stop after tool calls is auto-answered even before files change.
 - A finished report ending with a closing offer ("Let me know if you need anything else.") is `done`, not a question.
-- A fix turn that changes nothing is no longer checked again: a question goes to the answerer, a disagreement to you (or the checker).
+- A fix turn that changes nothing is no longer checked again: a question goes to the answerer, a disagreement to you. The checker never sees the agent's reply.
 - Only the closing sentence of a reply counts as asking: "要不要" or "should I" earlier in the reply, or inside quotes, no longer starts the answerer.
 - The second check on automatic answers looks at commands and action phrases only: a cloud tool named in prose ("use the AWS SDK", `src/aws/client.ts`) no longer sends the question to you.
 - When the answerer finds the agent had finished, the card reads "Finished" without an "Agent asked" excerpt; excerpts of long replies start at a sentence boundary.
