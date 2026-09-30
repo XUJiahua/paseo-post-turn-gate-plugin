@@ -48,7 +48,7 @@ The initializer writes four files:
 - `.paseo/post-turn-gate.json`: every field with its default value. Tests keep the initializer output aligned with the plugin schema. A field you delete falls back to the same default.
 - `.paseo/post-turn-gate/reviewer.md`, `verifier.md`, `answerer.md`: active repository instructions for each role. The short HTML comment is editing guidance and is ignored; the Markdown below it is included in every role prompt. Customize and commit these files with the project. See [Choosing the agents](#choosing-the-agents).
 
-It refuses to overwrite any of them unless you pass `--force`; `post-turn-gate-init --help` or `npm run init -- --help` lists all options.
+It refuses to overwrite an existing policy unless you pass `--force`, and never overwrites an existing role rules file (delete one to regenerate its template); `post-turn-gate-init --help` or `npm run init -- --help` lists all options.
 
 ### Install and tailor it with a coding agent
 

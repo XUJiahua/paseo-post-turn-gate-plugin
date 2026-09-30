@@ -60,7 +60,7 @@ Options:
   --fix <rounds>   fix rounds after a failed check, 1-5 (default: 2)
   --report         report a failed check instead of sending it back to the agent
   --dir <path>     repository to write into (default: current directory; the git root is used)
-  --force          overwrite existing files
+  --force          overwrite an existing policy file (role rules files are never overwritten)
   --stdout         print the policy instead of writing files
   --agent-prompt   print a coding-Agent setup task for --dir; write nothing
   -h, --help       show this help`;
@@ -177,11 +177,15 @@ try {
 
 const files = [[POLICY_PATH, text]];
 for (const role of ROLES) files.push([policy.agents[role].instructions_file, TEMPLATES[role]]);
-// Check everything first, so a refusal never leaves a half-written setup.
-const existing = files.map(([file]) => file).filter((file) => existsSync(path.join(root, file)));
-if (existing.length > 0 && !values.force) fail(`already exists: ${existing.join(", ")}; use --force to overwrite`);
+// Role rules are the project's own work: an existing rules file is always kept. Only the policy is
+// regenerated, and only with --force. Check first, so a refusal never leaves a half-written setup.
+if (existsSync(path.join(root, POLICY_PATH)) && !values.force) fail(`already exists: ${POLICY_PATH}; use --force to overwrite it`);
 for (const [file, content] of files) {
   const target = path.join(root, file);
+  if (file !== POLICY_PATH && existsSync(target)) {
+    console.log(`kept ${target} (delete it to regenerate the template)`);
+    continue;
+  }
   mkdirSync(path.dirname(target), { recursive: true });
   writeFileSync(target, content);
   console.log(`wrote ${target}`);

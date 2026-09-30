@@ -60,6 +60,8 @@ type AgentSnapshot = NonNullable<
 
 export const MANAGED_LABEL = "post-turn-gate.managed";
 export const TARGET_LABEL = "post-turn-gate.target";
+/** Added by the daemon to every agent created with a parent (design.md V8). */
+const PARENT_LABEL = "paseo.parent-agent-id";
 const FIX_PREFIX = "ptg:";
 const REQUEST_TEXT_LIMIT = 8000;
 
@@ -501,11 +503,18 @@ export function createGate(options: GateOptions): Gate {
     return null;
   }
 
-  function triggers(trigger: Policy["trigger"], agent: AgentSnapshot, isRoot: boolean): boolean {
+  async function triggers(paseo: Paseo, trigger: Policy["trigger"], agent: AgentSnapshot, parentId: string | null): Promise<boolean> {
     if (agent.labels[MANAGED_LABEL] === "true") return false;
-    if (trigger === "all") return true;
-    if (trigger === "root_only") return isRoot;
-    return isRoot || agent.labels[TARGET_LABEL] === "true";
+    if (trigger === "root_only" || (trigger === "root_and_opt_in" && agent.labels[TARGET_LABEL] !== "true")) return parentId === null;
+    // A descendant of the plugin's own reviewer, verifier or answerer is part of that check, not a task to gate.
+    // ponytail: one refresh per ancestor, capped at 10 levels; an unknown or deeper ancestor counts as not managed.
+    for (let depth = 0; parentId && depth < 10; depth++) {
+      const ancestor = await refreshAgent(paseo, parentId);
+      if (!ancestor) break;
+      if (ancestor.labels[MANAGED_LABEL] === "true") return false;
+      parentId = ancestor.labels[PARENT_LABEL] ?? null;
+    }
+    return true;
   }
 
   async function refreshAgent(paseo: Paseo, agentId: string): Promise<AgentSnapshot | null> {
@@ -1467,7 +1476,8 @@ export function createGate(options: GateOptions): Gate {
       if (run && run.source_agent_id === agentId && run.round === Number(fix[2])) {
         return onFixTurnEnded(paseo, run, event.outcome, concurrent, event.timeline);
       }
-      return;
+      // The run is gone or moved on: gate this turn like any other so its changes are still checked.
+      log(`stale fix message ${messageId} on ${agentId}; gating the turn normally`);
     }
 
     const skip = (reason: string) => log(`skip ${agentId}: ${reason}`);
@@ -1478,7 +1488,7 @@ export function createGate(options: GateOptions): Gate {
 
     const source = await refreshAgent(paseo, agentId);
     if (!source) return skip("agent not found");
-    if (!triggers(snapshot.trigger, source, event.agent.parentAgentId === null)) return skip(`not a trigger target (${snapshot.trigger})`);
+    if (!(await triggers(paseo, snapshot.trigger, source, event.agent.parentAgentId))) return skip(`not a trigger target (${snapshot.trigger})`);
     const policy = snapshot.policy;
     if (!policy) {
       // Only a turn that would have been gated (it changed files) gets the error card.

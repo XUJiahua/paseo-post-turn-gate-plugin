@@ -259,6 +259,23 @@ const edit = () => writeFileSync(path.join(repo, "a.txt"), "two\n");
 // ---------- tests ----------
 
 describe("trigger", () => {
+  test("trigger all does not gate a descendant of the plugin's own reviewer", async () => {
+    writePolicy({ version: 2, trigger: "all" });
+    await sourceTurn({ change: edit, messageId: "a" });
+    const reviewer = fake.created[0].agentId as string;
+    fake.agents.set("grandchild", sourceAgent({ id: "grandchild", labels: { "paseo.parent-agent-id": reviewer } }));
+    await sourceTurn({ agentId: "grandchild", parentAgentId: reviewer, change: () => writeFileSync(path.join(repo, "b.txt"), "b"), messageId: "g" });
+    assert.equal(fake.created.length, 1, "no reviewer for the reviewer's sub-agent");
+    fake.agents.set("sub", sourceAgent({ id: "sub", labels: { "paseo.parent-agent-id": SOURCE } }));
+    await sourceTurn({ agentId: "sub", parentAgentId: SOURCE, change: () => writeFileSync(path.join(repo, "c.txt"), "c"), messageId: "s" });
+    assert.equal(fake.created.length, 2, "an ordinary sub-agent is still gated");
+  });
+
+  test("a turn whose fix message no longer matches a run is gated normally", async () => {
+    writePolicy({ version: 2 });
+    await sourceTurn({ change: edit, messageId: "ptg:gone-run:fix:1" });
+    assert.equal(fake.created.length, 1);
+  });
   test("no policy file: nothing happens", async () => {
     await sourceTurn({ change: edit });
     assert.equal(fake.created.length, 0);
@@ -457,6 +474,18 @@ describe("dispatch and report", () => {
     await sourceTurn({ change: () => { edit(); writeFileSync(path.join(repo, ".paseo/post-turn-gate/reviewer.md"), "changed mid-turn"); } });
     assert.match(fake.created[0].prompt, /Money is always integer cents\.\n\nAlso read the README\./);
     assert.doesNotMatch(fake.created[0].prompt, /changed mid-turn/);
+  });
+
+  test("init --force regenerates the policy but keeps customized role rules", () => {
+    const init = (...args: string[]) => execFileSync(process.execPath, ["bin/post-turn-gate-init.mjs", "--dir", repo, ...args]);
+    init();
+    const rules = path.join(repo, ".paseo/post-turn-gate/reviewer.md");
+    writeFileSync(rules, "- Money is integer cents.\n");
+    assert.throws(() => init("--fix", "3"), /Command failed/, "an existing policy needs --force");
+    init("--force", "--fix", "3");
+    const policy = JSON.parse(readFileSync(path.join(repo, ".paseo/post-turn-gate.json"), "utf8"));
+    assert.equal(policy.on_fail.fix.max_rounds, 3);
+    assert.equal(readFileSync(rules, "utf8"), "- Money is integer cents.\n");
   });
 
   test("npm run init writes active repository instructions for every role", async () => {
