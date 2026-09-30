@@ -164,7 +164,7 @@
 - **profile 引用**：先按 id 精确匹配，再按 name 精确匹配；name 重名 → `ERROR`，要求改用 id。profile 不存在 → `ERROR`，并列出现有 profile。
   - profile 存在 daemon 配置的 `daemon.agentProfiles` 里，插件在每次 dispatch 时用 `paseo.config.get()` 读取。已用测试 daemon 实测：插件会话有读取权限，profile（claude / `bypassPermissions`）会原样用于创建 Verifier。
   - profile 只提供启动设置，不带 `systemPrompt`。角色 prompt 始终由插件的内置职责/JSON 契约与仓库中的 `instructions_file` / `instructions` 组成。
-- **`instructions_file`**：仓库里的规则文件（相对 git 根目录），默认 `.paseo/post-turn-gate/<role>.md`。默认路径不存在时视为没有规则；自己写的路径必须存在且在仓库内，否则配置错误。`null` 关闭。
+- **`instructions_file`**：仓库里的规则文件（相对 git 根目录），默认 `.paseo/post-turn-gate/<role>.md`。默认路径不存在时视为没有规则；自己写的路径必须存在且在仓库内，否则配置错误；是否在仓库内按 `realpath` 判断，指向仓库外的软链接（包括默认路径）同样是配置错误。`null` 关闭。
 - **`instructions`**：内联规则，接在文件内容之后。两者合计不超过 20000 字符，追加在内置角色 prompt 之后、JSON 输出约束之前，不能替换结论格式。
 - 规则文件在 `turn_started` 时和策略一起读取并冻结到 run/chain 里：Agent 在本轮改规则文件，不影响对本轮的检查。
 - **`timeout_minutes`**：包括等待授权的时间。reviewer / verifier 超时判 `ERROR`；answerer 超时把问题交给用户。
@@ -196,7 +196,9 @@ turn_started(agent)
   ├─ 该源 Agent 有 REVIEWING/DISPATCHING 的 run → 旧 run 标 SUPERSEDED，其 base_tree 和请求写入 ledger 的 carries 表留给下一轮
   ├─ trigger=root_only 且 parentAgentId≠null → 忽略
   └─ 读取策略、计算基线 tree → 存入内存 pending[agentId] = { policy, baseTree, repoRoot }；同一 repo 有 carry 时用它替换基线
-     （carry 在这一轮结束、结果交给 run 或 chain 后才删除；插件中途重启也不会丢）
+     （carry 在这一轮结束、结果交给 run 或 chain 后才删除；插件中途重启也不会丢；24 小时没更新的 carry 作废）
+     （carry 记下任务已用的修复轮次，下一个 run 从这里接着数；checked_tree 是检查已判 FAIL / 被反驳的 tree，
+      下一轮结束时 tree 仍是它 → 不再检查，删除 carry，改动按原样保留）
 
 turn_ended(agent, outcome, timeline)
   ├─ agent 是 ledger 中某个 run 的子 Agent → finalizeReview(run, outcome, timeline)
@@ -207,7 +209,7 @@ turn_ended(agent, outcome, timeline)
   ├─ refresh() 源 Agent → 按 labels + trigger 过滤（managed=true 永远跳过；无效策略也读得出 trigger）
   ├─ 策略无效 → 工作区有变化才写 ERROR 卡片（§3），结束；策略有效 → 之前的错误卡标为“已修复”
   └─ classify(outcome) → 按 on_outcome 分派（turn-outcomes.md）：
-       ├─ replaced → 结束；user_canceled → 结束任务链
+       ├─ replaced → 结束；user_canceled → 结束任务链，tree 有变化时把基线写入 carry（已有 carry 保留），下一轮照样检查
        ├─ 失败类（crashed / network / …）→ 不看工作区，照常通知或重试（任务链）
        ├─ 计算 endTree；与 baseTree 相同：
        │    done / as_done，或 awaiting_user 但任务没干过活（无 tool_call、链里没有代答/重试/修复）→ 结束任务链
@@ -275,7 +277,8 @@ finalizeReview(run, outcome, childTimeline):
   FAIL（本轮后面的检查不再执行）:
     report → FAILED
     fix 且 round-1 < fix.max_rounds → sendFix
-    否则 → NEEDS_HUMAN，写入 carry：用户接手后给源 Agent 发任意消息，下一轮从原始基线重新检查整个任务
+    否则 → NEEDS_HUMAN，写入 carry（checked_tree = end_tree）：用户接手后给源 Agent 发消息，下一轮改了文件 → 从原始基线
+           重新检查整个任务，轮次不重置（再 FAIL 直接 NEEDS_HUMAN）；什么都没改 → 不检查，改动按原样保留
   每次状态变化后：更新卡片；状态为终态 → 归档子 Agent（§6）
 ```
 
@@ -292,7 +295,7 @@ onFixTurnEnded(run, outcome):
   当前 tree = run.end_tree（修复轮什么都没改）→ 不重新检查、不消耗轮次：
     回复像提问（awaiting_user，refused 除外）→ SUPERSEDED，按 run 的基线和请求开任务链，记下已用轮次，走代答
     否则视为不同意 findings（on_fail.fix.on_dispute）：
-      human（默认）→ NEEDS_HUMAN，卡片显示 Agent 的回复，写入 carry
+      human（默认）→ NEEDS_HUMAN，卡片显示 Agent 的回复，写入 carry（checked_tree = end_tree，规则同上）
       rereview → 把回复交给 reviewer 再判一次（round + 1，占一轮）
   end_tree = 当前 tree → dispatch(run, round + 1, step=0)   // diff 仍然以原 base_tree 为基准，从第一项检查重新开始
 ```
@@ -404,9 +407,10 @@ CREATE INDEX gate_runs_child ON gate_runs(child_agent_id);
 CREATE INDEX gate_runs_source_status ON gate_runs(source_agent_id, status);
 -- 每一轮的子 Agent 在创建前登记，旧轮次子 Agent 的迟到事件也能识别为 managed
 CREATE TABLE gate_children (child_agent_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, round INTEGER NOT NULL);
--- 被 SUPERSEDED 的 run 留下的未检查改动，交给该 Agent 下一个被检查的轮次（§4.1）
+-- 未通过的改动（被 SUPERSEDED / NEEDS_HUMAN 的 run、被用户停止的轮次），交给该 Agent 下一个被检查的轮次（§4.1）
 CREATE TABLE carries (agent_id TEXT PRIMARY KEY, repo_root TEXT NOT NULL, base_tree TEXT NOT NULL,
-                      request_text TEXT NOT NULL, created_at INTEGER NOT NULL);
+                      request_text TEXT NOT NULL, rounds_used INTEGER NOT NULL DEFAULT 0, checked_tree TEXT,
+                      created_at INTEGER NOT NULL);
 -- 任务链与 answerer 子 Agent，见 turn-outcomes.md §4
 CREATE TABLE chains (agent_id TEXT PRIMARY KEY, chain_id TEXT NOT NULL UNIQUE, ...);
 CREATE TABLE chain_children (child_agent_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, chain_id TEXT NOT NULL);

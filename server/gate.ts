@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { PluginHookContext, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import type {
@@ -80,6 +80,10 @@ interface Pending extends LoadedPolicy {
   chainId: string | null;
   /** Request of a superseded run whose changes this turn now also covers. */
   carriedRequest?: string;
+  /** Fix rounds the carried task already used. */
+  carriedRounds?: number;
+  /** Tree a check of the carried task already failed; ending on it again changes nothing. */
+  checkedTree?: string | null;
 }
 
 /** Everything needed to gate the work of one task (a turn, or a chain of turns). */
@@ -97,8 +101,10 @@ interface Task {
   concurrent: readonly string[];
   /** The task did work (tool calls, or earlier turns of its chain), even if the tree did not change. */
   worked?: boolean;
-  /** Round a new gate run starts at: fix rounds a fix turn used before it asked a question carry over. */
+  /** Round a new gate run starts at: fix rounds the task used before (a question, a carry) carry over. */
   startRound?: number;
+  /** Tree a check of this task already failed: a turn ending on it again is not checked again. */
+  checkedTree?: string | null;
 }
 
 /** A checker's permission requests that were denied, and whether it was asked for a verdict afterwards. */
@@ -391,21 +397,38 @@ export function createGate(options: GateOptions): Gate {
   // on the ledger until a finished turn has handled it, so a restart mid-way does not drop it.
   function applyCarry(agentId: string): void {
     const carry = ledger.carry(agentId);
+    if (carry && now() - carry.created_at > CHAIN_TTL_MS) return ledger.deleteCarry(agentId);
     const target = pending.get(agentId);
     if (!carry || !target?.policy || target.repoRoot !== carry.repo_root) return;
     target.baseTree = carry.base_tree;
     target.carriedRequest = carry.request_text;
+    target.carriedRounds = carry.rounds_used;
+    target.checkedTree = carry.checked_tree;
   }
 
-  async function supersede(paseo: Paseo, run: Run): Promise<Run> {
+  async function supersede(paseo: Paseo, run: Run, fixesUsed?: number): Promise<Run> {
     const next = await transition(paseo, run, { status: "SUPERSEDED" });
-    carryOver(run);
+    carryOver(run, null, fixesUsed);
     return next;
   }
 
-  /** Hands a run's unchecked changes to the source agent's next gated turn (see applyCarry). */
-  function carryOver(run: Run): void {
-    ledger.setCarry({ agent_id: run.source_agent_id, repo_root: run.repo_root, base_tree: run.base_tree, request_text: run.request_text }, now());
+  /**
+   * Hands a run's unchecked changes to the source agent's next gated turn (see applyCarry). `checkedTree` is
+   * the tree a check failed on (or the agent disputed): a next turn ending on it again leaves the task as it
+   * is instead of checking the same tree again. The task keeps the fix rounds it used.
+   */
+  function carryOver(run: Run, checkedTree: string | null = null, fixesUsed = run.status === "FIXING" ? run.round : run.round - 1): void {
+    ledger.setCarry(
+      {
+        agent_id: run.source_agent_id,
+        repo_root: run.repo_root,
+        base_tree: run.base_tree,
+        request_text: run.request_text,
+        rounds_used: fixesUsed,
+        checked_tree: checkedTree,
+      },
+      now(),
+    );
     const carried = taskConcurrent.get(run.source_agent_id) ?? new Set<string>();
     for (const id of concurrentOf(run)) carried.add(id);
     if (carried.size > 0) taskConcurrent.set(run.source_agent_id, carried);
@@ -459,9 +482,12 @@ export function createGate(options: GateOptions): Gate {
       if (!spec.instructions_file) continue;
       const field = `agents.${role}.instructions_file`;
       const file = path.resolve(repoRoot, spec.instructions_file);
-      if (file !== repoRoot && !file.startsWith(`${repoRoot}${path.sep}`)) return `${field}: must be inside the repository`;
+      const inside = (target: string, root: string) => target === root || target.startsWith(`${root}${path.sep}`);
+      if (!inside(file, repoRoot)) return `${field}: must be inside the repository`;
       let text: string;
       try {
+        // A symlink must not pull a file from outside the repository (~/.aws/credentials) into the prompt.
+        if (!inside(await realpath(file), await realpath(repoRoot))) return `${field}: must be inside the repository`;
         // HTML comments are guidance for the person editing the file (npm run init writes them), not rules.
         text = (await readFile(file, "utf8")).replace(/<!--[\s\S]*?-->/g, "").trim();
       } catch (error) {
@@ -674,9 +700,15 @@ export function createGate(options: GateOptions): Gate {
     } else if (maxFixRounds(policy) === 0) {
       await transition(paseo, run, { ...base, status: "FAILED" });
     } else if (round - 1 >= maxFixRounds(policy)) {
-      await transition(paseo, run, { ...base, status: "NEEDS_HUMAN" });
-      // The failing changes stay unaccepted: the agent's next turn checks the whole task again.
-      carryOver(run);
+      await transition(paseo, run, {
+        ...base,
+        status: "NEEDS_HUMAN",
+        error:
+          "The fix rounds are used up. Take over in the chat: if the agent's next turn changes files, the whole task is " +
+          "checked again (without new fix rounds); a turn that changes nothing leaves the changes as they are.",
+      });
+      // The failing changes stay unaccepted until a turn changes them or leaves them as they are.
+      carryOver(run, run.end_tree);
     } else {
       try {
         await sendFix(paseo, ledger.update(run.run_id, base, now()), verdict, policy);
@@ -694,7 +726,7 @@ export function createGate(options: GateOptions): Gate {
     const fixing = await transition(paseo, run, { status: "FIXING", deadline_at: null });
     const source = await refreshAgent(paseo, run.source_agent_id);
     if (!source || source.status !== "idle") {
-      await supersede(paseo, fixing);
+      await supersede(paseo, fixing, run.round - 1); // the fix was not sent
       return;
     }
     await paseo.agents.ref(run.source_agent_id).send(buildFixPrompt(verdict, run.round, maxFixRounds(policy), concurrentOf(run)), {
@@ -771,9 +803,10 @@ export function createGate(options: GateOptions): Gate {
       dispute: truncate(reply || "(no reply)", 4000),
       error:
         `The agent changed nothing in fix round ${run.round} and replied instead (below). Decide who is right, ` +
-        "then send the agent a message: its next turn checks the whole task again.",
+        "then send the agent a message: if its next turn changes files, the whole task is checked again; a turn " +
+        "that changes nothing leaves the changes as they are.",
     });
-    carryOver(run);
+    carryOver(run, run.end_tree);
   }
 
   // ---------- task chains, answers and retries (docs/turn-outcomes.md) ----------
@@ -888,7 +921,7 @@ export function createGate(options: GateOptions): Gate {
   function ensureChain(task: Task): Chain {
     const existing = ledger.chain(task.agentId);
     if (existing) return ledger.updateChain(task.agentId, { request_text: task.requestText }, now()) ?? existing;
-    return ledger.createChain(
+    const created = ledger.createChain(
       {
         agent_id: task.agentId,
         chain_id: randomUUID(),
@@ -901,6 +934,9 @@ export function createGate(options: GateOptions): Gate {
       },
       now(),
     );
+    // A carried task keeps the fix rounds it already used.
+    const roundsUsed = (task.startRound ?? 1) - 1;
+    return roundsUsed > 0 ? (ledger.updateChain(task.agentId, { rounds_used: roundsUsed }, now()) ?? created) : created;
   }
 
   function taskFromChain(chain: Chain): Task {
@@ -952,6 +988,7 @@ export function createGate(options: GateOptions): Gate {
     if (checks.length === 0) return;
     const endTree = knownEndTree ?? (await snapshotTree(task.repoRoot));
     if (endTree === task.baseTree) return log(`skip ${task.agentId}: working tree unchanged`);
+    if (endTree === task.checkedTree) return log(`skip ${task.agentId}: tree already checked; its changes are left as they are`);
     const run = {
       run_id: randomUUID(),
       source_agent_id: task.agentId,
@@ -980,6 +1017,20 @@ export function createGate(options: GateOptions): Gate {
     const action = task.policy.on_outcome[category];
     if (category === "replaced") return; // its baseline was carried into the newer turn
     if (category === "user_canceled") {
+      // Stopping the agent does not accept what it changed: the changes stay in scope for its next gated turn.
+      if ((await snapshotTree(task.repoRoot)) !== task.baseTree) {
+        ledger.setCarry(
+          {
+            agent_id: task.agentId,
+            repo_root: task.repoRoot,
+            base_tree: task.baseTree,
+            request_text: task.requestText,
+            rounds_used: (task.startRound ?? 1) - 1,
+            checked_tree: null,
+          },
+          now(),
+        );
+      }
       return endChain(paseo, task.agentId, { state: "stopped", message: "You stopped the agent." });
     }
     // A task that did nothing (a chat question, an explanation) is left alone: no checks, no answerer. One that
@@ -1460,12 +1511,14 @@ export function createGate(options: GateOptions): Gate {
         items.some((item) => item.type === "tool_call") ||
         snapshot.carriedRequest !== undefined ||
         (chain !== null && (chain.answers > 0 || chain.retries > 0 || chain.rounds_used > 0)),
-      startRound: (chain?.rounds_used ?? 0) + 1,
+      startRound: (chain?.rounds_used ?? snapshot.carriedRounds ?? 0) + 1,
+      checkedTree: chain ? null : snapshot.checkedTree ?? null,
     };
     await applyOutcome(paseo, task, category, detail, replyText(items));
     // Handled: a run, a chain (both keep the carried baseline) or nothing left to check. A replaced turn's
-    // snapshot, carry included, moves on to the newer turn, so the carry stays until that one ends.
-    if (snapshot.carriedRequest !== undefined && category !== "replaced") ledger.deleteCarry(agentId);
+    // snapshot, carry included, moves on to the newer turn, so the carry stays until that one ends; a stopped
+    // turn keeps it for the next one (applyOutcome).
+    if (snapshot.carriedRequest !== undefined && category !== "replaced" && category !== "user_canceled") ledger.deleteCarry(agentId);
     // The task goes on (a chain, a carry, or a replacing turn): keep its overlaps for the turn that finishes it.
     if (taskOverlap.size > 0 && (category === "replaced" || ledger.chain(agentId) || ledger.carry(agentId))) {
       taskConcurrent.set(agentId, taskOverlap);

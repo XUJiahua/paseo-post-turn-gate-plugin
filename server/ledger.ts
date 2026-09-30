@@ -83,6 +83,10 @@ export interface Carry {
   repo_root: string;
   base_tree: string;
   request_text: string;
+  /** Fix rounds the task already used, so a carried task does not start with a fresh budget. */
+  rounds_used: number;
+  /** Tree a check already failed or disputed; a later turn ending on the same tree is not checked again. */
+  checked_tree: string | null;
   created_at: number;
 }
 
@@ -244,6 +248,8 @@ export class Ledger {
         repo_root TEXT NOT NULL,
         base_tree TEXT NOT NULL,
         request_text TEXT NOT NULL,
+        rounds_used INTEGER NOT NULL DEFAULT 0,
+        checked_tree TEXT,
         created_at INTEGER NOT NULL
       );
     `);
@@ -267,6 +273,7 @@ export class Ledger {
       answer_reply: "TEXT",
       answer_signal: "TEXT",
     });
+    migrate("carries", { rounds_used: "INTEGER NOT NULL DEFAULT 0", checked_tree: "TEXT" });
   }
 
   /** Records a reviewer/verifier agent id before it is created, so its events are never mistaken for a source. */
@@ -433,13 +440,19 @@ export class Ledger {
   // ---------- carries ----------
 
   /**
-   * Records the unchecked changes of a superseded run for the agent's next gated turn. An existing carry is
-   * kept: it is older, so its baseline already covers the new run's changes.
+   * Records the unchecked changes of a run for the agent's next gated turn. An existing carry keeps its
+   * baseline and request (it is older, so they already cover the new run's changes); rounds, checked tree and
+   * age follow the newest run.
    */
   setCarry(carry: Omit<Carry, "created_at">, now: number): void {
     this.db
-      .prepare("INSERT OR IGNORE INTO carries (agent_id, repo_root, base_tree, request_text, created_at) VALUES (?, ?, ?, ?, ?)")
-      .run(carry.agent_id, carry.repo_root, carry.base_tree, carry.request_text, now);
+      .prepare(
+        `INSERT INTO carries (agent_id, repo_root, base_tree, request_text, rounds_used, checked_tree, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(agent_id) DO UPDATE SET rounds_used = max(rounds_used, excluded.rounds_used),
+           checked_tree = excluded.checked_tree, created_at = excluded.created_at`,
+      )
+      .run(carry.agent_id, carry.repo_root, carry.base_tree, carry.request_text, carry.rounds_used, carry.checked_tree, now);
   }
 
   carry(agentId: string): Carry | null {

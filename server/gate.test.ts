@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
@@ -487,6 +487,21 @@ describe("dispatch and report", () => {
     assert.equal(fake.created.length, 0);
   });
 
+  test("a rules file symlinked outside the repository is rejected", async () => {
+    const outside = path.join(repo, "..", `${path.basename(repo)}-secret.md`);
+    writeFileSync(outside, "TOP-SECRET-TOKEN");
+    try {
+      mkdirSync(path.join(repo, ".paseo/post-turn-gate"), { recursive: true });
+      symlinkSync(outside, path.join(repo, ".paseo/post-turn-gate/reviewer.md"));
+      writePolicy({ version: 2 });
+      await sourceTurn({ change: edit });
+      assert.match(configCard()?.error ?? "", /reviewer\.instructions_file: must be inside the repository/);
+      assert.equal(fake.created.length, 0);
+    } finally {
+      rmSync(outside, { force: true });
+    }
+  });
+
   test("an unparseable reply is an ERROR, never a PASS", async () => {
     writePolicy({ version: 2 });
     await sourceTurn({ change: edit });
@@ -813,6 +828,46 @@ describe("fix loop", () => {
     assert.match(fake.created[2].prompt, /Implement feature X[\s\S]*Follow-up from the user: I fixed it myself/);
   });
 
+  test("after the rounds are used up, a turn that changes nothing leaves the task as it is", async () => {
+    writePolicy({ version: 2, on_fail: { fix: { max_rounds: 1 } } });
+    await sourceTurn({ change: edit });
+    await childTurn(fake.created[0].agentId, FAIL);
+    await fixTurn(1, () => writeFileSync(path.join(repo, "a.txt"), "fixed\n"));
+    await childTurn(fake.created[1].agentId, FAIL);
+    assert.equal(onlyRun().status, "NEEDS_HUMAN");
+    assert.match(onlyRun().error ?? "", /fix rounds are used up/);
+    await sourceTurn({ text: "ok leave it, I accept it as is", messageId: "m2" });
+    assert.equal(fake.created.length, 2, "the same tree is not checked again");
+    await sourceTurn({ text: "thanks", messageId: "m3" });
+    assert.equal(fake.created.length, 2, "the carry is gone");
+    assert.equal(fake.sent.length, 1);
+  });
+
+  test("after the rounds are used up, a re-check does not start a new fix loop", async () => {
+    writePolicy({ version: 2, on_fail: { fix: { max_rounds: 1 } } });
+    await sourceTurn({ change: edit });
+    await childTurn(fake.created[0].agentId, FAIL);
+    await fixTurn(1, () => writeFileSync(path.join(repo, "a.txt"), "fixed\n"));
+    await childTurn(fake.created[1].agentId, FAIL);
+    await sourceTurn({ text: "try again", messageId: "m2", change: () => writeFileSync(path.join(repo, "a.txt"), "again\n") });
+    assert.equal(fake.created.length, 3);
+    await childTurn(fake.created[2].agentId, FAIL);
+    assert.equal(fake.sent.length, 1, "max_rounds counts rounds for the whole task");
+    assert.equal(fake.cards.get([...fake.cards.keys()].at(-1)!)?.status, "NEEDS_HUMAN");
+  });
+
+  test("a carry expires after a day", async () => {
+    writePolicy({ version: 2, on_fail: { fix: { max_rounds: 1 } } });
+    await sourceTurn({ change: edit });
+    await childTurn(fake.created[0].agentId, FAIL);
+    await fixTurn(1, () => writeFileSync(path.join(repo, "a.txt"), "fixed\n"));
+    await childTurn(fake.created[1].agentId, FAIL);
+    clock += 25 * 60 * 60_000;
+    await sourceTurn({ text: "something else", messageId: "m2", change: () => writeFileSync(path.join(repo, "b.txt"), "b\n") });
+    assert.equal(fake.created.length, 3);
+    assert.doesNotMatch(fake.created[2].prompt, /Implement feature X/, "a new task, not the expired one");
+  });
+
   test("a busy source is never interrupted", async () => {
     writePolicy({ version: 2, on_fail: { fix: { max_rounds: 2 } } });
     await sourceTurn({ change: edit });
@@ -861,6 +916,25 @@ describe("superseded runs keep their changes in scope", () => {
     await childTurn(fake.created[1].agentId, PASS);
     await sourceTurn({ text: "and now?", messageId: "m3" });
     assert.equal(fake.created.length, 2, "once checked, the carry is gone");
+  });
+
+  test("stopping the agent keeps its changes in scope for the next turn", async () => {
+    writePolicy({ version: 2 });
+    await sourceTurn({ change: edit, outcome: { kind: "canceled", reason: "user" } });
+    assert.equal(fake.created.length, 0);
+    await sourceTurn({ text: "thanks", messageId: "m2" });
+    assert.equal(fake.created.length, 1, "the stopped turn's change is still reviewed");
+    assert.match(fake.created[0].prompt, /Implement feature X[\s\S]*Follow-up from the user: thanks/);
+  });
+
+  test("stopping the agent again keeps an existing carry", async () => {
+    writePolicy({ version: 2 });
+    await sourceTurn({ change: edit });
+    const [base] = diffOf(fake.created[0].prompt);
+    await sourceTurn({ text: "stop", messageId: "m2", outcome: { kind: "canceled", reason: "user" } }); // supersedes the review
+    await sourceTurn({ text: "thanks", messageId: "m3" });
+    assert.equal(fake.created.length, 2);
+    assert.equal(diffOf(fake.created[1].prompt)[0], base);
   });
 
   test("the carry survives plugin restarts, before and during the next turn", async () => {
