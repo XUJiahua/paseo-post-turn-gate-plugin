@@ -217,7 +217,7 @@ data = { category, message, suggestion, attempt, maxAttempts, nextRetryAt }
 - answerer 的 profile、instructions、权限和超时都在 `agents.answerer`（design.md §3.1），`answer` 里只有次数上限。
 - 重试时，源 Agent 状态为 `idle` 或 `error` 都允许发送：失败后的状态是 `error`（E5、E6）。
 - `done` 为 `notify` 或 `ignore` 时 `on_outcome` 的其余部分仍然生效（代答、重试、通知），只是不做检查。
-- messageId 前缀：answerer 自己的 prompt 用 `ptg:ask:`，发给源 Agent 的代答用 `ptg:answer:`，重试用 `ptg:retry:`，fix 轮保持 `ptg:<run>:fix:<n>`。
+- messageId 前缀：answerer 自己的 prompt 用 `ptg:ask:<chain>:<answerer agentId>`（每次调用一个 key，escalate 后再调用不会撞 key），发给源 Agent 的代答用 `ptg:answer:`，重试用 `ptg:retry:`，fix 轮保持 `ptg:<run>:fix:<n>`。
 
 ## 7.2 截断、拒答的启发式识别（第 1 类，已实现）
 

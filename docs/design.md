@@ -189,9 +189,9 @@ npm run profiles -- --provider codex --model gpt-5.5 --role reviewer --thinking 
 ```text
 turn_started(agent)
   ├─ agent 是 ledger 中某个 run 的子 Agent → 忽略
-  ├─ 该源 Agent 有 REVIEWING/FIXING 的 run，且不是 fix 轮 → 旧 run 标 SUPERSEDED
+  ├─ 该源 Agent 有 REVIEWING/DISPATCHING 的 run → 旧 run 标 SUPERSEDED，其 base_tree 和请求留给下一轮
   ├─ trigger=root_only 且 parentAgentId≠null → 忽略
-  └─ 读取策略、计算基线 tree → 存入内存 pending[agentId] = { policy, baseTree, repoRoot }
+  └─ 读取策略、计算基线 tree → 存入内存 pending[agentId] = { policy, baseTree, repoRoot }；有留下的 base_tree 时用它替换基线
 
 turn_ended(agent, outcome, timeline)
   ├─ agent 是 ledger 中某个 run 的子 Agent → finalizeReview(run, outcome, timeline)
@@ -263,11 +263,11 @@ finalizeReview(run, outcome, childTimeline):
 ```text
 sendFix(run):
   src = refresh(source)；status ≠ idle → SUPERSEDED
-  ledger: status=FIXING
+  ledger: status=FIXING, deadline_at=null   // 修复由源 Agent 完成，不套用角色的 timeout_minutes
   src.send(formatFindings(verdict), { messageId: "ptg:<run_id>:fix:<round>" })
 
 onFixTurnEnded(run, outcome):
-  outcome ≠ completed → SUPERSEDED
+  outcome ≠ completed → SUPERSEDED（base_tree 和请求留给下一轮，见 4.1）
   end_tree = 当前 tree → dispatch(run, round + 1)   // diff 仍然以原 base_tree 为基准
 ```
 

@@ -88,7 +88,8 @@ sequenceDiagram
 
 - 自动修复是默认行为（`max_rounds: 2`），目的是让 agent 自己循环到通过。设为 `"on_fail": "report"`（或 `npm run init -- --report`）时只出 FAILED 卡片，不发回去修。
 - 修了 `max_rounds` 轮还是 FAIL，卡片变成 NEEDS_HUMAN，交给你处理。
-- 修复期间你自己发了消息，这次审查标为 SUPERSEDED，以你的消息为准。
+- 修复期间你自己发了消息，这次审查标为 SUPERSEDED，以你的消息为准。没通过检查的改动不会被放过：你这一轮结束后，从原来的基线开始连同原始请求一起检查。
+- 修复轮没有超时：修复由开发 agent 自己完成，多慢都会在它结束后重新检查。
 
 每个仓库的审查规则写在 `.paseo/post-turn-gate/reviewer.md` 里。`npm run init` 会生成一份立即生效的默认规则：HTML 注释只是编辑说明，注释后的 Markdown 会加入提示词。继续按项目补充并和代码一起提交，例如"金额一律用整数分"、"新接口必须有集成测试"。verifier、answerer 分别对应 `verifier.md`、`answerer.md`。
 
@@ -276,7 +277,7 @@ sequenceDiagram
   G->>R: 归档（结果已经过时）
   G-->>你: 旧卡片 SUPERSEDED
   A-->>G: 新一轮完成
-  G->>G: 为新一轮重新审查
+  G->>G: 从旧 run 的基线重新审查（含上一轮未审完的改动和原始请求）
 ```
 
 ## 场景 9：插件或 daemon 重启

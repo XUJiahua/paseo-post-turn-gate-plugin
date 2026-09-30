@@ -73,6 +73,8 @@ interface LoadedPolicy {
 interface Pending extends LoadedPolicy {
   turnId: string | null;
   chainId: string | null;
+  /** Request of a superseded run whose changes this turn now also covers. */
+  carriedRequest?: string;
 }
 
 /** Everything needed to gate the work of one task (a turn, or a chain of turns). */
@@ -261,6 +263,29 @@ export function createGate(options: GateOptions): Gate {
   async function fail(paseo: Paseo, run: Run, error: string, patch: Partial<Run> = {}): Promise<void> {
     const next = await transition(paseo, run, { ...patch, status: "ERROR", error });
     await archiveChild(paseo, next.child_agent_id);
+  }
+
+  // A superseded run's changes were never passed, so the agent's next gated turn starts from the run's
+  // baseline and request instead of taking a fresh one (which would already contain them).
+  // ponytail: kept in memory; a restart before the next turn starts loses it and that turn gets a fresh
+  // baseline. Upgrade path: store the carry on the ledger.
+  const carried = new Map<string, { baseTree: string; requestText: string }>();
+
+  function applyCarry(agentId: string): void {
+    const carry = carried.get(agentId);
+    const target = pending.get(agentId);
+    if (!carry || !target?.policy) return;
+    carried.delete(agentId);
+    target.baseTree = carry.baseTree;
+    target.carriedRequest = carry.requestText;
+  }
+
+  async function supersede(paseo: Paseo, run: Run): Promise<Run> {
+    const next = await transition(paseo, run, { status: "SUPERSEDED" });
+    // A turn that already started (its pending snapshot exists) takes the carry now, otherwise the next one does.
+    carried.set(run.source_agent_id, { baseTree: run.base_tree, requestText: run.request_text });
+    applyCarry(run.source_agent_id);
+    return next;
   }
 
   // ---------- policy ----------
@@ -465,10 +490,12 @@ export function createGate(options: GateOptions): Gate {
   }
 
   async function sendFix(paseo: Paseo, run: Run, verdict: Verdict, policy: Policy): Promise<void> {
-    const fixing = await transition(paseo, run, { status: "FIXING", deadline_at: now() + timeoutOf(run) });
+    // No deadline: the source agent does the fix, and a role's timeout_minutes does not bound its work.
+    // A slow fix still ends in a turn_ended that re-checks it; timing it out would leave the fix unchecked.
+    const fixing = await transition(paseo, run, { status: "FIXING", deadline_at: null });
     const source = await refreshAgent(paseo, run.source_agent_id);
     if (!source || source.status !== "idle") {
-      await transition(paseo, fixing, { status: "SUPERSEDED" });
+      await supersede(paseo, fixing);
       return;
     }
     await paseo.agents.ref(run.source_agent_id).send(buildFixPrompt(verdict, run.round, maxFixRounds(policy)), {
@@ -481,7 +508,7 @@ export function createGate(options: GateOptions): Gate {
   async function onFixTurnEnded(paseo: Paseo, run: Run, outcome: TurnEnded["outcome"]): Promise<void> {
     if (run.status !== "FIXING") return;
     if (outcome.kind !== "completed") {
-      await transition(paseo, run, { status: "SUPERSEDED" });
+      await supersede(paseo, run);
       return;
     }
     const endTree = await snapshotTree(run.repo_root);
@@ -611,13 +638,13 @@ export function createGate(options: GateOptions): Gate {
     };
   }
 
-  function chainRequestText(chain: Chain | null, lastUser: ReturnType<typeof lastUserMessage>): string {
+  function chainRequestText(prior: string | null, lastUser: ReturnType<typeof lastUserMessage>): string {
     const text = lastUser?.text ?? "";
     const id = lastUser?.messageId ?? lastUser?.clientMessageId ?? "";
-    if (!chain) return truncate(text, REQUEST_TEXT_LIMIT);
-    if (id.startsWith("ptg:retry:")) return chain.request_text;
+    if (prior === null) return truncate(text, REQUEST_TEXT_LIMIT);
+    if (id.startsWith("ptg:retry:")) return prior;
     const label = id.startsWith("ptg:answer:") ? "Answered on the user's behalf" : "Follow-up from the user";
-    return truncate(`${chain.request_text}\n\n${label}: ${text}`, REQUEST_TEXT_LIMIT);
+    return truncate(`${prior}\n\n${label}: ${text}`, REQUEST_TEXT_LIMIT);
   }
 
   async function needsUser(paseo: Paseo, chain: Chain, question: string | undefined, reason: string): Promise<void> {
@@ -785,7 +812,9 @@ export function createGate(options: GateOptions): Gate {
     const endTree = await snapshotTree(chain.repo_root);
     const childAgentId = randomUUID();
     const attempt = chain.answers + 1;
-    const key = `ptg:ask:${chain.chain_id}:${attempt}`;
+    // One key per answerer child: `answers` only grows when an answer is sent, so an escalated or failed
+    // call would reuse an attempt number with a new payload (agent_request_key_conflict). Replays reuse the payload.
+    const key = `ptg:ask:${chain.chain_id}:${childAgentId}`;
     const payload = {
       agentId: childAgentId,
       idempotencyKey: key,
@@ -952,10 +981,16 @@ export function createGate(options: GateOptions): Gate {
     // The user spoke while a review was running: the review is stale.
     for (const run of ledger.activeForSource(agentId)) {
       if (run.status === "REVIEWING" || run.status === "DISPATCHING") {
-        const next = await transition(paseo, run, { status: "SUPERSEDED" });
+        const next = await supersede(paseo, run);
         await archiveChild(paseo, next.child_agent_id);
       }
     }
+    await snapshotTurn(event, paseo);
+    applyCarry(agentId);
+  }
+
+  async function snapshotTurn(event: TurnStarted, paseo: Paseo): Promise<void> {
+    const agentId = event.agent.id;
     let chain = liveChain(agentId);
     // The plugin clears these before sending its own answer or retry, so this is always the user.
     if (chain && (chain.answer_child_id || chain.next_retry_at !== null)) {
@@ -1050,7 +1085,7 @@ export function createGate(options: GateOptions): Gate {
       policyJson: snapshot.policyJson,
       policyHash: snapshot.policyHash,
       baseTree: snapshot.baseTree,
-      requestText: chainRequestText(chain, lastUser),
+      requestText: chainRequestText(chain?.request_text ?? snapshot.carriedRequest ?? null, lastUser),
       turnKey: `${agentId}:${messageId ?? `turn:${event.turnId}:${event.timeline.length}`}`,
     };
     await applyOutcome(paseo, task, category, detail, replyText(items));
@@ -1186,7 +1221,7 @@ export function createGate(options: GateOptions): Gate {
     }
     const later = items.slice(index + 1);
     if (later.some((item) => item.type === "user_message")) {
-      await transition(paseo, run, { status: "SUPERSEDED" });
+      await supersede(paseo, run);
       return;
     }
     return onFixTurnEnded(paseo, run, { kind: "completed" });

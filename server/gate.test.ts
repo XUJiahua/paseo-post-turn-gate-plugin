@@ -41,6 +41,7 @@ function createFakePaseo() {
   const cards = new Map<string, CardData>();
   const cardAppends: Array<{ agentId: string; id: string; data: CardData }> = [];
   let failCreate = false;
+  const keys = new Map<string, string>();
   const profiles: Array<Record<string, unknown>> = [];
   const api = {
     config: { get: async () => ({ requestId: "r", config: { agentProfiles: profiles } }) },
@@ -75,6 +76,11 @@ function createFakePaseo() {
           create: async (options: Record<string, any>) => {
             created.push({ workspaceId, ...options });
             if (failCreate) throw new Error("provider unavailable");
+            // Like the daemon (design.md V9): a key replays only its own payload.
+            const payload = JSON.stringify(options);
+            const previous = keys.get(options.idempotencyKey);
+            if (previous !== undefined && previous !== payload) throw new Error("agent_request_key_conflict");
+            keys.set(options.idempotencyKey, payload);
             agents.set(options.agentId, {
               ...agents.get(options.parent)!,
               id: options.agentId,
@@ -618,6 +624,50 @@ describe("fix loop", () => {
     await sourceTurn({ messageId: `ptg:${runId}:fix:1`, outcome: { kind: "canceled", reason: "user" } });
     assert.equal(onlyRun().status, "SUPERSEDED");
   });
+
+  test("a slow fix never times out and is still re-checked", async () => {
+    writePolicy({ version: 2, on_fail: { fix: { max_rounds: 2 } } });
+    await sourceTurn({ change: edit });
+    await childTurn(fake.created[0].agentId, FAIL);
+    fake.agents.set(SOURCE, sourceAgent({ status: "running" }));
+    clock += 60 * 60_000; // far past any role's timeout_minutes
+    gate.reconcile(fake.paseo);
+    await gate.idle();
+    assert.equal(onlyRun().status, "FIXING");
+    fake.agents.set(SOURCE, sourceAgent());
+    await fixTurn(1, () => writeFileSync(path.join(repo, "a.txt"), "fixed\n"));
+    assert.equal(fake.created.length, 2);
+    assert.equal(onlyRun().status, "REVIEWING");
+  });
+});
+
+describe("superseded runs keep their changes in scope", () => {
+  const diffOf = (prompt: string) => /diff ([0-9a-f]{40}) ([0-9a-f]{40})/.exec(prompt)!.slice(1);
+
+  test("a user message during review: the next turn is checked from the run's baseline and request", async () => {
+    writePolicy({ version: 2 });
+    await sourceTurn({ change: edit });
+    const [base] = diffOf(fake.created[0].prompt);
+    await sourceTurn({ text: "thanks", messageId: "m2" }); // no edits of its own
+    assert.equal(fake.created.length, 2, "the unchecked change is still reviewed");
+    assert.equal(diffOf(fake.created[1].prompt)[0], base);
+    assert.match(fake.created[1].prompt, /Implement feature X[\s\S]*Follow-up from the user: thanks/);
+    await childTurn(fake.created[1].agentId, PASS);
+    await sourceTurn({ text: "and now?", messageId: "m3" });
+    assert.equal(fake.created.length, 2, "once checked, the carry is gone");
+  });
+
+  test("an interrupted fix turn: the next turn is checked from the run's original baseline", async () => {
+    writePolicy({ version: 2, on_fail: { fix: { max_rounds: 2 } } });
+    await sourceTurn({ change: edit });
+    const [base] = diffOf(fake.created[0].prompt);
+    await childTurn(fake.created[0].agentId, FAIL);
+    const runId = fake.sent[0].messageId!.split(":")[1];
+    await sourceTurn({ messageId: `ptg:${runId}:fix:1`, outcome: { kind: "canceled", reason: "replaced" } });
+    await sourceTurn({ text: "do it differently", messageId: "m2", change: () => writeFileSync(path.join(repo, "b.txt"), "b") });
+    assert.equal(fake.created.length, 2);
+    assert.equal(diffOf(fake.created[1].prompt)[0], base);
+  });
 });
 
 describe("recovery", () => {
@@ -842,7 +892,7 @@ describe("turn outcomes: answers, retries, chains", () => {
     await sourceTurn({ text: "go on", messageId: "n2" }); // user continues manually: chain ends with a review
     assert.equal(reviewers().length, 1);
     const manualBase = baseOf(reviewers()[0].prompt);
-
+    await childTurn(reviewers()[0].agentId, PASS); // checked, so the next task starts from a fresh baseline
     fake.cards.clear();
     writePolicy({ version: 2, on_outcome: { network: { retry: { max: 1, delay_seconds: 30, message: "Retry please." } } } });
     await sourceTurn({ change: () => writeFileSync(path.join(repo, "c.txt"), "c"), outcome: networkFailure, reply, messageId: "n3" });
