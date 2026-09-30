@@ -173,7 +173,7 @@ prompt 包含：
   - 超过重试次数：notify；
   - carry 存在超过 24 小时：丢弃。
 - 重试消息的 `messageId` 为 `ptg:retry:<chainId>:<n>`，与 fix 轮一样归入同一条链。发送前必须确认 Agent 为 `idle`，否则放弃重试（用户已经接手）。
-- **存储**：carry 和待执行的重试写进 ledger 表 `chains`（`agent_id` 为主键，另有 `chain_id`、`policy_json`、`base_tree`、`request_text`、`retries`、`answers`、`next_retry_at`、计划中的代答 `answer_at`、answerer 的派发参数和截止时间、`card_json`、`card_seq`、`rounds_used` 等），answerer 子 Agent 登记在 `chain_children`。对账循环（60s）负责到点发送，插件重启后也能继续。
+- **存储**：carry 和待执行的重试写进 ledger 表 `tasks`（每个源 Agent 一行，与 turn 快照、carry 共用；原为 `chains` 表。`agent_id` 为主键，另有 `chain_id`、`policy_json`、`base_tree`、`request_text`、`retries`、`answers`、`next_retry_at`、计划中的代答 `answer_at`、answerer 的派发参数和截止时间、`card_json`、`card_seq`、`rounds_used` 等），answerer 子 Agent 登记在 `chain_children`。对账循环（60s）负责到点发送，插件重启后也能继续。
 - **修复轮里的提问**：修复轮没改文件、只是在提问时（design.md §4.3），run 转 `SUPERSEDED`，按 run 的基线和请求开一条链，`rounds_used` 记下已用的修复轮次；链结束时新建的 run 从 `rounds_used + 1` 轮开始，`max_rounds` 仍按整个任务计。
 
 `ponytail:` 等待用户回答期间，`awaiting_user` 会让 carry 一直保留，直到 24 小时过期。期间用户开始一个新任务，也会被算进同一条链，review 范围因此变大。可以接受：这只会多 review，不会漏。

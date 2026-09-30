@@ -114,6 +114,43 @@ const CHAIN_COLUMNS = [
   "answer_signal",
 ] as const;
 
+/** Automation state of a chain, cleared when a chain starts or ends. */
+const CHAIN_RESET = {
+  retries: 0,
+  answers: 0,
+  last_question: null,
+  stop_answering: 0,
+  next_retry_at: null,
+  retry_message: null,
+  answer_child_id: null,
+  answer_dispatch_json: null,
+  answer_deadline_at: null,
+  card_json: null,
+  card_seq: 0,
+  answer_at: null,
+  answer_reply: null,
+  answer_signal: null,
+} as const;
+
+/**
+ * A source agent's task row: the task's scope (repo, baseline, request, fix rounds used), shared by its carry and
+ * its chain; `carried_at` marks unchecked changes waiting for the next turn; `chain_id` a running chain.
+ */
+interface TaskRow extends Omit<Chain, "chain_id" | "workspace_id" | "repo_root" | "policy_json" | "policy_hash" | "base_tree" | "request_text"> {
+  chain_id: string | null;
+  chain_created_at: number | null;
+  workspace_id: string | null;
+  repo_root: string | null;
+  policy_json: string | null;
+  policy_hash: string | null;
+  base_tree: string | null;
+  request_text: string | null;
+  checked_tree: string | null;
+  carried_at: number | null;
+  turn_json: string | null;
+  turn_at: number | null;
+}
+
 export type NewRun = Pick<
   Run,
   | "run_id"
@@ -201,15 +238,22 @@ export class Ledger {
       );
       CREATE INDEX IF NOT EXISTS gate_runs_child ON gate_runs(child_agent_id);
       CREATE INDEX IF NOT EXISTS gate_runs_source_status ON gate_runs(source_agent_id, status);
-      CREATE TABLE IF NOT EXISTS chains (
+      -- One row per source agent for the task it is working on: the running turn's frozen snapshot, unchecked
+      -- changes handed to its next turn (carry), and the automation of a task chain (answers, retries).
+      -- Replaces the chains, carries and turn_snapshots tables of earlier releases.
+      CREATE TABLE IF NOT EXISTS tasks (
         agent_id TEXT PRIMARY KEY,
-        chain_id TEXT NOT NULL UNIQUE,
-        workspace_id TEXT NOT NULL,
-        repo_root TEXT NOT NULL,
-        policy_json TEXT NOT NULL,
-        policy_hash TEXT NOT NULL,
-        base_tree TEXT NOT NULL,
-        request_text TEXT NOT NULL,
+        repo_root TEXT,
+        workspace_id TEXT,
+        base_tree TEXT,
+        request_text TEXT,
+        rounds_used INTEGER NOT NULL DEFAULT 0,
+        checked_tree TEXT,
+        carried_at INTEGER,
+        chain_id TEXT UNIQUE,
+        chain_created_at INTEGER,
+        policy_json TEXT,
+        policy_hash TEXT,
         retries INTEGER NOT NULL DEFAULT 0,
         answers INTEGER NOT NULL DEFAULT 0,
         last_question TEXT,
@@ -221,10 +265,11 @@ export class Ledger {
         answer_deadline_at INTEGER,
         card_json TEXT,
         card_seq INTEGER NOT NULL DEFAULT 0,
-        rounds_used INTEGER NOT NULL DEFAULT 0,
         answer_at INTEGER,
         answer_reply TEXT,
         answer_signal TEXT,
+        turn_json TEXT,
+        turn_at INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -243,20 +288,6 @@ export class Ledger {
         card_id TEXT NOT NULL,
         error TEXT NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS carries (
-        agent_id TEXT PRIMARY KEY,
-        repo_root TEXT NOT NULL,
-        base_tree TEXT NOT NULL,
-        request_text TEXT NOT NULL,
-        rounds_used INTEGER NOT NULL DEFAULT 0,
-        checked_tree TEXT,
-        created_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS turn_snapshots (
-        agent_id TEXT PRIMARY KEY,
-        snapshot_json TEXT NOT NULL,
-        created_at INTEGER NOT NULL
-      );
     `);
     // Ledgers created by older releases lack newer columns.
     const migrate = (table: string, added: Record<string, string>) => {
@@ -271,14 +302,7 @@ export class Ledger {
       blocked_json: "TEXT",
       dispute: "TEXT",
     });
-    migrate("chains", {
-      card_seq: "INTEGER NOT NULL DEFAULT 0",
-      rounds_used: "INTEGER NOT NULL DEFAULT 0",
-      answer_at: "INTEGER",
-      answer_reply: "TEXT",
-      answer_signal: "TEXT",
-    });
-    migrate("carries", { rounds_used: "INTEGER NOT NULL DEFAULT 0", checked_tree: "TEXT" });
+    this.importOldTables();
   }
 
   /** Records a reviewer/verifier agent id before it is created, so its events are never mistaken for a source. */
@@ -360,55 +384,73 @@ export class Ledger {
       .all(sourceAgentId, ...TERMINAL_STATUSES) as unknown as Run[];
   }
 
-  // ---------- chains ----------
+  // ---------- tasks: chains, carries and turn snapshots share one row per agent ----------
+
+  private row(agentId: string): TaskRow | null {
+    return (this.db.prepare("SELECT * FROM tasks WHERE agent_id = ?").get(agentId) as TaskRow | undefined) ?? null;
+  }
+
+  /** Inserts the agent's row if it has none, then applies `patch`. */
+  private upsert(agentId: string, patch: Partial<Omit<TaskRow, "agent_id" | "created_at" | "updated_at">>, now: number): void {
+    this.db.prepare("INSERT OR IGNORE INTO tasks (agent_id, created_at, updated_at) VALUES (?, ?, ?)").run(agentId, now, now);
+    const entries = Object.entries(patch);
+    const assignments = [...entries.map(([key]) => `${key} = ?`), "updated_at = ?"].join(", ");
+    const values = entries.map(([, value]) => (value === undefined ? null : value)) as Array<string | number | null>;
+    this.db.prepare(`UPDATE tasks SET ${assignments} WHERE agent_id = ?`).run(...values, now, agentId);
+  }
+
+  /** Drops a row that no longer holds a turn snapshot, a carry or a chain. */
+  private prune(agentId: string): void {
+    this.db
+      .prepare("DELETE FROM tasks WHERE agent_id = ? AND turn_json IS NULL AND carried_at IS NULL AND chain_id IS NULL")
+      .run(agentId);
+  }
+
+  private static asChain(row: TaskRow | undefined | null): Chain | null {
+    if (!row?.chain_id) return null;
+    return {
+      ...(row as unknown as Omit<Chain, "chain_id" | "created_at">),
+      chain_id: row.chain_id,
+      created_at: row.chain_created_at ?? row.created_at,
+    };
+  }
 
   chain(agentId: string): Chain | null {
-    return (this.db.prepare("SELECT * FROM chains WHERE agent_id = ?").get(agentId) as Chain | undefined) ?? null;
+    return Ledger.asChain(this.row(agentId));
   }
 
   chainById(chainId: string): Chain | null {
-    return (this.db.prepare("SELECT * FROM chains WHERE chain_id = ?").get(chainId) as Chain | undefined) ?? null;
+    return Ledger.asChain(this.db.prepare("SELECT * FROM tasks WHERE chain_id = ?").get(chainId) as TaskRow | undefined);
   }
 
   chains(): Chain[] {
-    return this.db.prepare("SELECT * FROM chains ORDER BY created_at").all() as unknown as Chain[];
+    return (this.db.prepare("SELECT * FROM tasks WHERE chain_id IS NOT NULL ORDER BY chain_created_at").all() as unknown as TaskRow[]).map(
+      (row) => Ledger.asChain(row)!,
+    );
   }
 
+  /** Starts a chain on the agent's task; a previous chain's automation state is reset. */
   createChain(
     chain: Pick<Chain, "agent_id" | "chain_id" | "workspace_id" | "repo_root" | "policy_json" | "policy_hash" | "base_tree" | "request_text">,
     now: number,
   ): Chain {
-    this.db
-      .prepare(
-        `INSERT OR REPLACE INTO chains
-          (agent_id, chain_id, workspace_id, repo_root, policy_json, policy_hash, base_tree, request_text, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        chain.agent_id,
-        chain.chain_id,
-        chain.workspace_id,
-        chain.repo_root,
-        chain.policy_json,
-        chain.policy_hash,
-        chain.base_tree,
-        chain.request_text,
-        now,
-        now,
-      );
-    return this.chain(chain.agent_id)!;
+    const { agent_id, ...fields } = chain;
+    this.upsert(agent_id, { ...fields, ...CHAIN_RESET, rounds_used: 0, chain_created_at: now }, now);
+    return this.chain(agent_id)!;
   }
 
   updateChain(agentId: string, patch: Partial<Pick<Chain, (typeof CHAIN_COLUMNS)[number]>>, now: number): Chain | null {
+    if (!this.chain(agentId)) return null;
     const entries = Object.entries(patch).filter(([key]) => (CHAIN_COLUMNS as readonly string[]).includes(key));
-    const assignments = [...entries.map(([key]) => `${key} = ?`), "updated_at = ?"].join(", ");
-    const values = entries.map(([, value]) => (value === undefined ? null : value)) as Array<string | number | null>;
-    this.db.prepare(`UPDATE chains SET ${assignments} WHERE agent_id = ?`).run(...values, now, agentId);
+    this.upsert(agentId, Object.fromEntries(entries), now);
     return this.chain(agentId);
   }
 
+  /** Ends the agent's chain; a carry or turn snapshot on the same task stays. */
   deleteChain(agentId: string): void {
-    this.db.prepare("DELETE FROM chains WHERE agent_id = ?").run(agentId);
+    if (!this.chain(agentId)) return;
+    this.upsert(agentId, { chain_id: null, chain_created_at: null, policy_json: null, policy_hash: null, ...CHAIN_RESET }, Date.now());
+    this.prune(agentId);
   }
 
   addChainChild(childAgentId: string, agentId: string, chainId: string): void {
@@ -450,46 +492,94 @@ export class Ledger {
    * age follow the newest run.
    */
   setCarry(carry: Omit<Carry, "created_at">, now: number): void {
-    this.db
-      .prepare(
-        `INSERT INTO carries (agent_id, repo_root, base_tree, request_text, rounds_used, checked_tree, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(agent_id) DO UPDATE SET rounds_used = max(rounds_used, excluded.rounds_used),
-           checked_tree = excluded.checked_tree, created_at = excluded.created_at`,
-      )
-      .run(carry.agent_id, carry.repo_root, carry.base_tree, carry.request_text, carry.rounds_used, carry.checked_tree, now);
+    const existing = this.carry(carry.agent_id);
+    this.upsert(
+      carry.agent_id,
+      existing
+        ? { rounds_used: Math.max(existing.rounds_used, carry.rounds_used), checked_tree: carry.checked_tree, carried_at: now }
+        : {
+            repo_root: carry.repo_root,
+            base_tree: carry.base_tree,
+            request_text: carry.request_text,
+            rounds_used: carry.rounds_used,
+            checked_tree: carry.checked_tree,
+            carried_at: now,
+          },
+      now,
+    );
   }
 
   carry(agentId: string): Carry | null {
-    return (this.db.prepare("SELECT * FROM carries WHERE agent_id = ?").get(agentId) as Carry | undefined) ?? null;
+    const row = this.row(agentId);
+    if (row?.carried_at == null || !row.repo_root || row.base_tree === null || row.request_text === null) return null;
+    return {
+      agent_id: agentId,
+      repo_root: row.repo_root,
+      base_tree: row.base_tree,
+      request_text: row.request_text,
+      rounds_used: row.rounds_used,
+      checked_tree: row.checked_tree,
+      created_at: row.carried_at,
+    };
   }
 
+  /** The carry was handed on; a chain of the same task keeps the shared baseline and request. */
   deleteCarry(agentId: string): void {
-    this.db.prepare("DELETE FROM carries WHERE agent_id = ?").run(agentId);
+    if (!this.carry(agentId)) return;
+    this.upsert(agentId, { carried_at: null, checked_tree: null }, Date.now());
+    this.prune(agentId);
   }
 
   // ---------- turn snapshots ----------
 
   /** The policy and baseline frozen at a running turn's start, so a plugin restart mid-turn still gates it. */
   setTurnSnapshot(agentId: string, snapshotJson: string, now: number): void {
-    this.db
-      .prepare(
-        `INSERT INTO turn_snapshots (agent_id, snapshot_json, created_at) VALUES (?, ?, ?)
-         ON CONFLICT(agent_id) DO UPDATE SET snapshot_json = excluded.snapshot_json, created_at = excluded.created_at`,
-      )
-      .run(agentId, snapshotJson, now);
+    this.upsert(agentId, { turn_json: snapshotJson, turn_at: now }, now);
   }
 
   turnSnapshot(agentId: string): { snapshot_json: string; created_at: number } | null {
-    return (
-      (this.db.prepare("SELECT snapshot_json, created_at FROM turn_snapshots WHERE agent_id = ?").get(agentId) as
-        | { snapshot_json: string; created_at: number }
-        | undefined) ?? null
-    );
+    const row = this.row(agentId);
+    return row?.turn_json ? { snapshot_json: row.turn_json, created_at: row.turn_at ?? row.created_at } : null;
   }
 
   deleteTurnSnapshot(agentId: string): void {
-    this.db.prepare("DELETE FROM turn_snapshots WHERE agent_id = ?").run(agentId);
+    const row = this.row(agentId);
+    if (!row?.turn_json) return;
+    this.upsert(agentId, { turn_json: null, turn_at: null }, Date.now());
+    this.prune(agentId);
+  }
+
+  /** Moves rows of the chains, carries and turn_snapshots tables of earlier releases into tasks. */
+  private importOldTables(): void {
+    const tables = new Set(
+      (this.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((t) => t.name),
+    );
+    this.db.exec("BEGIN");
+    try {
+      if (tables.has("chains")) {
+        for (const chain of this.db.prepare("SELECT * FROM chains").all() as unknown as Chain[]) {
+          const { agent_id, created_at, updated_at: _updated, ...fields } = chain;
+          const known = Object.fromEntries(Object.entries(fields).filter(([key]) => key === "chain_id" || (CHAIN_COLUMNS as readonly string[]).includes(key)));
+          this.upsert(agent_id, { ...known, chain_created_at: created_at }, created_at);
+        }
+        this.db.exec("DROP TABLE chains");
+      }
+      if (tables.has("carries")) {
+        for (const carry of this.db.prepare("SELECT * FROM carries").all() as unknown as Carry[]) {
+          this.setCarry({ ...carry, rounds_used: carry.rounds_used ?? 0, checked_tree: carry.checked_tree ?? null }, carry.created_at);
+        }
+        this.db.exec("DROP TABLE carries");
+      }
+      if (tables.has("turn_snapshots")) {
+        const rows = this.db.prepare("SELECT * FROM turn_snapshots").all() as Array<{ agent_id: string; snapshot_json: string; created_at: number }>;
+        for (const row of rows) this.setTurnSnapshot(row.agent_id, row.snapshot_json, row.created_at);
+        this.db.exec("DROP TABLE turn_snapshots");
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   close(): void {

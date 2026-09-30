@@ -193,9 +193,9 @@ npm run profiles -- --provider codex --model gpt-5.5 --role reviewer --thinking 
 ```text
 turn_started(agent)
   ├─ agent 是 ledger 中某个 run 的子 Agent → 忽略
-  ├─ 该源 Agent 有 REVIEWING/DISPATCHING 的 run → 旧 run 标 SUPERSEDED，其 base_tree 和请求写入 ledger 的 carries 表留给下一轮
+  ├─ 该源 Agent 有 REVIEWING/DISPATCHING 的 run → 旧 run 标 SUPERSEDED，其 base_tree 和请求写入 ledger 的 `tasks` 行（carry）留给下一轮
   ├─ trigger=root_only 且 parentAgentId≠null → 忽略
-  └─ 读取策略、计算基线 tree → 存入内存 pending[agentId] = { policy, baseTree, repoRoot }，并写一份到 ledger 的 turn_snapshots；同一 repo 有 carry 时用它替换基线
+  └─ 读取策略、计算基线 tree → 存入内存 pending[agentId] = { policy, baseTree, repoRoot }，并写一份到 ledger 的 `tasks.turn_json`；同一 repo 有 carry 时用它替换基线
      （carry 在这一轮结束、结果交给 run 或 chain 后才删除；插件中途重启也不会丢；24 小时没更新的 carry 作废）
      （carry 记下任务已用的修复轮次，下一个 run 从这里接着数；checked_tree 是检查已判 FAIL / 被反驳的 tree，
       下一轮结束时 tree 仍是它 → 不再检查，删除 carry，改动按原样保留）
@@ -205,7 +205,7 @@ turn_ended(agent, outcome, timeline)
   ├─ agent 是某条任务链的 answerer → finalizeAnswer（turn-outcomes.md §3.1）
   ├─ 最后一条 user_message.messageId 形如 "ptg:<run_id>:fix:<n>" → onFixTurnEnded(run, outcome)
   ├─ pending 属于更早的 turn（已被新一轮替换，基线已交给新一轮）→ 结束
-  ├─ 内存里没有 pending（插件中途重载、daemon 重启）→ 从 ledger 的 turn_snapshots 恢复，按原基线继续；都没有才记日志、结束
+  ├─ 内存里没有 pending（插件中途重载、daemon 重启）→ 从 ledger 的 `tasks.turn_json` 恢复，按原基线继续；都没有才记日志、结束
   ├─ refresh() 源 Agent → 按 labels + trigger 过滤（managed=true 永远跳过；无效策略也读得出 trigger）
   ├─ 策略无效 → 工作区有变化才写 ERROR 卡片（§3），结束；策略有效 → 之前的错误卡标为“已修复”
   └─ classify(outcome) → 按 on_outcome 分派（turn-outcomes.md）：
@@ -405,12 +405,15 @@ CREATE INDEX gate_runs_child ON gate_runs(child_agent_id);
 CREATE INDEX gate_runs_source_status ON gate_runs(source_agent_id, status);
 -- 每一轮的子 Agent 在创建前登记，旧轮次子 Agent 的迟到事件也能识别为 managed
 CREATE TABLE gate_children (child_agent_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, round INTEGER NOT NULL);
--- 未通过的改动（被 SUPERSEDED / NEEDS_HUMAN 的 run、被用户停止的轮次），交给该 Agent 下一个被检查的轮次（§4.1）
-CREATE TABLE carries (agent_id TEXT PRIMARY KEY, repo_root TEXT NOT NULL, base_tree TEXT NOT NULL,
-                      request_text TEXT NOT NULL, rounds_used INTEGER NOT NULL DEFAULT 0, checked_tree TEXT,
-                      created_at INTEGER NOT NULL);
--- 任务链与 answerer 子 Agent，见 turn-outcomes.md §4
-CREATE TABLE chains (agent_id TEXT PRIMARY KEY, chain_id TEXT NOT NULL UNIQUE, ...);
+-- 每个源 Agent 一行，表示它当前的任务（completion-supervisor.md §18 第 2 步的第一部分）。三部分共用任务范围
+-- （repo_root、base_tree、request_text、rounds_used），各自结束：
+--   turn_json / turn_at：turn_started 冻结的策略和基线（内存 pending 的副本），插件重载或 daemon 重启后该轮仍按原基线检查
+--   carried_at / checked_tree：未通过的改动（被 SUPERSEDED / NEEDS_HUMAN 的 run、被用户停止的轮次），交给下一个被检查的轮次（§4.1）
+--   chain_id 及 retries、answers、next_retry_at、answer_*、card_json、card_seq、policy_json 等：任务链与代答（turn-outcomes.md §4）
+-- 三部分都空了，这一行就删除。旧版的 chains、carries、turn_snapshots 表在启动时导入并删除。
+CREATE TABLE tasks (agent_id TEXT PRIMARY KEY, repo_root TEXT, base_tree TEXT, request_text TEXT,
+                    rounds_used INTEGER NOT NULL DEFAULT 0, checked_tree TEXT, carried_at INTEGER,
+                    chain_id TEXT UNIQUE, chain_created_at INTEGER, ..., turn_json TEXT, turn_at INTEGER, ...);
 CREATE TABLE chain_children (child_agent_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, chain_id TEXT NOT NULL);
 -- 每个 Agent 最后一张配置错误卡，策略恢复有效后标为“已修复”（§3）
 CREATE TABLE config_errors (agent_id TEXT PRIMARY KEY, card_id TEXT NOT NULL, error TEXT NOT NULL);
@@ -418,12 +421,7 @@ CREATE TABLE config_errors (agent_id TEXT PRIMARY KEY, card_id TEXT NOT NULL, er
 
 旧版 ledger 缺少的列在启动时用 `ALTER TABLE … ADD COLUMN` 补上。
 
-```sql
--- turn_started 冻结的策略和基线（内存 pending 的副本），插件重载或 daemon 重启后该轮仍按原基线检查；24 小时过期
-CREATE TABLE turn_snapshots (agent_id TEXT PRIMARY KEY, snapshot_json TEXT NOT NULL, created_at INTEGER NOT NULL);
-```
-
-在 claim 之前，`turn_started` 到 `turn_ended` 之间的策略快照同时放在内存 `pending` 和 `turn_snapshots` 里。hook 本身不会重放，但一轮可能跨越插件重载或 daemon 重启：只存内存时，重启后 `turn_ended` 找不到基线，这一轮的改动会不经检查地落进下一轮的基线（786b759 修复）。
+在 claim 之前，`turn_started` 到 `turn_ended` 之间的策略快照同时放在内存 `pending` 和 `tasks.turn_json` 里。hook 本身不会重放，但一轮可能跨越插件重载或 daemon 重启：只存内存时，重启后 `turn_ended` 找不到基线，这一轮的改动会不经检查地落进下一轮的基线（786b759 修复）。
 
 ## 9. 恢复与对账
 
