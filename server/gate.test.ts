@@ -1342,6 +1342,22 @@ describe("version 3: the decider answers after every turn that did work", () => 
     assert.equal(fake.sent.length, 0);
   });
 
+  test("after Stop auto-answering, turns come to you until you resume it", async () => {
+    v3();
+    await sourceTurn({ change: edit });
+    const chainId = outcome().chainId;
+    await gate.stopAnswering(chainId, fake.paseo);
+    await gate.idle();
+    await sourceTurn({ text: "more", messageId: "u2", change: () => writeFileSync(path.join(repo, "a.txt"), "x\n") });
+    assert.equal(role("decider").length, 1, "no decider while stopped");
+    assert.equal(outcome().state, "needs_user");
+    assert.equal(outcome().canResume, true);
+    await gate.stopAnswering(chainId, fake.paseo, true);
+    await gate.idle();
+    await sourceTurn({ text: "go", messageId: "u3", change: () => writeFileSync(path.join(repo, "a.txt"), "y\n") });
+    assert.equal(role("decider").length, 2, "answered again after resuming");
+  });
+
   test("a version 3 policy error names the field", async () => {
     writePolicy({ version: 3, supervision: { bogus: 1 } });
     await sourceTurn({ change: edit });

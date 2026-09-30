@@ -204,7 +204,7 @@ Every turn of a gated agent is sorted into a category, and `on_outcome` in the p
 - Rules for the answerer, such as "Language and tooling choices are yours to make.", go in `agents.answerer.instructions`.
 - The plugin never waits forever: every agent has a `timeout_minutes`, see [above](#choosing-the-agents).
 - Answers are sent as `[post-turn gate answered on your behalf]` and stay visible in the timeline.
-- The outcome card has a **Stop auto-answering** button. Each new question, failure or retry of a task gets a new card at the current timeline position; the previous one is closed.
+- The outcome card has a **Stop auto-answering** button, and a **Resume auto-answering** button once it is stopped. Each new question, failure or retry of a task gets a new card at the current timeline position; the previous one is closed.
 - A task that spans several turns (answered questions, retries) is reviewed as a whole, starting from its first turn.
 
 - **Which turns are gated:** root agents, and sub-agents labelled `post-turn-gate.target=true`. A finished turn gets a check only if its task changed the working tree. A stop that asks you something is auto-answered if the task changed files or did work (tool calls) before asking; a plain chat question is left to you. Failed turns are always reported or retried.

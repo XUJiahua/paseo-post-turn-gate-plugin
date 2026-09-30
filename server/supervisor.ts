@@ -13,7 +13,7 @@ export type SupervisorEvent =
   | { type: "permission_resolved"; event: PluginLifecycleEvents["agent.permission_resolved"] }
   | { type: "reconcile" };
 
-export type SupervisorControl = { taskId: string; action: "stop_answering" };
+export type SupervisorControl = { taskId: string; action: "stop_answering" | "resume_answering" };
 
 export interface CompletionSupervisor {
   /** Enqueues and returns at once, keeping every hook far below Paseo's 30s hook timeout. */
@@ -61,9 +61,9 @@ export function createSupervisor(options: SupervisorOptions): CompletionSupervis
           return gate.reconcile(paseo);
       }
     },
-    control({ taskId }, paseo) {
+    control({ taskId, action }, paseo) {
       capture(paseo);
-      return gate.stopAnswering(taskId, paseo);
+      return gate.stopAnswering(taskId, paseo, action === "resume_answering");
     },
     idle: () => gate.idle(),
     async close() {

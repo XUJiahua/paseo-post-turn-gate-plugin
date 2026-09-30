@@ -74,11 +74,12 @@ export function OutcomeCard({ item, theme }: PluginTimelineItemProps<OutcomeCard
   }
   if (data.state === "needs_user" || (data.state === "notice" && data.category !== "done")) statusStyle = styles.danger;
 
-  async function onStop() {
+  async function onStop(resume = false) {
     setStopping(true);
     setError(null);
     try {
-      await stop({ chainId: data.chainId });
+      await stop({ chainId: data.chainId, ...(resume ? { resume: true } : {}) });
+      setStopping(false);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
       setStopping(false);
@@ -134,6 +135,20 @@ export function OutcomeCard({ item, theme }: PluginTimelineItemProps<OutcomeCard
             onPress={() => void onStop()}
           >
             <Text style={styles.denyText}>Stop auto-answering</Text>
+          </Pressable>
+        </View>
+      ) : null}
+      {data.canResume ? (
+        <View style={styles.actions}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Resume auto-answering for this task"
+            accessibilityState={{ disabled: stopping }}
+            disabled={stopping}
+            style={styles.allow}
+            onPress={() => void onStop(true)}
+          >
+            <Text style={styles.allowText}>Resume auto-answering</Text>
           </Pressable>
         </View>
       ) : null}

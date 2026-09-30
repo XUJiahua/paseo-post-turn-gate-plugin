@@ -12,8 +12,8 @@ export default function contribute(server: PluginServerContext) {
   server.on("agent.permission_requested", (event, { paseo }) => supervisor.accept({ type: "permission_requested", event }, paseo));
   server.on("agent.permission_resolved", (event, { paseo }) => supervisor.accept({ type: "permission_resolved", event }, paseo));
 
-  server.handle(stopAnsweringRpc, async ({ chainId }, { paseo }) => ({
-    stopped: await supervisor.control({ taskId: chainId, action: "stop_answering" }, paseo),
+  server.handle(stopAnsweringRpc, async ({ chainId, resume }, { paseo }) => ({
+    stopped: await supervisor.control({ taskId: chainId, action: resume ? "resume_answering" : "stop_answering" }, paseo),
   }));
 
   return async () => {

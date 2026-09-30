@@ -153,7 +153,7 @@ export interface Gate {
   onTurnEnded(event: TurnEnded, paseo: Paseo): void;
   onPermission(event: PermissionRequested | PermissionResolved, paseo: Paseo): void;
   /** Stops auto-answering for a task chain (card button). */
-  stopAnswering(chainId: string, paseo: Paseo): Promise<boolean>;
+  stopAnswering(chainId: string, paseo: Paseo, resume?: boolean): Promise<boolean>;
   /** Clears retry timers. */
   close(): void;
   /** Advances unfinished runs from ledger state (startup recovery and timeouts). */
@@ -882,6 +882,7 @@ export function createGate(options: GateOptions): Gate {
       permission: null,
       decider: Boolean((JSON.parse(chain.policy_json) as Policy).supervision),
       checks: null,
+      canResume: false,
     };
   }
 
@@ -1413,9 +1414,17 @@ export function createGate(options: GateOptions): Gate {
     log(`answered for ${owner.agentId} (${attempt})`);
   }
 
-  async function stopAnswering(chainId: string, paseo: Paseo): Promise<boolean> {
+  async function stopAnswering(chainId: string, paseo: Paseo, resume = false): Promise<boolean> {
     const chain = ledger.chainById(chainId);
     if (!chain) return false;
+    if (resume) {
+      const resumed = ledger.updateChain(chain.agent_id, { stop_answering: 0 }, now())!;
+      await publishChainCard(paseo, resumed, {
+        canResume: false,
+        message: "Auto-answering resumed: the agent's next turn is answered for you again.",
+      });
+      return true;
+    }
     let current = ledger.updateChain(chain.agent_id, { stop_answering: 1 }, now())!;
     const wasAnswering = current.answer_child_id !== null || current.answer_at !== null || current.round_json !== null;
     if (wasAnswering) current = await cancelChainWork(paseo, current);
@@ -1423,6 +1432,7 @@ export function createGate(options: GateOptions): Gate {
       canStopAnswering: false,
       permission: null,
       ...(wasAnswering ? { state: "stopped" as const } : {}),
+      canResume: true,
       message: "Auto-answering stopped for this task; the agent's questions come to you.",
     });
     return true;
@@ -1484,7 +1494,11 @@ export function createGate(options: GateOptions): Gate {
     const signal =
       category === "awaiting_user" ? detail : FAILURES.has(category) ? `the turn failed (${category}): ${truncate(detail ?? "no details", 600)}` : null;
     const handOff = (reason: string) => roundNeedsUser(paseo, chain, replyTail(reply), reason);
-    if (chain.stop_answering) return handOff("auto-answering was stopped for this task");
+    if (chain.stop_answering) {
+      await roundNeedsUser(paseo, chain, replyTail(reply), "auto-answering was stopped for this task");
+      await publishChainCard(paseo, ledger.chain(task.agentId) ?? chain, { canResume: true });
+      return;
+    }
     if (sendsOf(chain) >= supervision.budget.max_auto_sends) {
       return handOff(`the task used its ${supervision.budget.max_auto_sends} automatic messages`);
     }
@@ -2304,11 +2318,11 @@ export function createGate(options: GateOptions): Gate {
         }
         await reconcileChains(paseo);
       }),
-    stopAnswering: (chainId, paseo) =>
+    stopAnswering: (chainId, paseo, resume) =>
       new Promise((resolve) =>
         enqueue("stop answering", async () => {
           try {
-            resolve(await stopAnswering(chainId, paseo));
+            resolve(await stopAnswering(chainId, paseo, resume));
           } catch (error) {
             resolve(false);
             throw error;

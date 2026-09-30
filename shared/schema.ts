@@ -425,11 +425,14 @@ export const outcomeCardSchema = z.object({
   decider: z.boolean().default(false),
   /** Version 3: the checks' results the decider worked from. */
   checks: z.string().nullable().default(null),
+  /** Auto-answering was stopped for the task; the card offers to resume it. */
+  canResume: z.boolean().default(false),
 });
 export type OutcomeCard = z.output<typeof outcomeCardSchema>;
 
 export const stopAnsweringRpc = defineRpc({
   name: "post-turn-gate.stop-answering",
-  input: z.object({ chainId: z.string() }),
+  /** resume: turn auto-answering back on for the task (the card's Resume button). */
+  input: z.object({ chainId: z.string(), resume: z.boolean().optional() }),
   output: z.object({ stopped: z.boolean() }),
 });
