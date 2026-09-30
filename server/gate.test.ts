@@ -1087,6 +1087,8 @@ describe("version 3: the decider answers after every turn that did work", () => 
   test("done with changes: checks run alongside the plan, and a PASS completes the task without a message", async () => {
     v3();
     await sourceTurn({ change: edit });
+    assert.equal(fake.cardAppends.filter((item) => !item.id.startsWith("post-turn-gate:outcome:")).length, 0, "one card per round: no check card");
+    assert.match(outcome().checks, /Checks running: review…/);
     assert.equal(role("reviewer").length, 1, "the checks start at once");
     assert.equal(role("decider").length, 1, "the decider plans at the same time");
     await childTurn(role("decider")[0].agentId, PLAN({}));
@@ -1289,6 +1291,23 @@ describe("version 3: the decider answers after every turn that did work", () => 
     await sourceTurn({ agentId: "second", change: () => writeFileSync(path.join(repo, "c.txt"), "x\n") });
     assert.match(role("decider").at(-1)!.prompt, /DECIDER RULE/);
     assert.doesNotMatch(role("decider").at(-1)!.prompt, /ANSWERER RULE/);
+  });
+
+  test("a checker's risky permission request is answered on the round card", async () => {
+    v3();
+    await sourceTurn({ change: edit });
+    const reviewer = role("reviewer")[0].agentId;
+    await childTurn(role("decider")[0].agentId, PLAN({}));
+    gate.onPermission(
+      {
+        agent: hookAgent(reviewer, SOURCE),
+        request: { id: "p1", provider: "kiro", name: "shell", kind: "tool", title: "git push", detail: { type: "unknown", command: "git push" } },
+      } as never,
+      fake.paseo,
+    );
+    await gate.idle();
+    assert.equal(outcome().permission?.agentId, reviewer);
+    assert.match(outcome().checks, /waiting for your permission/);
   });
 
   test("a version 3 policy error names the field", async () => {

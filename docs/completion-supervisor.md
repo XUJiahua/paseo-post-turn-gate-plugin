@@ -480,7 +480,7 @@ decider 协议 v1 的实现（`server/gate.ts` “decision rounds” 一节）�
 v1 与本设计的差异，后续步骤处理：
 
 - decider 的两个阶段是两个子 Agent，而不是同一个子 Agent 收到第二条消息：Paseo 的 `send()` 不接受 `outputSchema`，第二阶段拿不到结构化输出。代价是汇总阶段要重新读一遍上下文。
-- 检查 run 仍有自己的卡片，一轮在时间线上是两张卡（检查卡 + 决策卡）。检查者的权限按钮在检查卡上，合并需要把它们搬到决策卡。
+- 一轮一张卡：v3 的检查 run 不再发布自己的卡片，决策卡显示检查进度（含检查者 id）、结论、被拒绝的请求，以及检查者上交的权限按钮；decider 运行时它自己的请求优先占用按钮位置。
 - 工作区没变化时：主 Agent 说完成就结束；停下提问但本轮和任务都没做过工作时不启动 decider（沿用 v2 预筛）。
 - 墙钟包含等待用户的时间；进展只比较 tree，不比较 findings（均标了 `ponytail:`）。
 - `post-turn-gate-init` 默认仍生成 v2；`--supervise` 生成 v3（含 `decider.md` 模板）。等一轮一张卡完成后再改默认值。
@@ -490,7 +490,7 @@ v1 与本设计的差异，后续步骤处理：
 - crash、network、rate_limited 的机械重试用完后，以及未识别的 `error`，交给 decider（信号写进 prompt：`the turn failed (<类别>): <错误>`），由它决定回复“继续”还是交给用户；quota、context 耗尽仍直接找人。拒答由 decider 的计划（`refused`）处理。
 - 主 Agent 对 FAIL 回复但没改文件（反驳）时，不重跑检查：decider 读到仍然有效的 FAIL 结果，可以坚持修改或交给用户；它判 `done` 会被护栏拒绝，检查者看不到反驳。你发过消息后不复用旧结果。
 
-尚未做：一轮一张卡（检查卡与决策卡合并）、按工作区分队列、检查与 decider 模块从 `gate.ts` 拆分。
+尚未做：按工作区分队列、检查与 decider 模块从 `gate.ts` 拆分。
 
 ## 20. 已定的默认决策
 

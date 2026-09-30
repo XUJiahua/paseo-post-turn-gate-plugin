@@ -348,6 +348,8 @@ export function createGate(options: GateOptions): Gate {
   }
 
   async function publishCard(paseo: Paseo, run: Run): Promise<void> {
+    // Version 3: the round's card shows the checks (one card per decision round).
+    if ((JSON.parse(run.policy_json) as Policy).supervision) return publishRoundChecks(paseo, run);
     await paseo.agents.ref(run.source_agent_id).timeline.append({
       type: "plugin",
       // Keep updates for one round in place, but start each retry round at the current timeline position.
@@ -1535,10 +1537,26 @@ export function createGate(options: GateOptions): Gate {
     };
   }
 
+  /** Refreshes the round card with a run's progress and its checker's pending permission request. */
+  async function publishRoundChecks(paseo: Paseo, run: Run): Promise<void> {
+    const chain = ledger.chain(run.source_agent_id);
+    const round = chain ? roundOf(chain) : null;
+    if (!chain || round?.runId !== run.run_id) return;
+    const denied = blockedOf(run).flatMap((entry) => entry.titles);
+    await publishChainCard(paseo, chain, {
+      checks: [checksLine(run), denied.length ? `Denied: ${truncate(denied.join("; "), 300)}` : null].filter(Boolean).join("\n"),
+      // The decider's own request takes the card's permission slot while it runs.
+      ...(chain.answer_child_id ? {} : { permission: waiting.get(run.run_id) ?? null }),
+    });
+  }
+
   function checksLine(run: Run): string {
     const records = (JSON.parse(run.rounds_json) as RoundRecord[]).filter((record) => record.round === run.round);
     const done = records.map((record) => `${record.check} ${record.verdict ?? "?"}${record.reason ? ` (${record.reason})` : ""}`);
-    return isTerminal(run.status) ? `Checks: ${done.join(", ") || run.status}` : `Checks running: ${[...done, `${checkOf(run)}…`].join(", ")}`;
+    const running = [...done, `${checkOf(run)}…${waiting.has(run.run_id) ? " (waiting for your permission)" : ""}`];
+    // A checker is named with its id so `paseo logs` can find it; the card has no link to it (design.md V16).
+    const child = run.child_agent_id && !isTerminal(run.status) ? ` · ${checkOf(run)} agent ${run.child_agent_id}` : "";
+    return isTerminal(run.status) ? `Checks: ${done.join(", ") || run.status}` : `Checks running: ${running.join(", ")}${child}`;
   }
 
   /** The checks' results as the decider reads them. */

@@ -94,7 +94,7 @@ export function OutcomeCard({ item, theme }: PluginTimelineItemProps<OutcomeCard
         <Text style={styles.title}>{title}</Text>
         <Text style={statusStyle}>{status}</Text>
       </View>
-      {data.permission ? <PermissionPrompt permission={data.permission} styles={styles} who={who} /> : null}
+      {data.permission ? <PermissionPrompt permission={data.permission} styles={styles} who={data.decider && data.permission.agentId !== data.childAgentId ? "Checker" : who} /> : null}
       {data.question ? (
         <Text style={styles.body} selectable>
           Agent asked: {data.question}
