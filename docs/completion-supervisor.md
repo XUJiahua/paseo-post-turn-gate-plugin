@@ -479,6 +479,7 @@ decider 协议 v1 的实现（`server/gate.ts` “decision rounds” 一节）�
 
 - 一轮一张卡之后（`f9ea91a`）：“给 add.js 加 div，只写函数”：检查 PASS，decider 判定完成，没有发送任何消息，任务结束。“给 add.js 加 mul”，仓库的 `verifier.md` 规定每个导出函数都要有测试：verify FAIL → decider 发出修复要求 → 主 Agent 补了 mul 的测试 → verify 又因为 div 没有测试 FAIL → decider 再发一次 → PASS → 完成。全程 2 条自动消息，没有人参与。
 - 检查者的 summary 曾出现不是请求语言的情况（英文请求得到西班牙语 summary）。现在按请求文字判断语言（中日韩俄按字符，英文按常见词），能判断时在 prompt 里直接写出语言名；判断不了时退回“请求所用的语言”。
+- 语言修正之后（`9d3f6f9`）：中文请求“在 add.js 里加 pow 并补测试”，verify、review 的 summary 和 decider 的理由都是中文；检查 PASS 后任务自动结束。
 
 v1 与本设计的差异，后续步骤处理：
 
