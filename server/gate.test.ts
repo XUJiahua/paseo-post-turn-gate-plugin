@@ -469,6 +469,16 @@ describe("dispatch and report", () => {
     assert.match(card.reviewerChanges ?? "", /note\.txt/);
     assert.match(card.error ?? "", /verdict was discarded/);
     assert.equal(readFileSync(path.join(repo, "note.txt"), "utf8"), "x\n", "nothing is reverted");
+
+    // The user reverts the checker's file and messages the agent: the whole task is checked again.
+    const firstPrompt = fake.created[0].prompt as string;
+    rmSync(path.join(repo, "note.txt"));
+    await sourceTurn({ text: "继续", messageId: "m2" });
+    assert.equal(fake.created.length, 2);
+    const base = (prompt: string) => /diff (\w+) /.exec(prompt)?.[1];
+    assert.ok(base(firstPrompt));
+    assert.equal(base(fake.created[1].prompt), base(firstPrompt), "checked from the original baseline");
+    assert.match(fake.created[1].prompt, /Implement feature X[\s\S]*Follow-up from the user: 继续/);
   });
 
   test("a PASS that lists a HIGH finding counts as FAIL", async () => {

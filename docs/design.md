@@ -300,7 +300,7 @@ Reviewer 不强制只读，与源 Agent 采用相同的权限模型：
 
 - **能力**：继承源 Agent 的 mode，Verify 可以正常运行构建和测试。构建产物通常位于被 git 忽略的目录，不计入 tree，不会误报。
 - **约束**：prompt 中明确要求不要修改文件。
-- **检测**：review 前后对比 tree（§4.4，K12 已在 kiro 上实测）。发生变化时 verdict 作废：改了代码的检查者不再独立（可能自己“修好”再报 PASS），fix 模式下这些改动还会算进源 Agent 的下一轮 diff。run 转 `NEEDS_HUMAN`，卡片显示 diffstat；插件不回滚，由用户决定保留哪些改动。未被 git 忽略的构建产物也会触发这一条，应当加进 `.gitignore`。
+- **检测**：review 前后对比 tree（§4.4，K12 已在 kiro 上实测）。发生变化时 verdict 作废：改了代码的检查者不再独立（可能自己“修好”再报 PASS），fix 模式下这些改动还会算进源 Agent 的下一轮 diff。run 转 `NEEDS_HUMAN`，卡片显示 diffstat；插件不回滚，由用户决定保留哪些改动。同时写入 carry（同 SUPERSEDED），用户处理完后给源 Agent 发任意一条消息，下一轮就从原始基线重新检查整个任务。未被 git 忽略的构建产物也会触发这一条，应当加进 `.gitignore`。
   - Answerer 同理：派发时记录 tree，结束时 tree 变了就不发送答案，把问题交给用户。
 - **权限请求**：默认自动处理（`agents.<role>.permissions: "auto"`）。引入 gate 的目的就是减少人工反复确认，因此：
   - 常规工具调用（读文件、搜索、构建、跑测试、仓库内编辑）由插件以 `allow_once` 自动批准，不留长期授权；

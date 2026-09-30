@@ -348,13 +348,18 @@ export function createGate(options: GateOptions): Gate {
 
   async function supersede(paseo: Paseo, run: Run): Promise<Run> {
     const next = await transition(paseo, run, { status: "SUPERSEDED" });
+    carryOver(run);
+    return next;
+  }
+
+  /** Hands a run's unchecked changes to the source agent's next gated turn (see applyCarry). */
+  function carryOver(run: Run): void {
     ledger.setCarry({ agent_id: run.source_agent_id, repo_root: run.repo_root, base_tree: run.base_tree, request_text: run.request_text }, now());
     const carried = taskConcurrent.get(run.source_agent_id) ?? new Set<string>();
     for (const id of concurrentOf(run)) carried.add(id);
     if (carried.size > 0) taskConcurrent.set(run.source_agent_id, carried);
     // A turn that already started (its pending snapshot exists) takes the carry now, otherwise the next one does.
     applyCarry(run.source_agent_id);
-    return next;
   }
 
   // ---------- policy ----------
@@ -530,13 +535,17 @@ export function createGate(options: GateOptions): Gate {
     const reviewerChanges = afterTree === run.end_tree ? null : await diffStat(run.repo_root, run.end_tree, afterTree);
     if (reviewerChanges) {
       // A checker that edits the tree is no longer independent (it may have "fixed" what it then passed), and
-      // the edits would count as the source agent's work in the next round. Nothing is reverted: the user decides.
+      // the edits would count as the source agent's work in the next round. Nothing is reverted: the user
+      // decides, and the agent's next turn checks the whole task again from the original baseline.
       const who = concurrent.length > 0 ? `the ${check} agent or another agent (${shortIds(concurrent)})` : `the ${check} agent`;
       await transition(paseo, run, {
         status: "NEEDS_HUMAN",
         reviewer_changes: reviewerChanges,
-        error: `The working tree changed while ${who} ran, so its verdict was discarded. Nothing was reverted; look at the changes below and decide what to keep.`,
+        error:
+          `The working tree changed while ${who} ran, so its verdict was discarded. Nothing was reverted. ` +
+          "Keep or revert the changes below yourself, then send the agent a message: its next turn checks the whole task again.",
       });
+      carryOver(run);
       return archiveChild(paseo, childAgentId);
     }
     const verdict = parseVerdict(latestAssistantText(timeline));
