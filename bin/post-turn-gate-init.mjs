@@ -52,6 +52,27 @@ const DEFAULT_POLICY = {
   },
 };
 
+const role = (name, timeout) => ({
+  profile: null,
+  instructions_file: `.paseo/post-turn-gate/${name}.md`,
+  permissions: "auto",
+  timeout_minutes: timeout,
+  permission_wait_minutes: 5,
+});
+
+// Version 3 (preview): a decider agent answers for you after every turn that did work.
+const SUPERVISED_POLICY = {
+  version: 3,
+  trigger: "root_and_opt_in",
+  supervision: {
+    checks: ["verify", "review"],
+    speculative_checks: true,
+    reply_delay_seconds: 60,
+    budget: { max_auto_sends: 12, max_retries: 3, max_no_progress_rounds: 2, max_minutes: 120 },
+  },
+  agents: { decider: role("decider", 10), verifier: role("verifier", 30), reviewer: role("reviewer", 30) },
+};
+
 const USAGE = `Usage: post-turn-gate-init [options]
 
 Options:
@@ -59,6 +80,8 @@ Options:
                    verify (the change delivers the request), e.g. verify,review
   --fix <rounds>   fix rounds after a failed check, 1-5 (default: 2)
   --report         report a failed check instead of sending it back to the agent
+  --supervise      preview: write a version 3 policy, where a decider agent answers for you after every turn
+                   that did work (--check applies; default verify,review)
   --dir <path>     repository to write into (default: current directory; the git root is used)
   --force          overwrite an existing policy file (role rules files are never overwritten)
   --stdout         print the policy instead of writing files
@@ -92,6 +115,18 @@ project's acceptance criteria, authoritative documentation, test commands, and r
 - Require observable evidence for behavior changes instead of relying only on a code diff.
 - Mark missing evidence as inconclusive or a finding; never silently assume a requirement is satisfied.
 `,
+  decider: `<!--
+Decider rules for this repository (.paseo/post-turn-gate/decider.md).
+The Markdown below is active and is appended to the built-in decider prompt. The decider replies to the agent
+for you after each turn; record what it may decide for this project and what must always come to you.
+-->
+# Repository decider instructions
+
+- Base replies on repository-local guidance and the project's existing architecture and conventions.
+- Prefer existing dependencies, tools, and patterns over introducing a new project-wide choice.
+- Choose the smallest reversible option that stays within the original request.
+- Escalate when the repository does not determine the answer or the choice changes product behavior.
+`,
   answerer: `<!--
 Answerer rules for this repository (.paseo/post-turn-gate/answerer.md).
 The Markdown below is active and is appended to the built-in answerer prompt. Edit it to record decisions
@@ -113,7 +148,8 @@ function fail(message) {
 
 const { values } = parseArgs({
   options: {
-    check: { type: "string", default: "review" },
+    check: { type: "string" },
+    supervise: { type: "boolean", default: false },
     fix: { type: "string" },
     report: { type: "boolean", default: false },
     dir: { type: "string", default: process.cwd() },
@@ -144,9 +180,13 @@ if (values["agent-prompt"]) {
   process.exit(0);
 }
 
-const checks = values.check.split(",").map((check) => check.trim());
+const checkText = values.check ?? (values.supervise ? "verify,review" : "review");
+const checks = checkText.split(",").map((check) => check.trim());
 if (!checks.every((check) => check === "review" || check === "verify") || new Set(checks).size !== checks.length) {
-  fail(`--check takes review and/or verify once each, got "${values.check}"\n\n${USAGE}`);
+  fail(`--check takes review and/or verify once each, got "${checkText}"\n\n${USAGE}`);
+}
+if (values.supervise && (values.report || values.fix !== undefined)) {
+  fail("--supervise replaces --fix and --report: the decider handles failed checks within the task budget");
 }
 if (values.report && values.fix !== undefined) fail("--fix and --report exclude each other");
 const rounds = values.fix === undefined ? null : Number(values.fix);
@@ -154,10 +194,14 @@ if (rounds !== null && (!Number.isInteger(rounds) || rounds < 1 || rounds > 5)) 
   fail(`--fix must be an integer from 1 to 5, got "${values.fix}"`);
 }
 
-const policy = JSON.parse(JSON.stringify(DEFAULT_POLICY));
-policy.on_outcome.done = checks;
-if (values.report) policy.on_fail = "report";
-if (rounds !== null) policy.on_fail.fix.max_rounds = rounds;
+const policy = JSON.parse(JSON.stringify(values.supervise ? SUPERVISED_POLICY : DEFAULT_POLICY));
+if (values.supervise) {
+  policy.supervision.checks = checks;
+} else {
+  policy.on_outcome.done = checks;
+  if (values.report) policy.on_fail = "report";
+  if (rounds !== null) policy.on_fail.fix.max_rounds = rounds;
+}
 const text = `${JSON.stringify(policy, null, 2)}\n`;
 
 if (values.stdout) {
@@ -176,7 +220,9 @@ try {
 }
 
 const files = [[POLICY_PATH, text]];
-for (const role of ROLES) files.push([policy.agents[role].instructions_file, TEMPLATES[role]]);
+for (const name of values.supervise ? ["reviewer", "verifier", "decider"] : ROLES) {
+  files.push([policy.agents[name].instructions_file, TEMPLATES[name]]);
+}
 // Role rules are the project's own work: an existing rules file is always kept. Only the policy is
 // regenerated, and only with --force. Check first, so a refusal never leaves a half-written setup.
 if (existsSync(path.join(root, POLICY_PATH)) && !values.force) fail(`already exists: ${POLICY_PATH}; use --force to overwrite it`);

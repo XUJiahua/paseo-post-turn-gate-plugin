@@ -85,6 +85,8 @@ export interface Chain {
   no_progress: number;
   /** Version 3: start of the automation budget (the chain's start, or your last message in it). */
   budget_since: number | null;
+  /** Version 3: the last run that checked this task; a later round on the same tree reuses its results. */
+  last_run_id: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -129,6 +131,7 @@ const CHAIN_COLUMNS = [
   "last_fingerprint",
   "no_progress",
   "budget_since",
+  "last_run_id",
 ] as const;
 
 /** Automation state of a chain, cleared when a chain starts or ends. */
@@ -152,6 +155,7 @@ const CHAIN_RESET = {
   last_fingerprint: null,
   no_progress: 0,
   budget_since: null,
+  last_run_id: null,
 } as const;
 
 /**
@@ -306,6 +310,7 @@ export class Ledger {
         last_fingerprint TEXT,
         no_progress INTEGER NOT NULL DEFAULT 0,
         budget_since INTEGER,
+        last_run_id TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -348,6 +353,7 @@ export class Ledger {
       last_fingerprint: "TEXT",
       no_progress: "INTEGER NOT NULL DEFAULT 0",
       budget_since: "INTEGER",
+      last_run_id: "TEXT",
     });
     this.importOldTables();
   }

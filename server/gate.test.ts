@@ -1188,6 +1188,47 @@ describe("version 3: the decider answers after every turn that did work", () => 
     assert.equal(outcome().state, "resolved");
   });
 
+  test("failures: retries back off, then the decider takes over; quota exhaustion stays yours", async () => {
+    v3({ budget: { max_retries: 1 } });
+    const network = { kind: "failed" as const, error: { message: "socket hang up ECONNRESET" } };
+    await sourceTurn({ change: edit, outcome: network, reply: "[System Error] socket hang up" });
+    assert.equal(outcome().state, "retry_scheduled");
+    assert.equal(role("decider").length, 0, "a mechanical retry needs no decider");
+    clock += 31_000;
+    gate.reconcile(fake.paseo);
+    await gate.idle();
+    assert.equal(fake.sent.length, 1);
+    await sourceTurn({ messageId: fake.sent[0].messageId, text: fake.sent[0].text, outcome: network, reply: "[System Error] socket hang up" });
+    assert.equal(role("decider").length, 1, "retries used up: the decider looks at it");
+    assert.match(role("decider")[0].prompt, /the turn failed \(network\)/);
+    await childTurn(role("decider")[0].agentId, PLAN({ assessment: "incomplete", workers: [], reply_now: { kind: "send", message: "Continue from where you left off." } }));
+    assert.equal(fake.sent.length, 2);
+
+    // An unrecognized error without file changes still goes to the decider.
+    await sourceTurn({ messageId: fake.sent[1].messageId, text: fake.sent[1].text, outcome: { kind: "failed", error: { message: "weird" } } });
+    assert.equal(role("decider").length, 2);
+
+    await sourceTurn({ text: "again", messageId: "u9", outcome: { kind: "failed", error: { message: "You've reached your monthly usage limit" } } });
+    assert.equal(role("decider").length, 2, "quota exhaustion is not the decider's");
+    assert.equal(outcome().category, "quota_exhausted");
+  });
+
+  test("a dispute without changes: the decider reads the standing FAIL and cannot complete the task", async () => {
+    v3();
+    await sourceTurn({ change: edit });
+    await childTurn(role("decider")[0].agentId, PLAN({}));
+    await childTurn(role("reviewer")[0].agentId, FAIL);
+    await childTurn(role("decider")[1].agentId, REPLY({ message: "Fix the off-by-one." }));
+    const fix = fake.sent[0];
+    await sourceTurn({ messageId: fix.messageId, text: fix.text, reply: "The off-by-one is intended by the spec." });
+    assert.equal(role("reviewer").length, 1, "the same tree is not checked again");
+    assert.match(role("decider")[2].prompt, /finished \(FAILED\)/);
+    assert.doesNotMatch(role("reviewer")[0].prompt, /intended by the spec/, "the checker never sees the dispute");
+    await childTurn(role("decider")[2].agentId, PLAN({ workers: ["review"] }));
+    await childTurn(role("decider")[3].agentId, REPLY({ kind: "done" }));
+    assert.equal(outcome().state, "needs_user", "only you can overrule a check");
+  });
+
   test("a turn that stopped early gets 'Continue.' at once; the checks are canceled", async () => {
     v3();
     await sourceTurn({ change: edit, reply: "Next I will add the tests." });

@@ -4,7 +4,7 @@ import path from "node:path";
 import { describe, test } from "node:test";
 import { classify, currentTurnItems, isCourtesyOffer, looksLikeQuestion, similarity, stopSignal } from "./outcome.ts";
 import { answerRisk } from "./permissions.ts";
-import { gateChecks, maxFixRounds, policySchema } from "../shared/schema.ts";
+import { gateChecks, maxFixRounds, policySchema, supervisionSchema } from "../shared/schema.ts";
 
 const user = (text: string) => ({ type: "user_message", text });
 const says = (text: string) => ({ type: "assistant_message", text });
@@ -231,6 +231,17 @@ describe("on_outcome schema", () => {
     assert.equal(chosen.on_outcome.network, "notify", "other fields keep their defaults");
     assert.throws(() => run("--fix", "0"), /Command failed/);
     assert.throws(() => run("--check", "review,review"), /Command failed/);
+  });
+
+  test("npm run init --supervise writes a version 3 policy with every default", () => {
+    const run = (...args: string[]) =>
+      JSON.parse(execFileSync(process.execPath, ["bin/post-turn-gate-init.mjs", "--stdout", "--supervise", ...args], { encoding: "utf8" }));
+    const written = run();
+    assert.equal(written.version, 3);
+    assert.deepEqual(written.supervision, supervisionSchema.parse({}));
+    assert.deepEqual(policySchema.parse(written), policySchema.parse({ version: 3 }), "the same policy as all defaults");
+    assert.deepEqual(run("--check", "review").supervision.checks, ["review"]);
+    assert.throws(() => run("--fix", "2"), /Command failed/);
   });
 
   test("the CLI prints a safe, repository-specific coding-Agent setup task", () => {

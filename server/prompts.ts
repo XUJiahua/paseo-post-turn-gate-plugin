@@ -332,7 +332,9 @@ Checks this round: ${input.checks}
   if (input.phase === "plan") {
     return `${head}
 Assess the agent's state: "done" (it says it finished), "incomplete" (it stopped early: cut off, "next I will…",
-open todos), "awaiting_user" (it asks a question or for a decision), "refused" (it declined the request).
+open todos, or its turn failed), "awaiting_user" (it asks a question or for a decision), "refused" (it declined
+the request). When the turn failed, reply "Continue from where you left off." if another try can help, and
+escalate when it needs something only the user can fix (credentials, a missing service, a broken environment).
 
 Plan the next step:
 - "workers": the checks your reply depends on. Keep the running checks when the agent says it is done or asks

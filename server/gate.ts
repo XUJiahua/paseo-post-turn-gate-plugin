@@ -1122,6 +1122,8 @@ export function createGate(options: GateOptions): Gate {
       // Version 3 backs off: 30s, 2min, 8min.
       const retry = supervision ? { ...action.retry, delay_seconds: action.retry.delay_seconds * 4 ** chain.retries } : action.retry;
       if (chain.retries < action.retry.max && withinBudget) return scheduleRetry(paseo, chain, base, retry);
+      // Version 3: once the mechanical retries are used up, the decider looks at the failure.
+      if (supervision) return startRound(paseo, task, category, detail, reply);
       await publishChainCard(paseo, chain, {
         ...base,
         state: "notice",
@@ -1132,6 +1134,8 @@ export function createGate(options: GateOptions): Gate {
       });
       return;
     }
+    // Version 3: an unrecognized error goes to the decider; quota and context exhaustion are yours (no retry helps).
+    if (task.policy.supervision && category === "error") return startRound(paseo, task, category, detail, reply);
     await publishChainCard(paseo, chain, { ...base, state: "notice", attempt: 0, maxAttempts: 0, nextRetryAt: null });
   }
 
@@ -1453,7 +1457,7 @@ export function createGate(options: GateOptions): Gate {
     const supervision = task.policy.supervision!;
     const endTree = await snapshotTree(task.repoRoot);
     const changed = endTree !== task.baseTree;
-    if (!changed && (category === "done" || !task.worked)) {
+    if (!changed && !FAILURES.has(category) && (category === "done" || !task.worked)) {
       log(`skip ${task.agentId}: working tree unchanged (${category})`);
       return endChain(paseo, task.agentId, { state: "resolved", message: "The task ended without changing files." });
     }
@@ -1471,7 +1475,8 @@ export function createGate(options: GateOptions): Gate {
       return endChain(paseo, task.agentId, { state: "resolved", category: "done", question: null, message: "Completed: the checks already passed on this tree." });
     }
     chain = await newCard(paseo, chain);
-    const signal = category === "awaiting_user" ? detail : null;
+    const signal =
+      category === "awaiting_user" ? detail : FAILURES.has(category) ? `the turn failed (${category}): ${truncate(detail ?? "no details", 600)}` : null;
     const handOff = (reason: string) => roundNeedsUser(paseo, chain, replyTail(reply), reason);
     if (chain.stop_answering) return handOff("auto-answering was stopped for this task");
     if (sendsOf(chain) >= supervision.budget.max_auto_sends) {
@@ -1489,8 +1494,14 @@ export function createGate(options: GateOptions): Gate {
       return handOff(`${noProgress + 1} rounds in a row ended without changing files`);
     }
     const seq = (roundOf(chain)?.seq ?? chain.card_seq) + 1;
-    let runId: string | null = null;
-    if (changed && !reused && supervision.speculative_checks) runId = await startGate(paseo, { ...task, turnKey: `${task.turnKey}:round:${seq}` }, endTree);
+    // The agent replied to the plugin without changing the checked tree (e.g. it disputes a finding): the results
+    // still stand and the decider reads them. After your message they may not cover what you asked, so they are not reused.
+    const last = chain.last_run_id && !task.userSpoke ? ledger.get(chain.last_run_id) : null;
+    let runId: string | null = last && last.end_tree === endTree && isTerminal(last.status) && last.status !== "SUPERSEDED" ? last.run_id : null;
+    if (!runId && changed && !reused && supervision.speculative_checks) {
+      runId = await startGate(paseo, { ...task, turnKey: `${task.turnKey}:round:${seq}` }, endTree);
+      if (runId) chain = ledger.updateChain(task.agentId, { last_run_id: runId }, now()) ?? chain;
+    }
     const round: Round = { seq, phase: "waiting", runId, reused, userSpoke: task.userSpoke ?? false, changed, endTree, reply, signal, plan: null, rechecked: false };
     chain = saveRound(ledger.chain(task.agentId) ?? chain, round);
     if (supervision.reply_delay_seconds === 0) return dispatchDecider(paseo, chain, "plan");
@@ -1676,6 +1687,7 @@ export function createGate(options: GateOptions): Gate {
     const latest = roundOf(current);
     if (!latest || latest.seq !== round.seq) return; // the round ended while the checks started (a failed start)
     current = saveRound(current, { ...latest, runId });
+    current = ledger.updateChain(chain.agent_id, { last_run_id: runId }, now()) ?? current;
     const run = ledger.get(runId)!;
     if (isTerminal(run.status)) await settleRound(paseo, current, run);
   }
