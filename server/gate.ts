@@ -1097,6 +1097,21 @@ export function createGate(options: GateOptions): Gate {
     const action = task.policy.on_outcome[category];
     if (category === "replaced") return; // its baseline was carried into the newer turn
     if (category === "user_canceled") {
+      // A stop is your decision, never the decider's: no round starts. Paseo only tells "canceled while idle", so
+      // the card does not claim who stopped it (a daemon shutdown or another client looks the same).
+      if (task.policy.supervision && !task.userSpoke && ledger.chain(task.agentId)) {
+        // You stopped a turn the plugin started (its reply): the task stays, so Stop auto-answering still works;
+        // your next message continues it. The chain keeps the baseline, so no carry is needed.
+        const chain = await newCard(paseo, saveRound(ensureChain(task), null));
+        await publishChainCard(paseo, chain, {
+          ...roundCard(chain, null),
+          state: "stopped",
+          message: "The turn started by the plugin's reply was stopped. Nothing more is sent until you write; stop auto-answering if the plugin was going the wrong way.",
+          canStopAnswering: !chain.stop_answering,
+          canResume: Boolean(chain.stop_answering),
+        });
+        return;
+      }
       // Stopping the agent does not accept what it changed: the changes stay in scope for its next gated turn.
       if ((await snapshotTree(task.repoRoot)) !== task.baseTree) {
         ledger.setCarry(
@@ -1111,7 +1126,7 @@ export function createGate(options: GateOptions): Gate {
           now(),
         );
       }
-      return endChain(paseo, task.agentId, { state: "stopped", message: "You stopped the agent." });
+      return endChain(paseo, task.agentId, { state: "stopped", message: "The turn was stopped." });
     }
     if (task.policy.supervision && !FAILURES.has(category)) return startRound(paseo, task, category, detail, reply);
     // A task that did nothing (a chat question, an explanation) is left alone: no checks, no answerer. One that

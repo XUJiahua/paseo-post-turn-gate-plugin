@@ -498,6 +498,8 @@ v1 与本设计的差异，后续步骤处理：
 - crash、network、rate_limited 的机械重试用完后，以及未识别的 `error`，交给 decider（信号写进 prompt：`the turn failed (<类别>): <错误>`），由它决定回复“继续”还是交给用户；quota、context 耗尽仍直接找人。拒答由 decider 的计划（`refused`）处理。
 - 主 Agent 对 FAIL 回复但没改文件（反驳）时，不重跑检查：decider 读到仍然有效的 FAIL 结果，可以坚持修改或交给用户；它判 `done` 会被护栏拒绝，检查者看不到反驳。你发过消息后不复用旧结果。
 
+用户停止：永远不启动 decider，停止是用户本人的决定。停止的是插件回复发起的那一轮时，任务链保留，卡片仍有 Stop auto-answering；停止的是用户自己的那一轮时，改动交给下一轮检查（carry）。卡片只写“这一轮被停止了”，因为 Paseo 分不出是用户、daemon 关闭还是别的客户端停的（需要上游的 `canceled.cause`）。
+
 卡片上的控制：`Stop auto-answering` 会取消进行中的一轮（包括正在跑的检查）；停止后卡片显示 `Resume auto-answering`，恢复后下一轮照常由 decider 处理。Pause/Replace 未实现：停止加恢复已覆盖暂停，Replace 等价于你发一条新请求。
 
 尚未做：

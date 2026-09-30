@@ -1366,6 +1366,30 @@ describe("version 3: the decider answers after every turn that did work", () => 
     assert.equal(role("decider").length, 2, "answered again after resuming");
   });
 
+  test("a stop is yours: no decider; stopping a turn the plugin started keeps the task and its Stop button", async () => {
+    v3();
+    const canceled = { kind: "canceled" as const, reason: "Interrupted" };
+    // Your own turn, stopped: no round, the changes stay in scope for your next message.
+    await sourceTurn({ change: edit, outcome: canceled });
+    assert.equal(role("decider").length, 0);
+    assert.equal(role("reviewer").length, 0);
+    await sourceTurn({ text: "go on", messageId: "u2" });
+    assert.equal(role("reviewer").length, 1, "the stopped turn's changes are checked with the next one");
+    await childTurn(role("decider")[0].agentId, PLAN({}));
+    await childTurn(role("reviewer")[0].agentId, FAIL);
+    await childTurn(role("decider")[1].agentId, REPLY({ message: "Fix the off-by-one." }));
+    // The plugin's fix turn, stopped by you.
+    await sourceTurn({ messageId: fake.sent[0].messageId, text: fake.sent[0].text, change: () => writeFileSync(path.join(repo, "a.txt"), "half\n"), outcome: canceled });
+    assert.equal(role("decider").length, 2, "no decider after a stop");
+    assert.equal(outcome().state, "stopped");
+    assert.equal(outcome().canStopAnswering, true, "you can still stop auto-answering");
+    await gate.stopAnswering(outcome().chainId, fake.paseo);
+    await gate.idle();
+    await sourceTurn({ text: "do it my way", messageId: "u3", change: () => writeFileSync(path.join(repo, "a.txt"), "mine\n") });
+    assert.equal(role("decider").length, 2, "stopped: your next turn is not answered for you");
+    assert.equal(outcome().state, "needs_user");
+  });
+
   test("a version 3 policy error names the field", async () => {
     writePolicy({ version: 3, supervision: { bogus: 1 } });
     await sourceTurn({ change: edit });
