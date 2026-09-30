@@ -32,11 +32,22 @@
 - **三条发送路径各自判断**：fix（要求 `idle`）、answer 和 retry（`idle` 或 `error`）分别“先 refresh、后 send”。Paseo 的 `send()` 会取消运行中的 turn（design.md V5），这个窗口只被缩小（宽限期、两步之间不 await），没有消除。
 - **预算互不相关**：修复轮次按任务计，代答次数和重试次数按链计，没有任务级总上限、墙钟上限或跨类型的无进展检测。
 - **并发只提示不隔离**：重叠检测只在内存里，重启前已在运行的 turn 看不到；检查者与源 Agent 共用工作目录。
+- **提问和检查只能串行**：Agent 做完改动后停下提问（例如“需要现在 commit 吗？”），任务先进 `chains` 等宽限期、跑 answerer、发答案，答案那一轮以 `done` 结束后才建 run 开始检查，卡片也分成两张。两套状态机不能同时持有一个任务；检查者与源 Agent 又共用目录，检查期间源 Agent 一改文件 verdict 就作废，所以 v2 也不能让它们重叠。答案那一轮没有改动工作区时（commit、确认、“继续”后什么都没改），这次检查审的是同一棵 tree，完全可以提前做。
 - **“完成”只有局部定义**：INCONCLUSIVE、`report` 模式的 FAILED 都是终态；工作区没变化的 turn 不检查，这对“只分析不改码”的任务是正确的，但也意味着没有统一的完成契约。
 
 ### 1.3 结论
 
 新能力应是一个独立的深模块 `CompletionSupervisor`：对外只有事件输入和生命周期控制，对内统一拥有任务状态、检查调度、继续决策、预算、持久化和所有自动发送。现有的 run、chain、carry、turn snapshot 合并为一条 Task 记录；`outcome.ts`、`prompts.ts`、`permissions.ts`、`reviewer.ts`、`git.ts` 作为内部模块原样复用，而不是继续扩张彼此交接的几套状态。
+
+与 v2 的关系：supervisor 替换的是编排层，不是检查能力。
+
+| | 处理方式 |
+| --- | --- |
+| 被替换 | `gate_runs`、`chains`、`carries`、`turn_snapshots` 及其交接逻辑 → 一个 Task 状态机；fix、answer、retry 三条发送路径 → 一个派发器 |
+| 原样复用 | `outcome.ts`、`prompts.ts`、`permissions.ts`、`reviewer.ts`、`git.ts`，卡片组件，策略中的 `trigger` 和 `agents` |
+| 新增 | 完成契约、任务级预算与无进展检测、Requirement Revision、Pause/Resume、提问期间的提前检查（§8.1）、按宿主能力提升的保证级别（§11.1） |
+
+在同等宿主能力下 supervisor 是 v2 的严格超集，v2 的行为是它的一种策略配置，因此可以直接覆盖现有实现，而不是与之并存。覆盖的前提见 §18：先功能对等再删除旧路径、v2 策略文件按原语义解释、升级时 ledger 中未结束的记录不能被新旧两套同时拥有发送权。
 
 ## 2. 目标与非目标
 
@@ -184,7 +195,7 @@ CompletionSupervisor ───────────────► TimelinePr
 | 状态 | 含义 |
 | --- | --- |
 | `SOURCE_RUNNING` | Source Agent 正在执行用户或监督器派发的 attempt。 |
-| `ASSESSING` | 分类 Source Agent 的结束原因并确定下一步；预筛命中提问时在此运行 answerer（含宽限期）。 |
+| `ASSESSING` | 分类 Source Agent 的结束原因并确定下一步；预筛命中提问时在此运行 answerer（含宽限期），工作区有改动时同时进行提前检查（§8.1）。 |
 | `CHECKING` | 持有 Workspace Lease，串行执行 completion/quality checks；隔离 worktree 可用时在其中运行，否则在原工作目录（§11.1）。 |
 | `READY_TO_CONTINUE` | 已生成继续动作，等待派发器发送（到期的宽限期或重试延迟）；`dispatch: "assisted"` 时等待用户人工提交。 |
 | `WAITING_USER` | 需要真实用户输入，暂停所有自动化。 |
@@ -213,6 +224,11 @@ flowchart TD
     U[用户开始任务] --> R[SOURCE_RUNNING]
     R --> A[ASSESSING]
     A -->|done 且工作区有变化| C[CHECKING]
+    A -->|提问且工作区有变化：answerer 与提前检查并行| AC[ASSESSING + CHECKING]
+    AC -->|检查结束 + 答案：合并为一条消息| N
+    AC -->|answerer 判定 done| C
+    AC -->|answerer 判定 incomplete：取消检查| N
+    AC -->|answerer 转交| W
     A -->|done 且未改动、无未检查改动| D
     A -->|incomplete / answerer 给出答案| N[READY_TO_CONTINUE]
     A -->|crash / network / rate limit| P{重试预算可用?}
@@ -244,7 +260,7 @@ flowchart TD
     C -->|显式 Replace| S
 ```
 
-每次从 `CHECKING` 返回继续工作都会创建新 cycle，新 cycle 从检查列表第一项重新开始（修复可能破坏已通过的检查，与现状一致）。旧 cycle 的结果仍保留用于审计，但不会跨快照复用。
+每次从 `CHECKING` 返回继续工作都会创建新 cycle，新 cycle 从检查列表第一项重新开始（修复可能破坏已通过的检查，与现状一致）。旧 cycle 的结果仍保留用于审计，但不会跨快照复用；唯一的复用是 §8.1 的“答案轮没改 tree”。
 
 ## 8. 决策规则
 
@@ -252,7 +268,7 @@ flowchart TD
 | --- | --- | --- |
 | `done` | 工作区相对 Task 基线有变化时运行 completion + quality checks | 与现状一致：从未改动工作区的纯分析、纯聊天任务直接 `COMPLETED`，不启动 evaluator；有未检查改动（继承的基线）时照常检查。 |
 | `incomplete` | 生成带缺口证据的 continue 提示 | 由现有预筛信号（`truncated`、`tool_last`、`todo_pending`）加 answerer 的 `incomplete` 判定得出。经统一派发器发送（§11.2）；计入 source-turn 与 no-progress 预算。 |
-| `awaiting_user` | 先等 `delay_seconds` 宽限期，再由 answerer 判定；能从需求与仓库确定的由它作答，真实选择进入 `WAITING_USER` | 沿用现有 escalate 规则、`answerRisk`、同题相似度 ≥ 0.5 即转交；不把“继续”伪装成用户决定。宽限期内的用户输入取消代答。 |
+| `awaiting_user` | 先等 `delay_seconds` 宽限期，再由 answerer 判定；能从需求与仓库确定的由它作答，真实选择进入 `WAITING_USER`；工作区有改动时同时提前检查（§8.1） | 沿用现有 escalate 规则、`answerRisk`、同题相似度 ≥ 0.5 即转交；不把“继续”伪装成用户决定。宽限期内的用户输入取消代答。 |
 | `refused` | `BLOCKED` | 与现状一致，不代答、不重试。若策略明确声明为可恢复的技术性拒绝，应直接进入 `READY_TO_CONTINUE`，不能先进入 `BLOCKED` 再 Resume。 |
 | `crashed` / `network` / `rate_limited` | 延迟后 bounded retry | 现状为固定 `delay_seconds`、每类最多 3 次、默认不重试；supervisor 可改为指数退避。经统一派发器发送；使用同一 Task 和确定性 message id。失败后 Agent 状态为 `error` 也允许重试（E5、E6）。 |
 | `quota_exhausted` / `context_exhausted` | `BLOCKED` | 同一 Agent 无法可靠恢复；schema 已禁止对它们配置 retry。未来可接入 successor handoff。 |
@@ -269,6 +285,25 @@ flowchart TD
 - verdict JSON 无效：允许在 check retry 预算内重跑 evaluator；不能因此让 Source Agent 重做任务。现状是直接 `ERROR`。
 - evaluator 的权限请求被拒（用户点拒绝，或 `permission_wait_minutes` 到期代拒）且没有给出 verdict：追问一次结论（nudge），截止时间至少顺延 5 分钟；只追问一次。
 - evaluator 修改树：使整个 cycle 失效并进入 `WAITING_USER`，由用户决定如何处理意外变更。
+
+### 8.1 提问期间的提前检查
+
+Agent 做完改动后停下提问，是最常见的 `awaiting_user`。v2 在这里串行：等宽限期、跑 answerer、发答案、等答案那一轮结束，才开始检查。supervisor 用同一个 Task 同时持有两件事：
+
+1. `awaiting_user` 且工作区相对 Task 基线有变化时，宽限期、answerer 与 completion + quality checks 同时启动。检查照常持有 Workspace Lease，并以提问时的 tree 为快照。answerer 只读、不跑构建，与检查并行不违反不变量 10。
+2. 答案不在检查结束前发送。源 Agent 在检查期间保持空闲，所以不会出现“源 Agent 改文件导致 verdict 作废”；宽限期通常覆盖大部分检查时间，答案的实际延迟是 `max(宽限期 + answerer, 检查)`，而不是两者之和。
+3. 两边结果合并为一个 source action：
+   - 检查 PASS + 答案：只发答案；
+   - 检查 FAIL + 答案：答案与 findings 合成一条消息，占一次代答和一次 fix；
+   - answerer 判定其实已完成（`done`）：检查继续，结果即本 cycle 结论；
+   - answerer 判定没做完（`incomplete`）：取消检查、丢弃结果，发“Continue.”；
+   - answerer 转交用户：检查照常结束，`WAITING_USER` 卡片同时显示问题和检查结论；用户的回复成为新的 Requirement Revision。
+4. 答案那一轮结束后：tree 与检查快照相同（commit、确认、“继续”后没改文件）→ 直接沿用这次 verdict，不重新检查；tree 变了 → 新 cycle，从第一项检查重新开始。
+5. 用户在这期间发消息：与其他场景一样，取消未发的答案并追加 Requirement Revision；检查结果作废（contract revision 变了）。
+
+`answer` 类 Requirement Revision 不使同一 tree 上的 verdict 失效：answerer 只能在原需求和仓库事实的范围内作答，产品取舍、范围扩大一律转交用户（§2.2），所以代答不扩大完成契约；答案若导致新的实现，tree 一定变化，检查自然重跑。用户本人的输入仍然使旧 verdict 失效。
+
+代价是 answerer 判定 `incomplete` 时白跑一次检查。`supervision.check_while_asking` 可以关掉这一行为，回到 v2 的串行顺序。
 
 ## 9. 进展检测与预算
 
@@ -460,7 +495,7 @@ Workspace Lease 覆盖同一工作区内所有插件派发的 source attempts、
 
 ## 13. 用户交互
 
-每个 Task 在主时间线上任一时刻只有一张活动卡片。同一件事的进度原地更新；每个需要用户关注的新事件（新 cycle 的检查、新的提问、新的失败或重试、终态）以 `card_seq + 1` 在时间线当前位置新开一张，旧卡最后更新一次：按钮去掉，仍在进行中的状态改为“已在下方新卡片继续”。这是现有卡片从“每链复用一张”改过来的教训（26132e8、turn-outcomes.md §5）：更新时间线上方很远的旧卡，用户看不到，Paseo 也会让新一轮看起来没有卡片。
+每个 Task 在主时间线上任一时刻只有一张活动卡片。同一件事的进度原地更新，提问期间的提前检查（§8.1）也是同一件事：问题、答案和各项检查结论显示在同一张卡上；每个需要用户关注的新事件（新 cycle 的检查、新的提问、新的失败或重试、终态）以 `card_seq + 1` 在时间线当前位置新开一张，旧卡最后更新一次：按钮去掉，仍在进行中的状态改为“已在下方新卡片继续”。这是现有卡片从“每链复用一张”改过来的教训（26132e8、turn-outcomes.md §5）：更新时间线上方很远的旧卡，用户看不到，Paseo 也会让新一轮看起来没有卡片。
 
 活动卡片至少显示：
 
@@ -515,6 +550,7 @@ Workspace Lease 覆盖同一工作区内所有插件派发的 source attempts、
     "checks": ["verify", "review"],
     "blocking_severity": "HIGH",
     "answer_delay_seconds": 60,
+    "check_while_asking": true,
     "budget": {
       "max_source_attempts": 12,
       "max_fix_attempts": 2,
@@ -554,6 +590,7 @@ Workspace Lease 覆盖同一工作区内所有插件派发的 source attempts、
 - review fail → fix → recheck → completed；修复轮无改动不重检，提问转代答、反驳转 `WAITING_USER`；
 - incomplete → continue，连续无进展后停止；
 - awaiting_user → 宽限期内用户回复则不代答；到期代答；同题再问与 `answerRisk` 命中时转交；
+- 提问且工作区有改动 → 检查与 answerer 并行，答案在检查结束后才发；FAIL 时答案与 findings 合成一条消息；答案轮 tree 不变时沿用 verdict、不再检查，tree 变化时重新检查；answerer 判定 `incomplete` 时检查被取消；`check_while_asking: false` 时回到串行；
 - crash/network/rate limit 按预算退避重试；
 - context/quota 直接 blocked；未知 `error` 进入 `WAITING_USER`；
 - user_canceled 保留改动，下一条用户消息在同一 Task 内检查它们；
@@ -603,6 +640,7 @@ Workspace Lease 覆盖同一工作区内所有插件派发的 source attempts、
 10. evaluator 修改工作区时任务不会被错误标为完成。
 11. 用户停止 Agent 后，停止前的改动不会绕过检查。
 12. v2 策略继续按旧语义工作，且不会被 v3 initializer 产生的配置破坏。
+13. Agent 改完文件后提问、答案那一轮不再改文件时，整个任务只跑一次检查、只有一张活动卡，总耗时不超过 `max(宽限期 + answerer, 检查)` 加答案那一轮本身。
 
 ## 18. 分阶段实施
 
@@ -616,6 +654,12 @@ Workspace Lease 覆盖同一工作区内所有插件派发的 source attempts、
 8. **宿主能力升级**：Paseo 提供 `sendIfIdle`、cwd、运行中 Agent 列表后，capability probe 自动把保证级别升到 `atomic`、`worktree`、`exclusive`，无需改策略。这一步不阻塞前面任何一步。
 
 每一阶段都应保持现有 v2 测试（`server/*.test.ts`）通过。迁移完成前，旧 Gate 和新 Supervisor 不能同时拥有 Source Agent 的发送权。
+
+用 supervisor 覆盖 v2 实现（删除 `gate_runs`/`chains`/`carries`/`turn_snapshots` 路径）的前提：
+
+- 第 3 步完成，v2 的全部测试场景和真实 kiro 端到端场景在 supervisor 上通过；
+- v2 策略文件按 `mode: "turn"` 语义解释，行为不变；提前检查（§8.1）等新行为只在 task 模式或显式开启时生效；
+- 升级时 ledger 中未结束的 run、chain、carry 要么由旧代码跑完，要么一次性迁移为 Task，不能同时被两套代码驱动。
 
 ## 19. 被否决的替代方案
 
