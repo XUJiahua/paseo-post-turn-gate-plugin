@@ -169,7 +169,7 @@ Each role has its own block under `agents`:
 
 The role prompt is always built by this plugin: its built-in job and JSON contract, followed by the project-specific `instructions_file` and `instructions`. Paseo profiles only provide launch settings; they never provide or replace these prompts.
 
-For the `codex` provider, managed reviewer, verifier and answerer agents inherit the source model, mode, thinking level and Fast setting. The plugin always turns Codex Plan mode off for those child agents: a Plan-mode turn ends with a plan-approval request, while a gate role must finish with its structured JSON result. Explicitly setting `agents.<role>.features.plan_mode` to `true` is therefore also overridden.
+Managed reviewer, verifier and decider (answerer) agents inherit the source model, mode, thinking level and features such as Codex's Fast setting. The plugin always turns a `plan_mode` feature off for those child agents, whatever the provider id (`codex`, `codex-proxy`, …): a Plan-mode turn ends with a plan-approval request, while a gate role must finish with its structured JSON result. Explicitly setting `agents.<role>.features.plan_mode` to `true` is therefore also overridden.
 
 Profiles are optional. To create shared launch profiles and then opt a project into one, run:
 

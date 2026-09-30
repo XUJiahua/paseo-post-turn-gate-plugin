@@ -2084,6 +2084,20 @@ describe("reviewer config", () => {
     assert.deepEqual(explicit.config.featureValues, { plan_mode: false, fast_mode: true });
   });
 
+  test("Plan mode is turned off by feature, whatever the provider id (codex-proxy)", () => {
+    const resolved = resolveRole(
+      { provider: "codex-proxy", model: "gpt-5.6-terra", featureValues: { plan_mode: true, fast_mode: true } },
+      { profile: null },
+      "post-turn-gate-reviewer",
+      [],
+    );
+    assert.ok(resolved.ok);
+    assert.deepEqual(resolved.config.featureValues, { plan_mode: false, fast_mode: true });
+    const kiro = resolveRole({ provider: "kiro", model: "m", featureValues: { auto_accept: false } }, { profile: null }, "r", []);
+    assert.ok(kiro.ok);
+    assert.deepEqual(kiro.config.featureValues, { auto_accept: false }, "other features are inherited as they are");
+  });
+
   test("errors: unknown or ambiguous profile, provider switch without a model", () => {
     const missing = resolveReviewer(source, { profile: "nope" }, profiles);
     assert.ok(!missing.ok && /not found.*"Review" \(p-review\)/.test(missing.error));

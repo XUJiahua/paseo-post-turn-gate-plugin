@@ -159,7 +159,7 @@
 - **分层**：源 Agent → agent profile → 显式字段，上层覆盖下层。
 - **profile 默认关闭**：初始化策略写入 `null`，因此默认路径不读取 Paseo profile。只有项目显式填写 id 或 name 时才使用共享 profile。旧版本生成的 `post-turn-gate-<role>` 引用在 profile 不存在时仍回退到源 Agent 并提示改为 `null`，用于兼容迁移。
 - **切换 provider 时清空**：model、mode、thinking、features 都是 provider 专属的。某一层换了 provider，就丢弃从下层继承来的这些字段，不做混用。例如源 Agent 是 kiro，profile 是 codex：只用 profile 里的值，不会把 kiro 的 mode 带过去。
-- **Codex Plan mode 例外**：Gate 托管的三个角色都必须输出结构化结果，因此最终 provider 为 `codex` 且存在 `plan_mode` 时会强制设为 `false`；Fast 等其他 feature 保持分层后的值。
+- **Plan mode 例外**：Gate 托管的角色都必须输出结构化结果，因此只要最终配置里有 `plan_mode` feature 就强制设为 `false`，不看 provider id（Codex 适配器也会以 `codex-proxy` 等 id 注册）；Fast 等其他 feature 保持分层后的值。
 - **缺 model 即报错**：最终没有 model（例如只写了 `"provider": "claude"`）→ `ERROR`，提示设置 `model`。Paseo 创建时要求 `provider/model` 格式（V12）。
 - **profile 引用**：先按 id 精确匹配，再按 name 精确匹配；name 重名 → `ERROR`，要求改用 id。profile 不存在 → `ERROR`，并列出现有 profile。
   - profile 存在 daemon 配置的 `daemon.agentProfiles` 里，插件在每次 dispatch 时用 `paseo.config.get()` 读取。已用测试 daemon 实测：插件会话有读取权限，profile（claude / `bypassPermissions`）会原样用于创建 Verifier。

@@ -24,12 +24,12 @@ export type ResolvedReviewer =
   | { ok: false; error: string };
 
 /**
- * Provider features normally inherit from the source agent. Codex Plan mode is the
- * exception: a turn in that mode ends with a plan-approval request instead of the
- * structured reply that a gate-managed role must return.
+ * Provider features normally inherit from the source agent. Plan mode is the exception: a turn in that mode ends
+ * with a plan-approval request instead of the structured reply that a gate-managed role must return. It is keyed by
+ * the feature, not the provider name: the same Codex adapter also runs as "codex-proxy" or under other ids.
  */
 export function prepareManagedLaunch(config: LaunchConfig & { model: string }): LaunchConfig & { model: string } {
-  if (config.provider !== "codex" || !Object.hasOwn(config.featureValues ?? {}, "plan_mode")) return config;
+  if (!Object.hasOwn(config.featureValues ?? {}, "plan_mode")) return config;
   return {
     ...config,
     featureValues: { ...config.featureValues, plan_mode: false },
