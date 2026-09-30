@@ -921,6 +921,10 @@ export function createGate(options: GateOptions): Gate {
   /** Drops a scheduled retry or answer, or a running answerer; the chain itself stays. */
   async function cancelChainWork(paseo: Paseo, chain: Chain): Promise<Chain> {
     if (chain.answer_child_id) await archiveChild(paseo, chain.answer_child_id);
+    // A version 3 round's checks go with it; nothing would read their result.
+    const round = roundOf(chain);
+    const run = round?.runId ? ledger.get(round.runId) : null;
+    if (run && !isTerminal(run.status)) await cancelRun(paseo, run, "The round was canceled.");
     return (
       ledger.updateChain(
         chain.agent_id,
@@ -1413,7 +1417,7 @@ export function createGate(options: GateOptions): Gate {
     const chain = ledger.chainById(chainId);
     if (!chain) return false;
     let current = ledger.updateChain(chain.agent_id, { stop_answering: 1 }, now())!;
-    const wasAnswering = current.answer_child_id !== null || current.answer_at !== null;
+    const wasAnswering = current.answer_child_id !== null || current.answer_at !== null || current.round_json !== null;
     if (wasAnswering) current = await cancelChainWork(paseo, current);
     await publishChainCard(paseo, current, {
       canStopAnswering: false,
@@ -1732,8 +1736,8 @@ export function createGate(options: GateOptions): Gate {
     await publishChainCard(paseo, chain, { checks: checksLine(run) });
   }
 
-  async function cancelRun(paseo: Paseo, run: Run): Promise<void> {
-    const next = await transition(paseo, run, { status: "SUPERSEDED", error: "Not needed: the decider replied without these checks." });
+  async function cancelRun(paseo: Paseo, run: Run, why = "Not needed: the decider replied without these checks."): Promise<void> {
+    const next = await transition(paseo, run, { status: "SUPERSEDED", error: why });
     await archiveChild(paseo, next.child_agent_id);
   }
 

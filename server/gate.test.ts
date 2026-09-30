@@ -1330,6 +1330,18 @@ describe("version 3: the decider answers after every turn that did work", () => 
     assert.match(outcome().checks, /waiting for your permission/);
   });
 
+  test("Stop auto-answering during the checks ends the round: no decider, the checker is stopped", async () => {
+    v3();
+    await sourceTurn({ change: edit });
+    await childTurn(role("decider")[0].agentId, PLAN({}));
+    assert.equal(await gate.stopAnswering(outcome().chainId, fake.paseo), true);
+    await gate.idle();
+    assert.ok(fake.archived.includes(role("reviewer")[0].agentId), "the checker is stopped");
+    await childTurn(role("reviewer")[0].agentId, PASS);
+    assert.equal(role("decider").length, 1, "no reply phase after you stopped it");
+    assert.equal(fake.sent.length, 0);
+  });
+
   test("a version 3 policy error names the field", async () => {
     writePolicy({ version: 3, supervision: { bogus: 1 } });
     await sourceTurn({ change: edit });
