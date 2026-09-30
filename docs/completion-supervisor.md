@@ -372,6 +372,8 @@ tree 改变、未满足需求减少、阻断 finding 消失、出现新的有效
 
 ## 15. 策略
 
+已实现的字段（`shared/schema.ts` 的 `supervisionSchema`）；`blocking_severity`、`dispatch: "assisted"` 尚未实现：
+
 ```json
 {
   "version": 3,
@@ -380,8 +382,6 @@ tree 改变、未满足需求减少、阻断 finding 消失、出现新的有效
     "checks": ["verify", "review"],
     "speculative_checks": true,
     "reply_delay_seconds": 60,
-    "blocking_severity": "HIGH",
-    "dispatch": "auto",
     "budget": {
       "max_auto_sends": 12,
       "max_retries": 3,
@@ -459,8 +459,29 @@ tree 改变、未满足需求减少、阻断 finding 消失、出现新的有效
 | `24a30d3` | `server/supervisor.ts` 入口外观（`accept`、`control`，接管恢复与 reconcile 定时器）；`server/dispatch.ts` 统一派发器，fix、代答、重试、FIXING 重发都经过它；`server/decisions.ts` 的 `decideCheck`、`decideAnswer` |
 | `64fe506` | `chains`、`carries`、`turn_snapshots` 合并为 `tasks` 表；旧表启动时导入后删除 |
 | `026969f` | `task_id` 贯穿检查：run 检查期间任务存活，PASSED/INCONCLUSIVE/FAILED/ERROR 结束任务，NEEDS_HUMAN/SUPERSEDED 交给 carry 或任务链；重叠 Agent 记录持久化 |
+| 本次 | decider 协议 v1（路线图第 2 步的主体），只对 `version: 3` 策略生效 |
 
-v2 外部行为不变，`npm test` 117 个测试通过。尚未做：按工作区分队列、检查与代答模块拆分（并入路线图第 2 步）。
+decider 协议 v1 的实现（`server/gate.ts` “decision rounds” 一节）：
+
+- `version: 3` 策略被规范化为内部策略形状加 `supervision`：检查只报告（`on_fail: "report"`），由 decider 写回复；`agents.decider` 即 answerer 角色，规则文件 `decider.md` 不存在时读 `answerer.md`。
+- 一轮：工作区有改动时立即启动推测性检查；宽限期后 decider 出计划（`DECIDER_PLAN_JSON_SCHEMA`）；需要检查的，检查结束后由第二个 decider 子 Agent 汇总回复（`DECIDER_REPLY_JSON_SCHEMA`）；不需要的直接用 `reply_now` 并取消检查。
+- 护栏：`done` 在有改动时必须有当前 tree 上的 PASSED run（没跑过检查就补跑一次，否则找人）；`answerRisk`；同题再问；自动发送预算；墙钟；连续无进展的轮次；检查者改树、权限被拒、需求歧义、检查者失败直接找人；宽限期或决策期间用户发消息取消本轮。
+- 发送：`pts:<chain>:<n>`，经统一派发器；回复前缀沿用 `[post-turn gate answered on your behalf]`。检查通过的 tree 记为 `passed_tree`，下一轮结束在同一棵 tree 上且主 Agent 说完成时直接完成，不再检查、不再启动 decider。
+- 机械重试：crash/network/rate_limited 按 `max_retries` 退避（30s、2min、8min），计入自动发送预算。
+- 你发消息接手时，自动发送计数、无进展计数、`passed_tree` 和墙钟起点重置。
+- 卡片：`outcomeCardSchema` 增加 `decider`、`checks`，客户端显示为 “Post-turn supervisor”。
+- 测试：`gate.test.ts` “version 3: the decider answers…”（8 个）。
+
+v1 与本设计的差异，后续步骤处理：
+
+- decider 的两个阶段是两个子 Agent，而不是同一个子 Agent 收到第二条消息：Paseo 的 `send()` 不接受 `outputSchema`，第二阶段拿不到结构化输出。代价是汇总阶段要重新读一遍上下文。
+- 检查 run 仍有自己的卡片，一轮在时间线上是两张卡（检查卡 + 决策卡）。检查者的权限按钮在检查卡上，合并需要把它们搬到决策卡。
+- 工作区没变化时：主 Agent 说完成就结束；停下提问但本轮和任务都没做过工作时不启动 decider（沿用 v2 预筛）。
+- `error`、`refused` 类失败、机械重试用完后仍是通知卡，尚未交给 decider（路线图第 3 步）。
+- 墙钟包含等待用户的时间；进展只比较 tree，不比较 findings（均标了 `ponytail:`）。
+- `post-turn-gate-init` 仍生成 v2；v3 需手写策略文件（路线图第 6 步）。
+
+尚未做：按工作区分队列、检查与 decider 模块从 `gate.ts` 拆分。
 
 ## 20. 已定的默认决策
 

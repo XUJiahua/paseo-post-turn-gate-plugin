@@ -157,7 +157,7 @@ function git(...args: string[]) {
  * `raw` writes the policy exactly as given.
  */
 function writePolicy(policy: unknown, raw = false) {
-  if (!raw && policy && typeof policy === "object") {
+  if (!raw && policy && typeof policy === "object" && (policy as { version?: number }).version !== 3) {
     const onOutcome = ((policy as Record<string, any>).on_outcome ??= {});
     if (onOutcome.awaiting_user === undefined) onOutcome.awaiting_user = { answer: { delay_seconds: 0 } };
     else if (typeof onOutcome.awaiting_user === "object") onOutcome.awaiting_user.answer.delay_seconds ??= 0;
@@ -1073,6 +1073,157 @@ describe("a task lives from its first turn until its result stands", () => {
     const answer = fake.sent.at(-1)!;
     await sourceTurn({ messageId: answer.messageId, text: answer.text, change: () => writeFileSync(path.join(repo, "b.ts"), "export {}\n") });
     assert.match(fake.created.at(-1)!.prompt, /other-agen/, "the checker is told about the overlap from before the restart");
+  });
+});
+
+describe("version 3: the decider answers after every turn that did work", () => {
+  const role = (name: string) => fake.created.filter((create) => create.labels["post-turn-gate.role"] === name);
+  const outcome = () => [...fake.cards.entries()].filter(([id]) => id.startsWith("post-turn-gate:outcome:")).at(-1)![1] as unknown as Record<string, any>;
+  const PLAN = (plan: Record<string, unknown>) => JSON.stringify({ assessment: "done", workers: ["review"], reply_now: null, question: "", ...plan });
+  const REPLY = (reply: Record<string, unknown>) => JSON.stringify({ kind: "send", message: "", answers_question: false, question: "", reason: "", ...reply });
+  const v3 = (supervision: Record<string, unknown> = {}) =>
+    writePolicy({ version: 3, supervision: { checks: ["review"], reply_delay_seconds: 0, ...supervision } });
+
+  test("done with changes: checks run alongside the plan, and a PASS completes the task without a message", async () => {
+    v3();
+    await sourceTurn({ change: edit });
+    assert.equal(role("reviewer").length, 1, "the checks start at once");
+    assert.equal(role("decider").length, 1, "the decider plans at the same time");
+    await childTurn(role("decider")[0].agentId, PLAN({}));
+    assert.equal(role("decider").length, 1, "the plan waits for the checks");
+    await childTurn(role("reviewer")[0].agentId, PASS);
+    assert.equal(role("decider").length, 2, "the reply is written from the results");
+    assert.match(role("decider")[1].prompt, /Overall: PASSED/);
+    await childTurn(role("decider")[1].agentId, REPLY({ kind: "done" }));
+    assert.equal(fake.sent.length, 0);
+    assert.equal(outcome().state, "resolved");
+    assert.match(outcome().message, /Completed/);
+    assert.equal(ledger.taskId(SOURCE), null, "the task ended");
+  });
+
+  test("a question after changes: a FAIL and the answer go back in one message", async () => {
+    v3();
+    await sourceTurn({ change: edit, reply: "Implemented it. Should I commit now?" });
+    await childTurn(role("decider")[0].agentId, PLAN({ assessment: "awaiting_user", question: "Should I commit now?" }));
+    await childTurn(role("reviewer")[0].agentId, FAIL);
+    assert.match(role("decider")[1].prompt, /Off by one/);
+    await childTurn(role("decider")[1].agentId, REPLY({ message: "Not yet: fix the off-by-one in a.txt first, then commit.", answers_question: true }));
+    assert.equal(fake.sent.length, 1, "one message");
+    assert.match(fake.sent[0].messageId!, /^pts:.+:1$/);
+    assert.match(fake.sent[0].text, /off-by-one[\s\S]*commit/);
+    assert.equal(outcome().state, "answered");
+    // The fix turn starts the next round from the task's baseline.
+    await sourceTurn({ messageId: fake.sent[0].messageId, text: fake.sent[0].text, change: () => writeFileSync(path.join(repo, "a.txt"), "fixed\n") });
+    assert.equal(role("reviewer").length, 2);
+    assert.match(role("reviewer")[1].prompt, /Answered on the user's behalf/);
+  });
+
+  test("an answer after a PASS: a next turn on the same tree completes without checking again", async () => {
+    v3();
+    await sourceTurn({ change: edit, reply: "Done. Should I commit?" });
+    await childTurn(role("decider")[0].agentId, PLAN({ assessment: "awaiting_user", question: "Should I commit?" }));
+    await childTurn(role("reviewer")[0].agentId, PASS);
+    await childTurn(role("decider")[1].agentId, REPLY({ message: "Yes, commit it.", answers_question: true }));
+    const answer = fake.sent[0];
+    await sourceTurn({ messageId: answer.messageId, text: answer.text, reply: "Committed." }); // a commit leaves the tree as it is
+    assert.equal(role("reviewer").length, 1, "not checked again");
+    assert.equal(role("decider").length, 2, "no new round");
+    assert.equal(outcome().state, "resolved");
+  });
+
+  test("checks that finish before the plan still lead to the reply (with the default grace period)", async () => {
+    v3({ reply_delay_seconds: 60 });
+    await sourceTurn({ change: edit });
+    await childTurn(role("reviewer")[0].agentId, PASS); // within the grace period
+    assert.equal(role("decider").length, 0);
+    clock += 61_000;
+    gate.reconcile(fake.paseo);
+    await gate.idle();
+    await childTurn(role("decider")[0].agentId, PLAN({}));
+    assert.equal(role("decider").length, 2, "the reply phase starts from the finished checks");
+    assert.match(role("decider")[1].prompt, /Overall: PASSED/);
+    await childTurn(role("decider")[1].agentId, REPLY({ kind: "done" }));
+    assert.equal(outcome().state, "resolved");
+  });
+
+  test("a plan that says done at once waits for the running checks instead of canceling them", async () => {
+    v3();
+    await sourceTurn({ change: edit });
+    await childTurn(role("decider")[0].agentId, PLAN({ workers: [], reply_now: { kind: "done" } }));
+    assert.equal(ledger.active().length, 1, "the checks keep running");
+    assert.equal(outcome().state, "answering");
+    await childTurn(role("reviewer")[0].agentId, PASS);
+    await childTurn(role("decider")[1].agentId, REPLY({ kind: "done" }));
+    assert.equal(outcome().state, "resolved");
+    assert.match(outcome().message, /checks passed/);
+  });
+
+  test("a turn that stopped early gets 'Continue.' at once; the checks are canceled", async () => {
+    v3();
+    await sourceTurn({ change: edit, reply: "Next I will add the tests." });
+    await childTurn(role("decider")[0].agentId, PLAN({ assessment: "incomplete", workers: [], reply_now: { kind: "send", message: "Continue." } }));
+    assert.equal(fake.sent.length, 1);
+    assert.match(fake.sent[0].text, /Continue\.$/);
+    assert.ok(fake.archived.includes(role("reviewer")[0].agentId), "the reviewer is stopped");
+    assert.equal(ledger.active().length, 0);
+  });
+
+  test("guardrails: done without a PASS, a risky reply, and the message budget go to you", async () => {
+    v3({ budget: { max_auto_sends: 1 } });
+    await sourceTurn({ change: edit });
+    await childTurn(role("decider")[0].agentId, PLAN({}));
+    await childTurn(role("reviewer")[0].agentId, FAIL);
+    await childTurn(role("decider")[1].agentId, REPLY({ kind: "done" }));
+    assert.equal(outcome().state, "needs_user");
+    assert.match(outcome().message, /checks ended FAILED/);
+
+    await sourceTurn({ text: "fix it", messageId: "u2", change: () => writeFileSync(path.join(repo, "a.txt"), "three\n") });
+    await childTurn(role("decider")[2].agentId, PLAN({ workers: [], reply_now: { kind: "send", message: "Run `git push --force` now." } }));
+    assert.equal(fake.sent.length, 0);
+    assert.equal(outcome().state, "needs_user");
+    assert.match(outcome().message, /not sent automatically/);
+
+    await sourceTurn({ text: "go on", messageId: "u3", change: () => writeFileSync(path.join(repo, "a.txt"), "four\n") });
+    await childTurn(role("decider")[3].agentId, PLAN({ workers: [], reply_now: { kind: "send", message: "Continue." } }));
+    assert.equal(fake.sent.length, 1);
+    await sourceTurn({ messageId: fake.sent[0].messageId, text: fake.sent[0].text, change: () => writeFileSync(path.join(repo, "a.txt"), "five\n") });
+    assert.equal(role("decider").length, 4, "the budget is used up: no decider");
+    assert.equal(outcome().state, "needs_user");
+    assert.match(outcome().message, /1 automatic messages/);
+  });
+
+  test("your message during the grace period cancels the round", async () => {
+    v3({ reply_delay_seconds: 60 });
+    await sourceTurn({ change: edit });
+    assert.equal(outcome().state, "answer_scheduled");
+    assert.equal(role("decider").length, 0);
+    gate.onTurnStarted({ agent: hookAgent(SOURCE), turnId: "t2" }, fake.paseo);
+    await gate.idle();
+    clock += 61_000;
+    gate.reconcile(fake.paseo);
+    await gate.idle();
+    assert.equal(role("decider").length, 0, "no decider after you replied");
+    assert.equal(fake.sent.length, 0);
+  });
+
+  test("the decider reads decider.md, or answerer.md when the repository has no decider rules yet", async () => {
+    mkdirSync(path.join(repo, ".paseo/post-turn-gate"), { recursive: true });
+    writeFileSync(path.join(repo, ".paseo/post-turn-gate/answerer.md"), "ANSWERER RULE");
+    v3();
+    await sourceTurn({ change: edit });
+    assert.match(role("decider")[0].prompt, /ANSWERER RULE/);
+    // A new task (another agent here) picks up decider.md once it exists; a running task keeps its frozen rules.
+    writeFileSync(path.join(repo, ".paseo/post-turn-gate/decider.md"), "DECIDER RULE");
+    fake.agents.set("second", sourceAgent({ id: "second" }));
+    await sourceTurn({ agentId: "second", change: () => writeFileSync(path.join(repo, "c.txt"), "x\n") });
+    assert.match(role("decider").at(-1)!.prompt, /DECIDER RULE/);
+    assert.doesNotMatch(role("decider").at(-1)!.prompt, /ANSWERER RULE/);
+  });
+
+  test("a version 3 policy error names the field", async () => {
+    writePolicy({ version: 3, supervision: { bogus: 1 } });
+    await sourceTurn({ change: edit });
+    assert.match(configCard()!.error ?? "", /supervision/);
   });
 });
 

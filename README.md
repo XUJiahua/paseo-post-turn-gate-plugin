@@ -173,6 +173,14 @@ Every turn of a gated agent is sorted into a category, and `on_outcome` in the p
 - **Where to find them:** while running, a child agent is listed under the source agent's **Subagents**; when finished it is archived and can be opened from **History**. From a terminal, `paseo logs <id> -f` follows a running one and `paseo logs <id>` shows a finished one; the card prints the command with the id.
 - **Where state lives:** in `${PASEO_HOME:-~/.paseo}/plugin-data/post-turn-gate/ledger.sqlite`.
 
+## Preview: version 3 (decider)
+
+A `version: 3` policy replaces fixed fix templates and answer limits with a decider agent that answers for you after every turn that did work: the checks run while it plans, and it sends one message that covers the findings and the agent's question, until the checks pass. It hands over only for key decisions (trade-offs, risky or outward actions, credentials, disputed findings, used-up budget). `post-turn-gate-init` does not write it yet; see [docs/completion-supervisor.md](docs/completion-supervisor.md) §15 and §19.1:
+
+```json
+{ "version": 3, "supervision": { "checks": ["verify", "review"] } }
+```
+
 ## Develop
 
 ```bash

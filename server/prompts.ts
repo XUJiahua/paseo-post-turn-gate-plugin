@@ -1,6 +1,6 @@
 import type { ZodType, output } from "zod";
-import type { AnswerReply, Verdict } from "../shared/schema.ts";
-import { answerReplySchema, verdictSchema } from "../shared/schema.ts";
+import type { AnswerReply, DeciderPlan, DeciderReply, Verdict } from "../shared/schema.ts";
+import { answerReplySchema, deciderPlanSchema, deciderReplySchema, verdictSchema } from "../shared/schema.ts";
 
 const ROLE = {
   verify: `You are an independent VERIFIER. Answer one question: does the change fully deliver the original request?
@@ -243,4 +243,125 @@ ${LANGUAGE_RULE}
 
 Reply with ONLY one JSON object, no prose and no code fence:
 {"state":"awaiting_user|incomplete|refused|done","question":"<the question, verbatim or summarized>","decision":"answer|escalate","answer":"<reply to send to the agent>","reason":"<one sentence>"}`;
+}
+
+// ---------- decider (version 3) ----------
+
+export function parseDeciderPlan(text: string): DeciderPlan | null {
+  return parseJsonReply(text, deciderPlanSchema);
+}
+
+export function parseDeciderReply(text: string): DeciderReply | null {
+  return parseJsonReply(text, deciderReplySchema);
+}
+
+const ESCALATE_RULES = `Hand the decision to the user (kind "escalate") instead of replying when:
+- it is a product or business trade-off the request does not settle (several reasonable options);
+- it involves deleting data, force-pushing, publishing, deploying, spending money, changing permissions,
+  credentials or secrets, or sending anything outside this machine;
+- it needs information only the user has (accounts, personal preferences, passwords, external context);
+- it would expand the work beyond what the user asked for;
+- the agent disputes a check's finding and you would accept its argument (only the user may overrule a check);
+- you are not confident.`;
+
+const REPLY_RULES = `Reply kinds:
+- "send": one message for the agent that covers everything it needs now: the answer to its question, the
+  findings to fix with what to change, missing tests or evidence to add, or "Continue." when it stopped early.
+  Put commands in backticks. Tell it to stop when done.
+- "done": the request is fully delivered and nothing is left to ask or fix.
+- "escalate": see the rules above; "question" says what the user must decide, "reason" why.`;
+
+/**
+ * The decider stands in for the user after a turn (docs/completion-supervisor.md §5). Phase "plan" decides what
+ * the next step depends on; phase "merge" writes the reply from the checks' results.
+ */
+export function buildDeciderPrompt(input: {
+  phase: "plan" | "merge";
+  requestText: string;
+  repoRoot: string;
+  baseTree: string;
+  endTree: string;
+  agentReply: string;
+  signal?: string | null;
+  previousQuestion: string | null;
+  instructions?: string;
+  /** What the plugin does about checks this round (running, reused, none). */
+  checks: string;
+  /** merge: the checks' results. */
+  results?: string;
+  /** merge: the plan from the first phase. */
+  plan?: DeciderPlan | null;
+  sendsLeft: number;
+  concurrentAgents?: readonly string[];
+}): string {
+  const extra = input.instructions?.trim()
+    ? `\nAdditional rules from the repository policy:\n<<<RULES\n${input.instructions.trim()}\nRULES>>>\n`
+    : "";
+  const previous = input.previousQuestion
+    ? `\nYou already answered this earlier question in the same task: ${JSON.stringify(input.previousQuestion)}\nIf the agent is asking the same thing again, escalate.\n`
+    : "";
+  const hint = input.signal ? `\nThe plugin noticed a signal in the reply: ${input.signal}.\n` : "";
+  const others = input.concurrentAgents?.length
+    ? `\nOther agents (${input.concurrentAgents.join(", ")}) changed this repository at the same time; the diff may include their work. Ask the agent to fix only its own changes.\n`
+    : "";
+  const head = `You supervise a coding agent on behalf of its user, so the work continues without the user until the
+request is done. The agent just ended a turn. You decide the next step and write the reply; independent
+checkers (verify: does the change deliver the request; review: is it correct and maintainable) give you
+evidence. You cannot overrule a check: a FAIL stands until the agent's next change passes it.
+${extra}${previous}${hint}${others}
+Repository: ${input.repoRoot}
+Work done so far in this task: git -C ${JSON.stringify(input.repoRoot)} diff ${input.baseTree} ${input.endTree}
+You may read files and run read-only commands. Do not modify the repository.
+Automatic messages left for this task: ${input.sendsLeft}.
+
+The user's request:
+<<<REQUEST
+${input.requestText}
+REQUEST>>>
+
+The agent's last message:
+<<<AGENT
+${input.agentReply}
+AGENT>>>
+
+Checks this round: ${input.checks}
+`;
+  if (input.phase === "plan") {
+    return `${head}
+Assess the agent's state: "done" (it says it finished), "incomplete" (it stopped early: cut off, "next I will…",
+open todos), "awaiting_user" (it asks a question or for a decision), "refused" (it declined the request).
+
+Plan the next step:
+- "workers": the checks your reply depends on. Keep the running checks when the agent says it is done or asks
+  something whose answer depends on whether the work is correct. Use [] when the reply does not depend on them
+  (it stopped early, or asks something the request already settles).
+- "reply_now": with workers [], the reply (see below); otherwise null.
+
+${ESCALATE_RULES}
+
+${REPLY_RULES}
+${LANGUAGE_RULE}
+
+Reply with ONLY one JSON object, no prose and no code fence:
+{"assessment":"done|incomplete|awaiting_user|refused","question":"<the agent's question, if any>","workers":["verify","review"],"reply_now":null}`;
+  }
+  return `${head}
+Your plan: ${JSON.stringify(input.plan ?? null)}
+
+Results of the checks:
+<<<RESULTS
+${input.results ?? "(none)"}
+RESULTS>>>
+
+Write the reply. A FAIL or an INCONCLUSIVE check the agent can close (missing tests, missing evidence) means the
+work is not done: send what to fix or add, together with the answer to the agent's question if it asked one.
+"done" is only right when every check passed.
+
+${ESCALATE_RULES}
+
+${REPLY_RULES}
+${LANGUAGE_RULE}
+
+Reply with ONLY one JSON object, no prose and no code fence:
+{"kind":"send|done|escalate","message":"<the message for the agent>","answers_question":false,"question":"","reason":"<one sentence>"}`;
 }

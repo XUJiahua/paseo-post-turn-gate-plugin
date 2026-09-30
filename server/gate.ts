@@ -1,9 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { PluginHookContext, PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import type {
   CardData,
+  DeciderPlan,
+  DeciderReply,
   Category,
   OnOutcome,
   OutcomeCard,
@@ -15,6 +18,8 @@ import type {
 import {
   ANSWER_JSON_SCHEMA,
   CARD_KIND,
+  DECIDER_PLAN_JSON_SCHEMA,
+  DECIDER_REPLY_JSON_SCHEMA,
   CARD_VERSION,
   DEFAULT_RETRY_MESSAGE,
   OUTCOME_CARD_KIND,
@@ -28,7 +33,9 @@ import {
   defaultInstructionsFile,
   gateChecks,
   maxFixRounds,
+  isStoredPolicy,
   policySchema,
+  triggerSchema,
 } from "../shared/schema.ts";
 import { diffStat, snapshotTree, toplevel } from "./git.ts";
 import type { Chain, Ledger, RoundRecord, Run } from "./ledger.ts";
@@ -36,11 +43,14 @@ import { SUGGESTIONS, classify, currentTurnItems, replyText, similarity } from "
 import {
   ANSWER_PREFIX,
   buildAnswerPrompt,
+  buildDeciderPrompt,
   buildFixPrompt,
   buildGatePrompt,
   buildNudgePrompt,
   latestAssistantText,
   parseAnswer,
+  parseDeciderPlan,
+  parseDeciderReply,
   parseVerdict,
 } from "./prompts.ts";
 import { answerRisk, decideAutoApproval } from "./permissions.ts";
@@ -65,6 +75,10 @@ export const TARGET_LABEL = "post-turn-gate.target";
 const PARENT_LABEL = "paseo.parent-agent-id";
 const FIX_PREFIX = "ptg:";
 const REQUEST_TEXT_LIMIT = 8000;
+/** Messages the version 3 supervisor sends to a source agent: pts:<chain>:<n>. */
+const ROUND_PREFIX = "pts:";
+const isPluginMessage = (id: string | null) => !!id && (id.startsWith(FIX_PREFIX) || id.startsWith(ROUND_PREFIX));
+const DECIDER_RULES = ".paseo/post-turn-gate/decider.md";
 
 interface LoadedPolicy {
   repoRoot: string;
@@ -108,6 +122,8 @@ interface Task {
   startRound?: number;
   /** Tree a check of this task already failed: a turn ending on it again is not checked again. */
   checkedTree?: string | null;
+  /** The turn answered a message from the user, not one the plugin sent. */
+  userSpoke?: boolean;
 }
 
 /** A checker's permission requests that were denied, and whether it was asked for a verdict afterwards. */
@@ -191,7 +207,7 @@ function firstRequestText(timeline: readonly TimelineItem[], lastUser: UserItem 
   const text = lastUser?.text ?? "";
   const earlier = timeline
     .filter((item): item is UserItem => item.type === "user_message" && item !== lastUser)
-    .filter((item) => !(item.messageId ?? item.clientMessageId ?? "").startsWith(FIX_PREFIX)) // the plugin's own messages
+    .filter((item) => !isPluginMessage(item.messageId ?? item.clientMessageId ?? null)) // the plugin's own messages
     .slice(-EARLIER_MESSAGES)
     .map((item) => `- ${truncate(item.text, 1000)}`);
   if (earlier.length === 0) return text;
@@ -209,14 +225,14 @@ export function createGate(options: GateOptions): Gate {
   const log = options.log ?? ((message, detail) => console.log(`[post-turn-gate] ${message}`, detail ?? ""));
   // Unfinished runs and chains store the policy frozen at their first turn; retire any in an older format.
   for (const run of ledger.active()) {
-    if (!policySchema.safeParse(JSON.parse(run.policy_json)).success) {
+    if (!isStoredPolicy(JSON.parse(run.policy_json))) {
       log(`retiring run ${run.run_id}: stored policy is in an old format`);
       ledger.update(run.run_id, { status: "ERROR", error: "stored policy is in an old format (plugin upgraded mid-run)" }, now());
       ledger.releaseRun(run.source_agent_id, run.run_id, true, now());
     }
   }
   for (const chain of ledger.chains()) {
-    if (!policySchema.safeParse(JSON.parse(chain.policy_json)).success) {
+    if (!isStoredPolicy(JSON.parse(chain.policy_json))) {
       log(`dropping chain ${chain.chain_id}: stored policy is in an old format`);
       ledger.deleteChain(chain.agent_id);
     }
@@ -390,6 +406,7 @@ export function createGate(options: GateOptions): Gate {
       ledger.releaseRun(next.source_agent_id, next.run_id, !ACCEPTS_NOTHING.includes(next.status), now());
     }
     await publishCard(paseo, next).catch((error) => log("card update failed", error));
+    if (isTerminal(next.status) && next.status !== "SUPERSEDED") await onRunSettled(paseo, next);
     return next;
   }
 
@@ -465,7 +482,7 @@ export function createGate(options: GateOptions): Gate {
     const baseTree = await snapshotTree(repoRoot);
     const base = { repoRoot, policyHash: createHash("sha256").update(raw).digest("hex"), baseTree };
     const invalid = (error: string, json: unknown) => {
-      const trigger = policySchema.shape.trigger.safeParse((json as { trigger?: unknown } | null)?.trigger);
+      const trigger = triggerSchema.safeParse((json as { trigger?: unknown } | null)?.trigger);
       return { ...base, policy: null, policyJson: raw, error, trigger: trigger.success ? trigger.data : ("root_and_opt_in" as const) };
     };
     let json: unknown;
@@ -493,7 +510,12 @@ export function createGate(options: GateOptions): Gate {
       const spec = policy.agents[role];
       if (!spec.instructions_file) continue;
       const field = `agents.${role}.instructions_file`;
-      const file = path.resolve(repoRoot, spec.instructions_file);
+      // A version 3 decider without its own rules file uses the answerer's (it is the answerer's successor).
+      const deciderDefault = role === "answerer" && spec.instructions_file === DECIDER_RULES;
+      const file = path.resolve(
+        repoRoot,
+        deciderDefault && !existsSync(path.resolve(repoRoot, DECIDER_RULES)) ? defaultInstructionsFile("answerer") : spec.instructions_file,
+      );
       const inside = (target: string, root: string) => target === root || target.startsWith(`${root}${path.sep}`);
       if (!inside(file, repoRoot)) return `${field}: must be inside the repository`;
       let text: string;
@@ -503,7 +525,7 @@ export function createGate(options: GateOptions): Gate {
         // HTML comments are guidance for the person editing the file (npm run init writes them), not rules.
         text = (await readFile(file, "utf8")).replace(/<!--[\s\S]*?-->/g, "").trim();
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT" && spec.instructions_file === defaultInstructionsFile(role)) continue;
+        if ((error as NodeJS.ErrnoException).code === "ENOENT" && (deciderDefault || spec.instructions_file === defaultInstructionsFile(role))) continue;
         return `${field}: cannot read ${spec.instructions_file}: ${(error as Error).message}`;
       }
       const combined = [text, spec.instructions?.trim()].filter(Boolean).join("\n\n");
@@ -856,6 +878,8 @@ export function createGate(options: GateOptions): Gate {
       childAgentId: null,
       canStopAnswering: false,
       permission: null,
+      decider: Boolean((JSON.parse(chain.policy_json) as Policy).supervision),
+      checks: null,
     };
   }
 
@@ -906,6 +930,7 @@ export function createGate(options: GateOptions): Gate {
           answer_at: null,
           answer_reply: null,
           answer_signal: null,
+          round_json: null,
         },
         now(),
       ) ?? chain
@@ -915,7 +940,7 @@ export function createGate(options: GateOptions): Gate {
   async function endChain(
     paseo: Paseo,
     agentId: string,
-    final: (Pick<OutcomeCard, "state" | "message"> & Partial<Pick<OutcomeCard, "category" | "question">>) | null,
+    final: (Pick<OutcomeCard, "state" | "message"> & Partial<OutcomeCard>) | null,
   ) {
     const chain = ledger.chain(agentId);
     if (!chain) return;
@@ -973,7 +998,7 @@ export function createGate(options: GateOptions): Gate {
     const id = lastUser?.messageId ?? lastUser?.clientMessageId ?? "";
     if (prior === null) return clipRequest(firstRequestText(timeline, lastUser));
     if (id.startsWith("ptg:retry:")) return prior;
-    const label = id.startsWith("ptg:answer:") ? "Answered on the user's behalf" : "Follow-up from the user";
+    const label = id.startsWith("ptg:answer:") || id.startsWith(ROUND_PREFIX) ? "Answered on the user's behalf" : "Follow-up from the user";
     return clipRequest(`${prior}\n\n${label}: ${text}`);
   }
 
@@ -996,12 +1021,14 @@ export function createGate(options: GateOptions): Gate {
   }
 
   /** Starts a review/verify of the task's changes (no-op without checks or for an unchanged tree). */
-  async function startGate(paseo: Paseo, task: Task, knownEndTree?: string): Promise<void> {
+  /** Returns the new run's id, or null when nothing was started. */
+  async function startGate(paseo: Paseo, task: Task, knownEndTree?: string): Promise<string | null> {
     const checks = gateChecks(task.policy);
-    if (checks.length === 0) return;
+    if (checks.length === 0) return null;
     const endTree = knownEndTree ?? (await snapshotTree(task.repoRoot));
-    if (endTree === task.baseTree) return log(`skip ${task.agentId}: working tree unchanged`);
-    if (endTree === task.checkedTree) return log(`skip ${task.agentId}: tree already checked; its changes are left as they are`);
+    const skip = (reason: string) => (log(`skip ${task.agentId}: ${reason}`), null);
+    if (endTree === task.baseTree) return skip("working tree unchanged");
+    if (endTree === task.checkedTree) return skip("tree already checked; its changes are left as they are");
     const run = {
       run_id: randomUUID(),
       source_agent_id: task.agentId,
@@ -1016,11 +1043,12 @@ export function createGate(options: GateOptions): Gate {
       concurrent_agents: encodeConcurrent(task.concurrent),
       task_id: ledger.beginTask(task.agentId, now()),
     };
-    if (!ledger.claim(run, now(), task.startRound ?? 1)) return log(`skip ${task.agentId}: run already exists for this turn`);
+    if (!ledger.claim(run, now(), task.startRound ?? 1)) return skip("run already exists for this turn");
     // The task lives until this run's result is in (transition → releaseRun).
     ledger.attachRun(task.agentId, run.run_id, now());
     log(`gate ${run.run_id} for ${task.agentId}: ${checks.join(" → ")}`);
     await dispatch(paseo, ledger.get(run.run_id)!);
+    return run.run_id;
   }
 
   async function applyOutcome(
@@ -1049,6 +1077,7 @@ export function createGate(options: GateOptions): Gate {
       }
       return endChain(paseo, task.agentId, { state: "stopped", message: "You stopped the agent." });
     }
+    if (task.policy.supervision && !FAILURES.has(category)) return startRound(paseo, task, category, detail, reply);
     // A task that did nothing (a chat question, an explanation) is left alone: no checks, no answerer. One that
     // worked without changing files yet (it read code, then asks how to proceed) can still be answered, and a
     // failed turn is always reported: the user may not be watching.
@@ -1088,7 +1117,11 @@ export function createGate(options: GateOptions): Gate {
       permission: null,
     };
     if (typeof action === "object" && "retry" in action) {
-      if (chain.retries < action.retry.max) return scheduleRetry(paseo, chain, base, action.retry);
+      const supervision = task.policy.supervision;
+      const withinBudget = !supervision || chain.answers + chain.retries < supervision.budget.max_auto_sends;
+      // Version 3 backs off: 30s, 2min, 8min.
+      const retry = supervision ? { ...action.retry, delay_seconds: action.retry.delay_seconds * 4 ** chain.retries } : action.retry;
+      if (chain.retries < action.retry.max && withinBudget) return scheduleRetry(paseo, chain, base, retry);
       await publishChainCard(paseo, chain, {
         ...base,
         state: "notice",
@@ -1152,6 +1185,7 @@ export function createGate(options: GateOptions): Gate {
 
   async function startScheduledAnswer(paseo: Paseo, chain: Chain): Promise<void> {
     const current = ledger.updateChain(chain.agent_id, { answer_at: null }, now()) ?? chain;
+    if (roundOf(current)?.phase === "waiting") return dispatchDecider(paseo, current, "plan");
     const cfg = answerConfig(JSON.parse(current.policy_json) as Policy);
     const source = await refreshAgent(paseo, current.agent_id);
     if (!source) return ledger.deleteChain(current.agent_id);
@@ -1291,6 +1325,7 @@ export function createGate(options: GateOptions): Gate {
   ): Promise<void> {
     const chain = ledger.chain(owner.agentId);
     if (!chain || chain.chain_id !== owner.chainId || chain.answer_child_id !== childId) return; // stale
+    if (roundOf(chain)) return finalizeDecider(paseo, chain, childId, outcome, timeline);
     const startTree = (JSON.parse(chain.answer_dispatch_json ?? "{}") as { endTree?: string }).endTree;
     let current = await cancelChainWork(paseo, chain);
     const denied = deniedAnswerers.delete(childId) ? "a permission request of the answerer was not answered in time and was denied; " : "";
@@ -1383,6 +1418,376 @@ export function createGate(options: GateOptions): Gate {
     return true;
   }
 
+  // ---------- decision rounds (version 3, docs/completion-supervisor.md §5) ----------
+
+  /**
+   * One decision round per turn that did work: the checks start at once (speculative), the decider plans after
+   * the grace period, then writes the reply from the checks' results. One message to the agent, or one hand-off.
+   */
+  interface Round {
+    seq: number;
+    /** waiting: grace period; planning / merging: a decider runs; checking: the plan waits for the checks. */
+    phase: "waiting" | "planning" | "checking" | "merging";
+    runId: string | null;
+    /** The checks already passed on endTree in an earlier round. */
+    reused: boolean;
+    /** endTree differs from the task's baseline. */
+    changed: boolean;
+    endTree: string;
+    reply: string;
+    signal: string | null;
+    plan: DeciderPlan | null;
+    /** A "done" without checks started them once; a second one without a PASS goes to the user. */
+    rechecked: boolean;
+  }
+
+  const roundOf = (chain: Chain): Round | null => (chain.round_json ? (JSON.parse(chain.round_json) as Round) : null);
+  const saveRound = (chain: Chain, round: Round | null): Chain =>
+    ledger.updateChain(chain.agent_id, { round_json: round ? JSON.stringify(round) : null }, now()) ?? chain;
+  const supervisionOfChain = (chain: Chain) => (JSON.parse(chain.policy_json) as Policy).supervision!;
+  const sendsOf = (chain: Chain) => chain.answers + chain.retries;
+
+  async function startRound(paseo: Paseo, task: Task, category: Category, detail: string | null, reply: string): Promise<void> {
+    const supervision = task.policy.supervision!;
+    const endTree = await snapshotTree(task.repoRoot);
+    const changed = endTree !== task.baseTree;
+    if (!changed && (category === "done" || !task.worked)) {
+      log(`skip ${task.agentId}: working tree unchanged (${category})`);
+      return endChain(paseo, task.agentId, { state: "resolved", message: "The task ended without changing files." });
+    }
+    let chain = ensureChain(task);
+    if (task.userSpoke && chain.budget_since !== null) {
+      // You took over: your message is new direction, so the automation budget and earlier PASS start again.
+      chain = ledger.updateChain(task.agentId, { answers: 0, retries: 0, no_progress: 0, passed_tree: null, last_fingerprint: null, budget_since: now() }, now())!;
+    } else if (chain.budget_since === null) {
+      chain = ledger.updateChain(task.agentId, { budget_since: now() }, now())!;
+    }
+    const reused = changed && chain.passed_tree === endTree;
+    if (category === "done" && reused) {
+      // e.g. the agent committed after an answer: same tree, already checked.
+      return endChain(paseo, task.agentId, { state: "resolved", category: "done", question: null, message: "Completed: the checks already passed on this tree." });
+    }
+    chain = await newCard(paseo, chain);
+    const signal = category === "awaiting_user" ? detail : null;
+    const handOff = (reason: string) => roundNeedsUser(paseo, chain, replyTail(reply), reason);
+    if (chain.stop_answering) return handOff("auto-answering was stopped for this task");
+    if (sendsOf(chain) >= supervision.budget.max_auto_sends) {
+      return handOff(`the task used its ${supervision.budget.max_auto_sends} automatic messages`);
+    }
+    // ponytail: wall clock since the budget started, including time spent waiting for you. Upgrade path: pause the
+    // clock in needs-user states.
+    if (now() - (chain.budget_since ?? chain.created_at) > supervision.budget.max_minutes * 60_000) {
+      return handOff(`the task ran for more than ${supervision.budget.max_minutes} minutes`);
+    }
+    // ponytail: progress is the tree only; findings and evidence are not compared.
+    const noProgress = chain.last_fingerprint === endTree ? chain.no_progress + 1 : 0;
+    chain = ledger.updateChain(task.agentId, { last_fingerprint: endTree, no_progress: noProgress }, now())!;
+    if (noProgress >= supervision.budget.max_no_progress_rounds) {
+      return handOff(`${noProgress + 1} rounds in a row ended without changing files`);
+    }
+    const seq = (roundOf(chain)?.seq ?? chain.card_seq) + 1;
+    let runId: string | null = null;
+    if (changed && !reused && supervision.speculative_checks) runId = await startGate(paseo, { ...task, turnKey: `${task.turnKey}:round:${seq}` }, endTree);
+    const round: Round = { seq, phase: "waiting", runId, reused, changed, endTree, reply, signal, plan: null, rechecked: false };
+    chain = saveRound(ledger.chain(task.agentId) ?? chain, round);
+    if (supervision.reply_delay_seconds === 0) return dispatchDecider(paseo, chain, "plan");
+    const at = now() + supervision.reply_delay_seconds * 1000;
+    chain = ledger.updateChain(task.agentId, { answer_at: at }, now())!;
+    await publishChainCard(paseo, chain, {
+      ...roundCard(chain, round),
+      state: "answer_scheduled",
+      nextRetryAt: at,
+      canStopAnswering: true,
+    });
+    wakeAt(paseo, at);
+  }
+
+  /** The card fields every state of a round shares. */
+  function roundCard(chain: Chain, round: Round | null): Partial<OutcomeCard> {
+    const run = round?.runId ? ledger.get(round.runId) : null;
+    return {
+      category: "awaiting_user",
+      decider: true,
+      question: round ? replyTail(round.reply) : null,
+      answer: null,
+      message: null,
+      suggestion: null,
+      attempt: sendsOf(chain),
+      maxAttempts: supervisionOfChain(chain).budget.max_auto_sends,
+      nextRetryAt: null,
+      childAgentId: null,
+      permission: null,
+      checks: round?.reused ? "Checks already passed on this tree." : run ? checksLine(run) : null,
+    };
+  }
+
+  function checksLine(run: Run): string {
+    const records = (JSON.parse(run.rounds_json) as RoundRecord[]).filter((record) => record.round === run.round);
+    const done = records.map((record) => `${record.check} ${record.verdict ?? "?"}${record.reason ? ` (${record.reason})` : ""}`);
+    return isTerminal(run.status) ? `Checks: ${done.join(", ") || run.status}` : `Checks running: ${[...done, `${checkOf(run)}…`].join(", ")}`;
+  }
+
+  /** The checks' results as the decider reads them. */
+  function describeRun(run: Run): string {
+    const records = (JSON.parse(run.rounds_json) as RoundRecord[]).filter((record) => record.round === run.round);
+    const verdict = run.result_json ? (JSON.parse(run.result_json) as Verdict) : null;
+    const lines = records.map((record) => `- ${record.check}: ${record.verdict}${record.reason ? ` (${record.reason})` : ""}. ${record.summary ?? ""}`);
+    const findings = (verdict?.findings ?? []).map(
+      (finding) => `  [${finding.severity}] ${finding.title}\n    Evidence: ${finding.evidence}\n    Suggested fix: ${finding.suggested_fix}`,
+    );
+    return [`Overall: ${run.status}`, ...lines, ...(findings.length ? ["Findings of the last check:", ...findings] : [])].join("\n");
+  }
+
+  async function dispatchDecider(paseo: Paseo, chain: Chain, phase: "plan" | "merge"): Promise<void> {
+    const round = roundOf(chain);
+    if (!round) return;
+    const policy = JSON.parse(chain.policy_json) as Policy;
+    const source = await refreshAgent(paseo, chain.agent_id);
+    if (!source) return;
+    if (phase === "plan" && !sendable(source.status)) {
+      // You (or another message) started a turn during the grace period; that turn starts a new round.
+      return endRound(paseo, saveRound(chain, null), { state: "stopped", message: "The agent was busy again; this round was skipped." });
+    }
+    const spec = policy.agents.answerer;
+    const profiles = spec.profile ? (await paseo.config.get()).config.agentProfiles ?? [] : [];
+    const resolved = resolveRole(inheritedConfig(source), spec, ROLE_PROFILE.answerer, profiles);
+    if (!resolved.ok) return roundNeedsUser(paseo, chain, replyTail(round.reply), `cannot start the decider: ${resolved.error}`);
+    const { model, ...launch } = resolved.config;
+    const run = round.runId ? ledger.get(round.runId) : null;
+    const checks = round.reused
+      ? "they already passed on this tree; they are not run again."
+      : !round.changed
+        ? "none: the task has not changed any files."
+        : run
+          ? isTerminal(run.status)
+            ? `finished (${run.status}).`
+            : `running (${gateChecks(policy).join(", ")}).`
+          : `not started; list the ones you need in "workers" (${gateChecks(policy).join(", ")}).`;
+    const tree = await snapshotTree(chain.repo_root);
+    const childAgentId = randomUUID();
+    const key = `${ROUND_PREFIX}ask:${chain.chain_id}:${childAgentId}`;
+    const payload = {
+      agentId: childAgentId,
+      idempotencyKey: key,
+      parent: chain.agent_id,
+      config: { ...launch, provider: `${launch.provider}/${model}` },
+      title: `Gate decide #${round.seq}${phase === "merge" ? " (reply)" : ""} · ${source.title ?? chain.agent_id.slice(0, 8)}`,
+      prompt: buildDeciderPrompt({
+        phase,
+        requestText: chain.request_text,
+        repoRoot: chain.repo_root,
+        baseTree: chain.base_tree,
+        endTree: round.endTree,
+        agentReply: truncate(round.reply, 6000),
+        signal: round.signal,
+        previousQuestion: chain.last_question,
+        instructions: spec.instructions,
+        checks,
+        results: phase === "merge" ? (run ? describeRun(run) : checks) : undefined,
+        plan: round.plan,
+        sendsLeft: supervisionOfChain(chain).budget.max_auto_sends - sendsOf(chain),
+        concurrentAgents: ledger.taskConcurrent(chain.agent_id),
+      }),
+      clientMessageId: key,
+      outputSchema: phase === "plan" ? DECIDER_PLAN_JSON_SCHEMA : DECIDER_REPLY_JSON_SCHEMA,
+      labels: { [MANAGED_LABEL]: "true", "post-turn-gate.role": "decider", "post-turn-gate.chain-id": chain.chain_id },
+    };
+    ledger.addChainChild(childAgentId, chain.agent_id, chain.chain_id);
+    let current = ledger.updateChain(
+      chain.agent_id,
+      {
+        answer_at: null,
+        answer_child_id: childAgentId,
+        // endTree: the tree the decider started on, to detect its edits (not part of the create payload).
+        answer_dispatch_json: JSON.stringify({ workspaceId: chain.workspace_id, endTree: tree, ...payload }),
+        answer_deadline_at: now() + spec.timeout_minutes * minuteMs,
+      },
+      now(),
+    )!;
+    current = saveRound(current, { ...round, phase: phase === "plan" ? "planning" : "merging" });
+    current = await publishChainCard(paseo, current, {
+      ...roundCard(current, round),
+      state: "answering",
+      message: resolved.note ?? null,
+      childAgentId,
+      canStopAnswering: true,
+    });
+    await createAnswerer(paseo, current);
+  }
+
+  async function finalizeDecider(
+    paseo: Paseo,
+    chain: Chain,
+    childId: string,
+    outcome: TurnEnded["outcome"],
+    timeline: readonly TimelineItem[],
+  ): Promise<void> {
+    const startTree = (JSON.parse(chain.answer_dispatch_json ?? "{}") as { endTree?: string }).endTree;
+    let current = ledger.updateChain(chain.agent_id, { answer_child_id: null, answer_dispatch_json: null, answer_deadline_at: null }, now()) ?? chain;
+    await archiveChild(paseo, childId);
+    const round = roundOf(current);
+    if (!round) return;
+    const handOff = (reason: string) => roundNeedsUser(paseo, current, replyTail(round.reply), reason);
+    const denied = deniedAnswerers.delete(childId) ? "a permission request of the decider was not answered in time and was denied; " : "";
+    if (outcome.kind !== "completed") return handOff(`${denied}the decider turn ${outcome.kind}`);
+    const afterTree = startTree ? await snapshotTree(current.repo_root) : null;
+    if (startTree && afterTree !== startTree) {
+      const changes = await diffStat(current.repo_root, startTree, afterTree!);
+      return handOff(`the working tree changed while the decider ran, so nothing was sent. Nothing was reverted:\n${truncate(changes, 600)}`);
+    }
+    const text = latestAssistantText(timeline);
+    if (round.phase === "merging") {
+      const reply = parseDeciderReply(text);
+      if (!reply) return handOff(`${denied}the decider reply is not valid JSON`);
+      return applyReply(paseo, current, round, reply);
+    }
+    const plan = parseDeciderPlan(text);
+    if (!plan) return handOff(`${denied}the decider plan is not valid JSON`);
+    const planned: Round = { ...round, plan };
+    current = saveRound(current, planned);
+    const run = planned.runId ? ledger.get(planned.runId) : null;
+    // A "done" on changed files needs the checks' PASS (applyReply), so it waits for them like a plan that asks for checks.
+    const awaitsChecks = plan.reply_now?.kind === "done" && planned.changed && !planned.reused;
+    if (plan.workers.length === 0 && !awaitsChecks) {
+      if (!plan.reply_now) return handOff("the decider asked for no checks and gave no reply");
+      if (run && !isTerminal(run.status)) await cancelRun(paseo, run);
+      return applyReply(paseo, current, planned, plan.reply_now);
+    }
+    if (planned.reused || !planned.changed) return dispatchDecider(paseo, current, "merge");
+    if (!run) return startRoundChecks(paseo, current, planned);
+    // The speculative checks may have finished before the plan (the grace period often covers them).
+    current = saveRound(current, { ...planned, phase: "checking" });
+    if (isTerminal(run.status)) return settleRound(paseo, current, run);
+  }
+
+  async function startRoundChecks(paseo: Paseo, chain: Chain, round: Round): Promise<void> {
+    let current = saveRound(chain, { ...round, phase: "checking" });
+    const task = { ...taskFromChain(current), turnKey: `${chain.agent_id}:round:${chain.chain_id}:${round.seq}:${round.rechecked ? "recheck" : "plan"}` };
+    const runId = await startGate(paseo, task, round.endTree);
+    current = ledger.chain(chain.agent_id) ?? current;
+    if (!runId) return roundNeedsUser(paseo, current, replyTail(round.reply), "the checks could not be started");
+    const latest = roundOf(current);
+    if (!latest || latest.seq !== round.seq) return; // the round ended while the checks started (a failed start)
+    current = saveRound(current, { ...latest, runId });
+    const run = ledger.get(runId)!;
+    if (isTerminal(run.status)) await settleRound(paseo, current, run);
+  }
+
+  /** A run of a version 3 task ended: its round goes on. */
+  async function onRunSettled(paseo: Paseo, run: Run): Promise<void> {
+    if (!(JSON.parse(run.policy_json) as Policy).supervision) return;
+    const chain = ledger.chain(run.source_agent_id);
+    const round = chain ? roundOf(chain) : null;
+    if (chain && round?.runId === run.run_id) await settleRound(paseo, chain, run);
+  }
+
+  async function settleRound(paseo: Paseo, chain: Chain, run: Run): Promise<void> {
+    const round = roundOf(chain);
+    if (!round || round.runId !== run.run_id || run.status === "SUPERSEDED") return;
+    // A checker that edited the tree, a denied permission, an ambiguous request or a failed checker: yours to decide.
+    if (run.status === "NEEDS_HUMAN" || run.status === "ERROR") {
+      if (chain.answer_child_id) await archiveChild(paseo, chain.answer_child_id);
+      const current = ledger.updateChain(chain.agent_id, { answer_child_id: null, answer_dispatch_json: null, answer_deadline_at: null, answer_at: null }, now()) ?? chain;
+      return roundNeedsUser(paseo, current, replyTail(round.reply), run.error ?? `the checks ended ${run.status}`);
+    }
+    if (round.phase === "checking") return dispatchDecider(paseo, chain, "merge");
+    // waiting / planning: the plan decides what happens with the result.
+    await publishChainCard(paseo, chain, { checks: checksLine(run) });
+  }
+
+  async function cancelRun(paseo: Paseo, run: Run): Promise<void> {
+    const next = await transition(paseo, run, { status: "SUPERSEDED", error: "Not needed: the decider replied without these checks." });
+    await archiveChild(paseo, next.child_agent_id);
+  }
+
+  /** The guardrails every reply passes before it is sent (docs/completion-supervisor.md §8). */
+  async function applyReply(paseo: Paseo, chain: Chain, round: Round, reply: DeciderReply): Promise<void> {
+    const question = round.plan?.question.trim() || replyTail(round.reply);
+    if (reply.kind === "escalate") return roundNeedsUser(paseo, chain, reply.question.trim() || question, reply.reason || "the decider handed this to you");
+    const run = round.runId ? ledger.get(round.runId) : null;
+    const passed = round.reused || (run?.status === "PASSED" && run.end_tree === round.endTree);
+    if (reply.kind === "done") {
+      if (round.changed && !passed) {
+        if (!run && !round.rechecked) return startRoundChecks(paseo, chain, { ...round, rechecked: true });
+        return roundNeedsUser(paseo, chain, question, `the decider says the task is done, but the checks ${run ? `ended ${run.status}` : "did not run"}`);
+      }
+      return endRound(paseo, chain, {
+        state: "resolved",
+        category: "done",
+        question: null,
+        message: round.changed ? "Completed: the checks passed." : "Completed.",
+      });
+    }
+    const text = reply.message.trim();
+    if (!text) return roundNeedsUser(paseo, chain, question, "the decider wrote an empty reply");
+    const risk = answerRisk(`${question}\n${text}`);
+    if (risk) return roundNeedsUser(paseo, chain, question, `not sent automatically: ${risk}`);
+    if (reply.answers_question && chain.last_question && similarity(question, chain.last_question) >= SAME_QUESTION) {
+      return roundNeedsUser(paseo, chain, question, "the agent asked the same question again after an automatic answer");
+    }
+    const budget = supervisionOfChain(chain).budget.max_auto_sends;
+    if (sendsOf(chain) >= budget) return roundNeedsUser(paseo, chain, question, `the task used its ${budget} automatic messages`);
+    const attempt = chain.answers + 1;
+    let current = chain;
+    const result = await sendIfIdle(
+      paseo,
+      chain.agent_id,
+      { text: `${ANSWER_PREFIX}\n${text}`, messageId: `${ROUND_PREFIX}${chain.chain_id}:${attempt}` },
+      {
+        accept: IDLE_OR_ERROR,
+        beforeSend: () =>
+          (current = ledger.updateChain(
+            chain.agent_id,
+            {
+              answers: attempt,
+              last_question: reply.answers_question ? question : chain.last_question,
+              passed_tree: passed ? round.endTree : chain.passed_tree,
+              round_json: null,
+            },
+            now(),
+          )!),
+      },
+    );
+    if (result !== "sent") {
+      return endRound(paseo, saveRound(chain, null), { state: "stopped", message: "You replied first; the automatic reply was not sent." });
+    }
+    await publishChainCard(paseo, current, {
+      ...roundCard(current, round),
+      state: "answered",
+      answer: truncate(text, 2000),
+      message: reply.reason ? truncate(reply.reason, 1000) : null,
+      canStopAnswering: true,
+    });
+    log(`decider replied for ${chain.agent_id} (${attempt})`);
+  }
+
+  /** Hands the round to you; the task (chain) stays, so your reply continues it. */
+  async function roundNeedsUser(paseo: Paseo, chain: Chain, question: string, reason: string): Promise<void> {
+    const round = roundOf(chain);
+    const run = round?.runId ? ledger.get(round.runId) : null;
+    if (run && !isTerminal(run.status)) await cancelRun(paseo, run);
+    const current = saveRound(ledger.chain(chain.agent_id) ?? chain, null);
+    log(`needs user for ${chain.agent_id}: ${reason}`);
+    await publishChainCard(paseo, current, {
+      ...roundCard(current, round),
+      state: "needs_user",
+      question: truncate(question, 2000),
+      message: truncate(reason, 1000),
+      suggestion: SUGGESTIONS.awaiting_user,
+      canStopAnswering: false,
+    });
+  }
+
+  async function endRound(
+    paseo: Paseo,
+    chain: Chain,
+    final: Pick<OutcomeCard, "state" | "message"> & Partial<Pick<OutcomeCard, "category" | "question">>,
+  ): Promise<void> {
+    const round = roundOf(chain);
+    if (final.state === "resolved") return endChain(paseo, chain.agent_id, { ...roundCard(chain, round), ...final });
+    await publishChainCard(paseo, saveRound(chain, null), { ...roundCard(chain, round), ...final, canStopAnswering: false });
+  }
+
   // ---------- event handlers ----------
 
   /**
@@ -1445,7 +1850,7 @@ export function createGate(options: GateOptions): Gate {
     const agentId = event.agent.id;
     let chain = liveChain(agentId);
     // The plugin clears these before sending its own answer or retry, so this is always the user.
-    if (chain && (chain.answer_child_id || chain.next_retry_at !== null || chain.answer_at !== null)) {
+    if (chain && (chain.answer_child_id || chain.next_retry_at !== null || chain.answer_at !== null || chain.round_json)) {
       chain = await cancelChainWork(paseo, chain);
       chain = await publishChainCard(paseo, chain, {
         state: "stopped",
@@ -1566,6 +1971,7 @@ export function createGate(options: GateOptions): Gate {
         (chain !== null && (chain.answers > 0 || chain.retries > 0 || chain.rounds_used > 0)),
       startRound: (chain?.rounds_used ?? snapshot.carriedRounds ?? 0) + 1,
       checkedTree: chain ? null : snapshot.checkedTree ?? null,
+      userSpoke: !isPluginMessage(messageId),
     };
     await applyOutcome(paseo, task, category, detail, replyText(items));
     // Handled: a run, a chain (both keep the carried baseline) or nothing left to check. A replaced turn's
@@ -1799,6 +2205,9 @@ export function createGate(options: GateOptions): Gate {
           await startScheduledAnswer(paseo, chain);
         } else if (chain.answer_child_id) {
           await reconcileAnswerer(paseo, chain);
+        } else if (roundOf(chain)?.phase === "checking") {
+          const run = ledger.get(roundOf(chain)!.runId ?? "");
+          if (run && isTerminal(run.status)) await settleRound(paseo, chain, run);
         }
       } catch (error) {
         log(`reconcile chain ${chain.chain_id} failed`, error);

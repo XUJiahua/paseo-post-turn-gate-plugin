@@ -21,6 +21,18 @@ const CATEGORY_LABELS: Record<Category, string> = {
 };
 
 function stateLabel(data: OutcomeCardData): string {
+  if (data.decider) {
+    switch (data.state) {
+      case "answer_scheduled":
+        return "Deciding soon";
+      case "answering":
+        return "Deciding…";
+      case "answered":
+        return `Replied for you (${data.attempt}/${data.maxAttempts})`;
+      case "resolved":
+        return data.category === "done" ? "Completed" : "Resolved";
+    }
+  }
   switch (data.state) {
     case "answer_scheduled":
       return "Answering for you soon";
@@ -74,13 +86,15 @@ export function OutcomeCard({ item, theme }: PluginTimelineItemProps<OutcomeCard
   }
 
   const status = stateLabel(data);
+  const title = data.decider ? "Post-turn supervisor" : `Post-turn gate · ${CATEGORY_LABELS[data.category]}`;
+  const who = data.decider ? "Decider" : "Answerer";
   return (
-    <View style={styles.card} accessible accessibilityLabel={`Post-turn gate: ${CATEGORY_LABELS[data.category]}, ${status}`}>
+    <View style={styles.card} accessible accessibilityLabel={`${title}, ${status}`}>
       <View style={styles.header}>
-        <Text style={styles.title}>Post-turn gate · {CATEGORY_LABELS[data.category]}</Text>
+        <Text style={styles.title}>{title}</Text>
         <Text style={statusStyle}>{status}</Text>
       </View>
-      {data.permission ? <PermissionPrompt permission={data.permission} styles={styles} who="Answerer" /> : null}
+      {data.permission ? <PermissionPrompt permission={data.permission} styles={styles} who={who} /> : null}
       {data.question ? (
         <Text style={styles.body} selectable>
           Agent asked: {data.question}
@@ -88,7 +102,12 @@ export function OutcomeCard({ item, theme }: PluginTimelineItemProps<OutcomeCard
       ) : null}
       {data.answer ? (
         <Text style={styles.body} selectable>
-          Answer sent: {data.answer}
+          {data.decider ? "Reply sent" : "Answer sent"}: {data.answer}
+        </Text>
+      ) : null}
+      {data.checks ? (
+        <Text style={styles.muted} selectable>
+          {data.checks}
         </Text>
       ) : null}
       {data.message ? (
@@ -100,7 +119,7 @@ export function OutcomeCard({ item, theme }: PluginTimelineItemProps<OutcomeCard
       {data.nextRetryAt ? (
         <Text style={styles.muted}>
           {data.state === "answer_scheduled"
-            ? `The answerer starts at ${formatTime(data.nextRetryAt)} unless you reply first`
+            ? `The ${who.toLowerCase()} starts at ${formatTime(data.nextRetryAt)} unless you reply first`
             : `Next retry at ${formatTime(data.nextRetryAt)}`}
         </Text>
       ) : null}
@@ -121,7 +140,7 @@ export function OutcomeCard({ item, theme }: PluginTimelineItemProps<OutcomeCard
       {error ? <Text style={styles.danger}>{error}</Text> : null}
       {data.childAgentId ? (
         <Text style={styles.muted} selectable>
-          Answerer · {data.childAgentId}
+          {who} · {data.childAgentId}
           {data.state === "answering" ? " (in this agent's Subagents)" : " (open it from History)"}
         </Text>
       ) : null}

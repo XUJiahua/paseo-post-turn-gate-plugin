@@ -76,6 +76,15 @@ export interface Chain {
   answer_at: number | null;
   answer_reply: string | null;
   answer_signal: string | null;
+  /** Version 3: the decision round in progress (JSON, see gate.ts Round). */
+  round_json: string | null;
+  /** Version 3: the tree the checks last passed on; a later turn ending on it needs no new checks. */
+  passed_tree: string | null;
+  /** Version 3: the tree of the last decision round, and how many rounds in a row ended on it. */
+  last_fingerprint: string | null;
+  no_progress: number;
+  /** Version 3: start of the automation budget (the chain's start, or your last message in it). */
+  budget_since: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -115,6 +124,11 @@ const CHAIN_COLUMNS = [
   "answer_at",
   "answer_reply",
   "answer_signal",
+  "round_json",
+  "passed_tree",
+  "last_fingerprint",
+  "no_progress",
+  "budget_since",
 ] as const;
 
 /** Automation state of a chain, cleared when a chain starts or ends. */
@@ -133,6 +147,11 @@ const CHAIN_RESET = {
   answer_at: null,
   answer_reply: null,
   answer_signal: null,
+  round_json: null,
+  passed_tree: null,
+  last_fingerprint: null,
+  no_progress: 0,
+  budget_since: null,
 } as const;
 
 /**
@@ -282,6 +301,11 @@ export class Ledger {
         answer_signal TEXT,
         turn_json TEXT,
         turn_at INTEGER,
+        round_json TEXT,
+        passed_tree TEXT,
+        last_fingerprint TEXT,
+        no_progress INTEGER NOT NULL DEFAULT 0,
+        budget_since INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -315,7 +339,16 @@ export class Ledger {
       dispute: "TEXT",
       task_id: "TEXT",
     });
-    migrate("tasks", { task_id: "TEXT", run_id: "TEXT", concurrent_json: "TEXT" });
+    migrate("tasks", {
+      task_id: "TEXT",
+      run_id: "TEXT",
+      concurrent_json: "TEXT",
+      round_json: "TEXT",
+      passed_tree: "TEXT",
+      last_fingerprint: "TEXT",
+      no_progress: "INTEGER NOT NULL DEFAULT 0",
+      budget_since: "INTEGER",
+    });
     this.importOldTables();
   }
 
