@@ -195,7 +195,7 @@ turn_started(agent)
   ├─ agent 是 ledger 中某个 run 的子 Agent → 忽略
   ├─ 该源 Agent 有 REVIEWING/DISPATCHING 的 run → 旧 run 标 SUPERSEDED，其 base_tree 和请求写入 ledger 的 carries 表留给下一轮
   ├─ trigger=root_only 且 parentAgentId≠null → 忽略
-  └─ 读取策略、计算基线 tree → 存入内存 pending[agentId] = { policy, baseTree, repoRoot }；同一 repo 有 carry 时用它替换基线
+  └─ 读取策略、计算基线 tree → 存入内存 pending[agentId] = { policy, baseTree, repoRoot }，并写一份到 ledger 的 turn_snapshots；同一 repo 有 carry 时用它替换基线
      （carry 在这一轮结束、结果交给 run 或 chain 后才删除；插件中途重启也不会丢；24 小时没更新的 carry 作废）
      （carry 记下任务已用的修复轮次，下一个 run 从这里接着数；checked_tree 是检查已判 FAIL / 被反驳的 tree，
       下一轮结束时 tree 仍是它 → 不再检查，删除 carry，改动按原样保留）
@@ -205,7 +205,7 @@ turn_ended(agent, outcome, timeline)
   ├─ agent 是某条任务链的 answerer → finalizeAnswer（turn-outcomes.md §3.1）
   ├─ 最后一条 user_message.messageId 形如 "ptg:<run_id>:fix:<n>" → onFixTurnEnded(run, outcome)
   ├─ pending 属于更早的 turn（已被新一轮替换，基线已交给新一轮）→ 结束
-  ├─ 没有 pending（例如插件中途重载）→ 记日志，结束
+  ├─ 内存里没有 pending（插件中途重载、daemon 重启）→ 从 ledger 的 turn_snapshots 恢复，按原基线继续；都没有才记日志、结束
   ├─ refresh() 源 Agent → 按 labels + trigger 过滤（managed=true 永远跳过；无效策略也读得出 trigger）
   ├─ 策略无效 → 工作区有变化才写 ERROR 卡片（§3），结束；策略有效 → 之前的错误卡标为“已修复”
   └─ classify(outcome) → 按 on_outcome 分派（turn-outcomes.md）：

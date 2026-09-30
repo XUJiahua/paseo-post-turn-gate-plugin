@@ -252,6 +252,11 @@ export class Ledger {
         checked_tree TEXT,
         created_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS turn_snapshots (
+        agent_id TEXT PRIMARY KEY,
+        snapshot_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
     `);
     // Ledgers created by older releases lack newer columns.
     const migrate = (table: string, added: Record<string, string>) => {
@@ -461,6 +466,30 @@ export class Ledger {
 
   deleteCarry(agentId: string): void {
     this.db.prepare("DELETE FROM carries WHERE agent_id = ?").run(agentId);
+  }
+
+  // ---------- turn snapshots ----------
+
+  /** The policy and baseline frozen at a running turn's start, so a plugin restart mid-turn still gates it. */
+  setTurnSnapshot(agentId: string, snapshotJson: string, now: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO turn_snapshots (agent_id, snapshot_json, created_at) VALUES (?, ?, ?)
+         ON CONFLICT(agent_id) DO UPDATE SET snapshot_json = excluded.snapshot_json, created_at = excluded.created_at`,
+      )
+      .run(agentId, snapshotJson, now);
+  }
+
+  turnSnapshot(agentId: string): { snapshot_json: string; created_at: number } | null {
+    return (
+      (this.db.prepare("SELECT snapshot_json, created_at FROM turn_snapshots WHERE agent_id = ?").get(agentId) as
+        | { snapshot_json: string; created_at: number }
+        | undefined) ?? null
+    );
+  }
+
+  deleteTurnSnapshot(agentId: string): void {
+    this.db.prepare("DELETE FROM turn_snapshots WHERE agent_id = ?").run(agentId);
   }
 
   close(): void {

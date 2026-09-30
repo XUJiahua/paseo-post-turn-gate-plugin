@@ -963,7 +963,38 @@ describe("superseded runs keep their changes in scope", () => {
     const [base] = diffOf(fake.created[0].prompt);
     gate.onTurnStarted({ agent: hookAgent(SOURCE), turnId: "t2" }, fake.paseo); // supersedes the review
     await gate.idle();
-    // Restart mid-turn: the new process has no snapshot for t2, so that turn is skipped.
+    // Restart mid-turn: t2's snapshot (carry baseline included) comes back from the ledger, so t2 is gated.
+    gate = createGate({ ledger, now: () => clock, minuteMs: 1_000 / 30, log: () => {} });
+    gate.onTurnEnded({ agent: hookAgent(SOURCE), turnId: "t2", outcome: { kind: "completed" }, timeline: [] }, fake.paseo);
+    await gate.idle();
+    assert.equal(fake.created.length, 2);
+    assert.equal(diffOf(fake.created[1].prompt)[0], base);
+  });
+
+  test("a plugin reload mid-turn still gates the turn from its own baseline", async () => {
+    writePolicy({ version: 2 });
+    gate.onTurnStarted({ agent: hookAgent(SOURCE), turnId: "t1" }, fake.paseo);
+    await gate.idle();
+    edit();
+    gate = createGate({ ledger, now: () => clock, minuteMs: 1_000 / 30, log: () => {} });
+    gate.onTurnEnded({ agent: hookAgent(SOURCE), turnId: "t1", outcome: { kind: "completed" }, timeline: [] }, fake.paseo);
+    await gate.idle();
+    assert.equal(fake.created.length, 1);
+    const [base, end] = diffOf(fake.created[0].prompt);
+    assert.notEqual(base, end, "the diff covers the turn's edit");
+    await childTurn(fake.created[0].agentId, PASS);
+    // The snapshot is consumed: a later turn with no changes is not gated again.
+    await sourceTurn({ text: "thanks", messageId: "m2" });
+    assert.equal(fake.created.length, 1);
+  });
+
+  test("the carry survives a plugin restart before the next turn", async () => {
+    writePolicy({ version: 2 });
+    await sourceTurn({ change: edit });
+    const [base] = diffOf(fake.created[0].prompt);
+    gate.onTurnStarted({ agent: hookAgent(SOURCE), turnId: "t2" }, fake.paseo); // supersedes the review
+    await gate.idle();
+    ledger.deleteTurnSnapshot(SOURCE); // as if t2's snapshot never landed
     gate = createGate({ ledger, now: () => clock, minuteMs: 1_000 / 30, log: () => {} });
     gate.onTurnEnded({ agent: hookAgent(SOURCE), turnId: "t2", outcome: { kind: "completed" }, timeline: [] }, fake.paseo);
     await gate.idle();

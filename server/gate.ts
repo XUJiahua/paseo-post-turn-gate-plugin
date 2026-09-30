@@ -1386,11 +1386,32 @@ export function createGate(options: GateOptions): Gate {
 
   // ---------- event handlers ----------
 
+  /**
+   * `pending` lives in memory; the ledger keeps a copy so a turn that was running when the plugin reloaded or
+   * the daemon restarted is still gated from its own baseline, instead of its changes landing unchecked in the
+   * next turn's baseline.
+   */
+  function restorePending(agentId: string): void {
+    if (pending.has(agentId)) return;
+    const saved = ledger.turnSnapshot(agentId);
+    if (!saved) return;
+    if (now() - saved.created_at > CHAIN_TTL_MS) return ledger.deleteTurnSnapshot(agentId);
+    pending.set(agentId, JSON.parse(saved.snapshot_json) as Pending);
+  }
+
+  function savePending(agentId: string): void {
+    const snapshot = pending.get(agentId);
+    if (snapshot) ledger.setTurnSnapshot(agentId, JSON.stringify(snapshot), now());
+    else ledger.deleteTurnSnapshot(agentId);
+  }
+
   function takePending(agentId: string, turnId: string | null): { snapshot: Pending | null; stale: boolean } {
+    restorePending(agentId);
     const snapshot = pending.get(agentId);
     if (!snapshot) return { snapshot: null, stale: false };
     if (snapshot.turnId && turnId && snapshot.turnId !== turnId) return { snapshot: null, stale: true };
     pending.delete(agentId);
+    ledger.deleteTurnSnapshot(agentId);
     return { snapshot, stale: false };
   }
 
@@ -1410,8 +1431,11 @@ export function createGate(options: GateOptions): Gate {
         await archiveChild(paseo, next.child_agent_id);
       }
     }
+    // A turn that was running across a restart must keep its baseline if it is being replaced now.
+    restorePending(agentId);
     await snapshotTurn(event, paseo);
     applyCarry(agentId);
+    savePending(agentId);
     const snapshot = pending.get(agentId);
     if (snapshot) startActivity(agentId, agentId, snapshot.repoRoot, event.turnId);
   }

@@ -14,6 +14,7 @@ All notable changes to this project are documented here.
 
 - After the fix rounds are used up (or the agent disputed the findings), the next turn keeps counting the task's rounds instead of starting a new fix loop, and a turn that changes nothing leaves the changes as they are instead of checking the same tree again. Unchecked changes expire after a day.
 - Stopping the agent no longer drops what it changed: the changes are checked with its next turn.
+- A turn that was running when the plugin reloaded or the daemon restarted is still checked from its own baseline, instead of being skipped with its changes left unchecked.
 - Failed turns are reported or retried even when they changed no files; a stop after tool calls is auto-answered even before files change.
 - A finished report ending with a closing offer ("Let me know if you need anything else.") is `done`, not a question.
 - A fix turn that changes nothing is no longer checked again: a question goes to the answerer, a disagreement to you. The checker never sees the agent's reply.
