@@ -1,48 +1,40 @@
 {
-  "version": 2,
+  "version": 3,
   "trigger": "root_and_opt_in",
-  "on_fail": {
-    "fix": {
-      "max_rounds": 2
+  "supervision": {
+    "checks": [
+      "review"
+    ],
+    "speculative_checks": true,
+    "reply_delay_seconds": 60,
+    "budget": {
+      "max_auto_sends": 12,
+      "max_retries": 3,
+      "max_no_progress_rounds": 2,
+      "max_minutes": 120
     }
   },
   "agents": {
-    "reviewer": {
+    "decider": {
       "profile": null,
-      "instructions_file": ".paseo/post-turn-gate/reviewer.md",
+      "instructions_file": ".paseo/post-turn-gate/decider.md",
       "permissions": "auto",
-      "timeout_minutes": 30
+      "timeout_minutes": 10,
+      "permission_wait_minutes": 5
     },
     "verifier": {
       "profile": null,
       "instructions_file": ".paseo/post-turn-gate/verifier.md",
       "permissions": "auto",
-      "timeout_minutes": 30
+      "timeout_minutes": 30,
+      "permission_wait_minutes": 5
     },
-    "answerer": {
+    "reviewer": {
       "profile": null,
-      "instructions_file": ".paseo/post-turn-gate/answerer.md",
+      "instructions_file": ".paseo/post-turn-gate/reviewer.md",
       "permissions": "auto",
-      "timeout_minutes": 10
+      "timeout_minutes": 30,
+      "permission_wait_minutes": 5
     }
-  },
-  "on_outcome": {
-    "done": [
-      "review"
-    ],
-    "awaiting_user": {
-      "answer": {
-        "max": 3
-      }
-    },
-    "refused": "notify",
-    "user_canceled": "ignore",
-    "replaced": "ignore",
-    "crashed": "notify",
-    "network": "notify",
-    "rate_limited": "notify",
-    "quota_exhausted": "notify",
-    "context_exhausted": "notify",
-    "error": "notify"
   }
 }
