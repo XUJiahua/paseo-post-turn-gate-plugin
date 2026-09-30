@@ -42,6 +42,7 @@ function createFakePaseo() {
   const cardAppends: Array<{ agentId: string; id: string; data: CardData }> = [];
   let failCreate = false;
   let createBarrier: Promise<void> | null = null;
+  let barrierWorkspace: string | null = null;
   const keys = new Map<string, string>();
   const profiles: Array<Record<string, unknown>> = [];
   const api = {
@@ -76,7 +77,7 @@ function createFakePaseo() {
         agents: {
           create: async (options: Record<string, any>) => {
             created.push({ workspaceId, ...options });
-            if (createBarrier) await createBarrier;
+            if (createBarrier && (barrierWorkspace === null || barrierWorkspace === workspaceId)) await createBarrier;
             if (failCreate) throw new Error("provider unavailable");
             // Like the daemon (design.md V9): a key replays only its own payload.
             const payload = JSON.stringify(options);
@@ -112,8 +113,9 @@ function createFakePaseo() {
       failCreate = value;
     },
     /** Holds every agents.create until the promise resolves (another repository's slow work). */
-    setCreateBarrier: (barrier: Promise<void> | null) => {
+    setCreateBarrier: (barrier: Promise<void> | null, workspaceId: string | null = null) => {
       createBarrier = barrier;
+      barrierWorkspace = workspaceId;
     },
   };
 }
@@ -1407,6 +1409,51 @@ describe("several repositories share the plugin", () => {
       gate.onTurnEnded(endB as never, fake.paseo);
       await gate.idle();
       assert.equal(fake.created.filter((create) => create.parent === "agent-b").length, 1, "B's change is checked, not taken into its baseline");
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  test("another workspace's hung work does not delay this workspace's checks", async () => {
+    writePolicy({ version: 2 });
+    const other = mkdtempSync(path.join(tmpdir(), "ptg-other-"));
+    try {
+      const g = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: other });
+      g("init", "-q", "-b", "main");
+      writeFileSync(path.join(other, "b.txt"), "one\n");
+      mkdirSync(path.join(other, ".paseo"));
+      writeFileSync(path.join(other, ".paseo/post-turn-gate.json"), JSON.stringify({ version: 2 }));
+      g("add", ".");
+      g("commit", "-qm", "init");
+      fake.agents.set("agent-b", sourceAgent({ id: "agent-b", workspaceId: "ws-2" }));
+      const agentB = { id: "agent-b", workspaceId: "ws-2", parentAgentId: null, provider: "kiro", cwd: other, title: null };
+
+      // Workspace ws-1's reviewer start hangs.
+      let release!: () => void;
+      fake.setCreateBarrier(new Promise<void>((resolve) => (release = resolve)), "ws-1");
+      const agentA = hookAgent(SOURCE);
+      gate.onTurnStarted({ agent: agentA, turnId: "a" }, fake.paseo);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      edit();
+      gate.onTurnEnded(
+        { agent: agentA, turnId: "a", outcome: { kind: "completed" }, timeline: [{ type: "user_message", text: "do A", messageId: "a1" }, { type: "assistant_message", text: "Done." }] } as never,
+        fake.paseo,
+      );
+      while (fake.created.length === 0) await new Promise((resolve) => setTimeout(resolve, 20));
+
+      // ws-2 goes through a whole round while ws-1 is stuck.
+      gate.onTurnStarted({ agent: agentB, turnId: "b" }, fake.paseo);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      writeFileSync(path.join(other, "b.txt"), "two\n");
+      gate.onTurnEnded(
+        { agent: agentB, turnId: "b", outcome: { kind: "completed" }, timeline: [{ type: "user_message", text: "do B", messageId: "b1" }, { type: "assistant_message", text: "Done." }] } as never,
+        fake.paseo,
+      );
+      const deadline = Date.now() + 10_000;
+      while (!fake.created.some((create) => create.parent === "agent-b") && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.ok(fake.created.some((create) => create.parent === "agent-b"), "ws-2's reviewer starts while ws-1 is stuck");
+      release();
+      await gate.idle();
     } finally {
       rmSync(other, { recursive: true, force: true });
     }

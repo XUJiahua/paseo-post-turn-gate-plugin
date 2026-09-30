@@ -78,7 +78,7 @@
 | 原方案 | 问题 | 修正 |
 |---|---|---|
 | 在 hook 中完成 Gate | 30s 超时（V4） | handler 只负责入队；整个流程事件驱动 |
-| 依赖 `turn_started` 先处理完 | handler 并发（V3） | 插件内单一串行队列 |
+| 依赖 `turn_started` 先处理完 | handler 并发（V3） | 每个 workspace 一个串行队列（§4.1） |
 | 从 hook 读 labels 做过滤 | hook 里没有 labels（V2） | `turn_ended` 时 `refresh()` 源 Agent 获取 |
 | 启动时恢复 | 启动时拿不到 `paseo`（V1） | 懒恢复（§9） |
 | 先建无 Prompt 子 Agent 再 `send` | `outputSchema` 只随初始 prompt 生效，这样做会丢掉它，还多一次竞态 | 预分配 `agentId`，先写 ledger，再带 prompt 和 `outputSchema` 一次创建（V8–V11） |
@@ -188,7 +188,9 @@ npm run profiles -- --provider codex --model gpt-5.5 --role reviewer --thinking 
 
 ## 4. 流程
 
-### 4.1 事件处理（全部经过串行队列）
+### 4.1 事件处理（每个 workspace 一个串行队列）
+
+事件按 hook 的 `workspaceId` 进入该 workspace 的串行队列；插件的子 Agent 创建在源 Agent 的 workspace 里，所以同一任务的事件始终在同一队列，顺序不变。对账与定时代答、重试按 run、任务链记录的 `workspace_id` 进入对应队列。不同 workspace 并行，一个 workspace 的慢操作不会推迟其他 workspace。
 
 例外：`turn_started` 的基线快照在事件到达时立即开始，不等队列轮到它。队列在处理其他仓库的慢操作时，这一轮的 Agent 可能已经改了文件；等到那时再拍基线，这些改动会被算进基线而永远不被检查。handler 在队列里等待这个快照结果。拍不出基线（git 超时、index 损坏）时，这一轮结束时出一张错误卡片说明未检查，而不是静默跳过。所有 git 调用都有 120 秒超时（`server/git.ts`），一个卡住的仓库不会拖住所有仓库。
 

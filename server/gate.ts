@@ -284,11 +284,21 @@ export function createGate(options: GateOptions): Gate {
   };
   const shortIds = (ids: readonly string[]) => ids.map((id) => id.slice(0, 8)).join(", ");
 
-  // ponytail: one global queue serializes all gate work; a slow agent create delays other agents' events.
-  // Upgrade path: per-source-agent queues if this ever becomes a bottleneck.
-  let tail: Promise<void> = Promise.resolve();
-  function enqueue(label: string, work: () => Promise<void>): void {
-    tail = tail.then(work).catch((error) => log(`${label} failed`, error instanceof Error ? error.stack : error));
+  // One serial queue per workspace: work for one workspace keeps its order, and a slow create or snapshot in one
+  // workspace no longer delays the others. The plugin's children live in their source agent's workspace, and runs
+  // and chains record it, so every event and every piece of recovery work has a key.
+  // ponytail: two workspaces on the same repository run in parallel; their agents' cross-checks (overlap notes) only
+  // share in-memory maps, which is safe in one thread. Upgrade path: key by repository root.
+  const tails = new Map<string, Promise<void>>();
+  function enqueue(label: string, work: () => Promise<void>, key: string | null | undefined = null): void {
+    const queue = key ?? "";
+    const next = (tails.get(queue) ?? Promise.resolve())
+      .then(work)
+      .catch((error) => log(`${label} failed`, error instanceof Error ? error.stack : error));
+    tails.set(queue, next);
+    void next.then(() => {
+      if (tails.get(queue) === next) tails.delete(queue);
+    });
   }
 
   // ---------- timeline card ----------
@@ -1196,20 +1206,29 @@ export function createGate(options: GateOptions): Gate {
   function wakeAt(paseo: Paseo, at: number): void {
     const timer = setTimeout(() => {
       retryTimers.delete(timer);
-      enqueue("scheduled work", () => startDueWork(paseo));
+      try {
+        startDueWork(paseo);
+      } catch (error) {
+        log("scheduled work failed", error); // e.g. the ledger was closed on unload
+      }
     }, Math.max(0, at - now()) + 100);
     timer.unref?.();
     retryTimers.add(timer);
   }
 
-  async function startDueWork(paseo: Paseo): Promise<void> {
-    for (const chain of ledger.chains()) {
-      try {
-        if (chain.next_retry_at !== null && chain.next_retry_at <= now()) await sendRetry(paseo, chain);
-        else if (chain.answer_at !== null && chain.answer_at <= now()) await startScheduledAnswer(paseo, chain);
-      } catch (error) {
-        log(`scheduled work for ${chain.agent_id} failed`, error);
-      }
+  /** Queues each chain's due retry or answer in its workspace; the chain is read again when its turn comes. */
+  function startDueWork(paseo: Paseo): void {
+    for (const { agent_id, workspace_id } of ledger.chains()) {
+      enqueue(
+        `scheduled work for ${agent_id}`,
+        async () => {
+          const chain = ledger.chain(agent_id);
+          if (!chain) return;
+          if (chain.next_retry_at !== null && chain.next_retry_at <= now()) await sendRetry(paseo, chain);
+          else if (chain.answer_at !== null && chain.answer_at <= now()) await startScheduledAnswer(paseo, chain);
+        },
+        workspace_id,
+      );
     }
   }
 
@@ -2289,8 +2308,10 @@ export function createGate(options: GateOptions): Gate {
     return onFixTurnEnded(paseo, run, { kind: "completed" }, [], items);
   }
 
-  async function reconcileChains(paseo: Paseo): Promise<void> {
-    for (const chain of ledger.chains()) {
+  async function reconcileChain(paseo: Paseo, agentId: string): Promise<void> {
+    const chain = ledger.chain(agentId);
+    if (!chain) return;
+    {
       try {
         if (now() - chain.created_at > CHAIN_TTL_MS) {
           await endChain(paseo, chain.agent_id, null);
@@ -2344,23 +2365,31 @@ export function createGate(options: GateOptions): Gate {
 
   return {
     onTurnStarted: (event, paseo) => {
+      const key = event.agent.workspaceId;
       // The baseline is taken now, not when the queue reaches this event: behind another repository's work the
       // agent may already have changed files, and those changes would land in the baseline unchecked.
       const early = needsFreshSnapshot(event.agent.id) ? loadPending(event.agent.cwd) : null;
       early?.catch(() => undefined); // awaited (and reported) by the handler
-      enqueue("turn_started", () => handleTurnStarted(event, paseo, early));
+      enqueue("turn_started", () => handleTurnStarted(event, paseo, early), key);
     },
-    onTurnEnded: (event, paseo) => enqueue("turn_ended", () => handleTurnEnded(event, paseo)),
-    onPermission: (event, paseo) => enqueue("permission", () => handlePermission(event, paseo)),
-    reconcile: (paseo) =>
-      enqueue("reconcile", async () => {
-        for (const run of ledger.active()) {
-          const fresh = ledger.get(run.run_id);
-          if (!fresh || isTerminal(fresh.status)) continue;
-          await reconcileRun(paseo, fresh).catch((error) => log(`reconcile ${run.run_id} failed`, error));
-        }
-        await reconcileChains(paseo);
-      }),
+    onTurnEnded: (event, paseo) => enqueue("turn_ended", () => handleTurnEnded(event, paseo), event.agent.workspaceId),
+    onPermission: (event, paseo) => enqueue("permission", () => handlePermission(event, paseo), event.agent.workspaceId),
+    reconcile: (paseo) => {
+      // Each run and chain is reconciled in its own workspace's queue, after that workspace's pending events.
+      for (const { run_id, workspace_id } of ledger.active()) {
+        enqueue(
+          `reconcile ${run_id}`,
+          async () => {
+            const fresh = ledger.get(run_id);
+            if (fresh && !isTerminal(fresh.status)) await reconcileRun(paseo, fresh);
+          },
+          workspace_id,
+        );
+      }
+      for (const { agent_id, workspace_id } of ledger.chains()) {
+        enqueue(`reconcile chain of ${agent_id}`, () => reconcileChain(paseo, agent_id), workspace_id);
+      }
+    },
     stopAnswering: (chainId, paseo, resume) =>
       new Promise((resolve) =>
         enqueue("stop answering", async () => {
@@ -2370,18 +2399,14 @@ export function createGate(options: GateOptions): Gate {
             resolve(false);
             throw error;
           }
-        }),
+        }, ledger.chainById(chainId)?.workspace_id),
       ),
     close: () => {
       for (const timer of retryTimers) clearTimeout(timer);
       retryTimers.clear();
     },
     idle: async () => {
-      let current: Promise<void>;
-      do {
-        current = tail;
-        await current;
-      } while (current !== tail);
+      while (tails.size > 0) await Promise.all([...tails.values()]);
     },
   };
 }

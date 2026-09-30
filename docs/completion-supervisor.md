@@ -491,6 +491,8 @@ v1 与本设计的差异，后续步骤处理：
 - 进展只比较 tree，不比较 findings（标了 `ponytail:`）。墙钟不含等待用户的时间：交给用户之后的下一轮总是由用户的消息开始，而用户消息会重置预算。
 - `post-turn-gate-init` 默认生成 v3（含 `decider.md` 模板），`--v2` 生成旧版策略；已有仓库的 v2 策略不受影响。
 
+多项目：每个 workspace 一个串行队列（事件按 hook 的 `workspaceId`，对账和定时任务按 run、任务链记录的 `workspace_id`），一个 workspace 的慢操作不再推迟其他 workspace。基线在 `turn_started` 到达时立即拍摄，不排队；git 调用有 120 秒超时，拍不出基线时出卡片说明。同一仓库开了两个 workspace 时它们并行，重叠提示仍然有效（标了 `ponytail:`）。
+
 路线图第 3 步（收回找人点）已完成的部分：
 
 - crash、network、rate_limited 的机械重试用完后，以及未识别的 `error`，交给 decider（信号写进 prompt：`the turn failed (<类别>): <错误>`），由它决定回复“继续”还是交给用户；quota、context 耗尽仍直接找人。拒答由 decider 的计划（`refused`）处理。
@@ -500,7 +502,6 @@ v1 与本设计的差异，后续步骤处理：
 
 尚未做：
 
-- 按工作区分队列：仍是一个全局串行队列（标了 `ponytail:`）。它在多个项目同时使用时的两个正确性问题已单独修掉：基线在 `turn_started` 到达时立即拍摄，不再排在其他仓库的工作后面（否则排队期间的改动会进基线而漏检）；git 调用有 120 秒超时，拍不出基线时出卡片说明。剩下的只是延迟：一个仓库的慢操作会推迟其他仓库的检查和回复。
 - 从 `gate.ts` 拆出 decision round 模块：试算过，它依赖 `gate.ts` 闭包里约 25 个函数（ledger、卡片、派发、任务链），拆出去只会得到一个很宽的浅接口，暂不拆。
 - 结构化 Requirement Revision 和发送 outbox：现在需求按文本累积，发送靠 messageId 对账。
 - Claude 冒烟：本机的 `claude-proxy` provider 不可用，未测。
