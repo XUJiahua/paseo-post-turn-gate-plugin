@@ -2,7 +2,7 @@
 
 A [Paseo](https://paseo.sh) plugin that runs an independent reviewer or verifier agent after each agent turn. The result shows up as a card in the original agent's timeline. In `fix` mode the plugin can send failing findings back to the agent for a limited number of rounds.
 
-Design and verified platform behavior: [docs/design.md](docs/design.md). Workflow diagrams: [docs/workflow.md](docs/workflow.md). Proposed task-level continuous supervisor: [docs/completion-supervisor.md](docs/completion-supervisor.md).
+Design and verified platform behavior: [docs/design.md](docs/design.md). Workflow diagrams: [docs/workflow.md](docs/workflow.md). Proposed decider-driven supervisor (roadmap): [docs/completion-supervisor.md](docs/completion-supervisor.md).
 
 ## Install
 

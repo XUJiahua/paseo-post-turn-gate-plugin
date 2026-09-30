@@ -2,7 +2,7 @@ import type { AnswerReply, Check, Policy, Verdict } from "../shared/schema.ts";
 import { gateChecks, maxFixRounds } from "../shared/schema.ts";
 
 /**
- * Pure next-step decisions (the DecisionEngine of docs/completion-supervisor.md §6): state and results in,
+ * Pure next-step decisions (guardrails of docs/completion-supervisor.md §8): state and results in,
  * the next step out, no side effects. The gate performs what they return.
  */
 

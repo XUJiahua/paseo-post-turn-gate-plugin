@@ -405,7 +405,7 @@ CREATE INDEX gate_runs_child ON gate_runs(child_agent_id);
 CREATE INDEX gate_runs_source_status ON gate_runs(source_agent_id, status);
 -- 每一轮的子 Agent 在创建前登记，旧轮次子 Agent 的迟到事件也能识别为 managed
 CREATE TABLE gate_children (child_agent_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, round INTEGER NOT NULL);
--- 每个源 Agent 一行，表示它当前的任务（completion-supervisor.md §18 第 2 步的第一部分）。三部分共用任务范围
+-- 每个源 Agent 一行，表示它当前的任务（completion-supervisor.md §19.1）。三部分共用任务范围
 -- （repo_root、base_tree、request_text、rounds_used），各自结束：
 --   turn_json / turn_at：turn_started 冻结的策略和基线（内存 pending 的副本），插件重载或 daemon 重启后该轮仍按原基线检查
 --   carried_at / checked_tree：未通过的改动（被 SUPERSEDED / NEEDS_HUMAN 的 run、被用户停止的轮次），交给下一个被检查的轮次（§4.1）
