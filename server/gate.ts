@@ -147,6 +147,8 @@ export interface Gate {
 }
 
 const isTerminal = (status: RunStatus) => TERMINAL_STATUSES.includes(status);
+/** Run results that leave the task's changes unaccepted: the task goes on with the agent's next turn. */
+const ACCEPTS_NOTHING: readonly RunStatus[] = ["NEEDS_HUMAN", "SUPERSEDED"];
 
 function lastUserMessage(timeline: readonly TimelineItem[]): UserItem | null {
   for (let index = timeline.length - 1; index >= 0; index -= 1) {
@@ -210,6 +212,7 @@ export function createGate(options: GateOptions): Gate {
     if (!policySchema.safeParse(JSON.parse(run.policy_json)).success) {
       log(`retiring run ${run.run_id}: stored policy is in an old format`);
       ledger.update(run.run_id, { status: "ERROR", error: "stored policy is in an old format (plugin upgraded mid-run)" }, now());
+      ledger.releaseRun(run.source_agent_id, run.run_id, true, now());
     }
   }
   for (const chain of ledger.chains()) {
@@ -233,8 +236,6 @@ export function createGate(options: GateOptions): Gate {
   const ACTIVITY_TTL_MS = 24 * 60 * 60 * 1000;
   interface Activity { repoRoot: string; owner: string; turnId: string | null; startedAt: number; others: Set<string> }
   const activity = new Map<string, Activity>();
-  /** Overlapping agents of a task that spans turns (a chain, or a superseded run's carry). */
-  const taskConcurrent = new Map<string, Set<string>>();
 
   /** owner: the source agent itself, or the source agent a gate child works for (never paired with each other). */
   function startActivity(agentId: string, owner: string, repoRoot: string, turnId: string | null): void {
@@ -385,6 +386,8 @@ export function createGate(options: GateOptions): Gate {
     if (isTerminal(next.status)) {
       waiting.delete(next.run_id);
       autoApproved.delete(next.run_id);
+      // NEEDS_HUMAN and SUPERSEDED hand the task on (a carry or a chain); any other result ends it.
+      ledger.releaseRun(next.source_agent_id, next.run_id, !ACCEPTS_NOTHING.includes(next.status), now());
     }
     await publishCard(paseo, next).catch((error) => log("card update failed", error));
     return next;
@@ -440,9 +443,7 @@ export function createGate(options: GateOptions): Gate {
       },
       now(),
     );
-    const carried = taskConcurrent.get(run.source_agent_id) ?? new Set<string>();
-    for (const id of concurrentOf(run)) carried.add(id);
-    if (carried.size > 0) taskConcurrent.set(run.source_agent_id, carried);
+    ledger.setTaskConcurrent(run.source_agent_id, [...ledger.taskConcurrent(run.source_agent_id), ...concurrentOf(run)], now());
     // A turn that already started (its pending snapshot exists) takes the carry now, otherwise the next one does.
     applyCarry(run.source_agent_id);
   }
@@ -962,7 +963,7 @@ export function createGate(options: GateOptions): Gate {
       baseTree: chain.base_tree,
       requestText: chain.request_text,
       turnKey: `${chain.agent_id}:chain:${chain.chain_id}:${chain.answers}:${chain.retries}`,
-      concurrent: [...(taskConcurrent.get(chain.agent_id) ?? [])],
+      concurrent: ledger.taskConcurrent(chain.agent_id),
       startRound: chain.rounds_used + 1,
     };
   }
@@ -1013,8 +1014,11 @@ export function createGate(options: GateOptions): Gate {
       base_tree: task.baseTree,
       end_tree: endTree,
       concurrent_agents: encodeConcurrent(task.concurrent),
+      task_id: ledger.beginTask(task.agentId, now()),
     };
     if (!ledger.claim(run, now(), task.startRound ?? 1)) return log(`skip ${task.agentId}: run already exists for this turn`);
+    // The task lives until this run's result is in (transition → releaseRun).
+    ledger.attachRun(task.agentId, run.run_id, now());
     log(`gate ${run.run_id} for ${task.agentId}: ${checks.join(" → ")}`);
     await dispatch(paseo, ledger.get(run.run_id)!);
   }
@@ -1406,7 +1410,7 @@ export function createGate(options: GateOptions): Gate {
     if (!snapshot) return { snapshot: null, stale: false };
     if (snapshot.turnId && turnId && snapshot.turnId !== turnId) return { snapshot: null, stale: true };
     pending.delete(agentId);
-    ledger.deleteTurnSnapshot(agentId);
+    ledger.deleteTurnSnapshot(agentId, true); // handleTurnEnded ends the task if nothing else holds it
     return { snapshot, stale: false };
   }
 
@@ -1432,7 +1436,9 @@ export function createGate(options: GateOptions): Gate {
     applyCarry(agentId);
     savePending(agentId);
     const snapshot = pending.get(agentId);
-    if (snapshot) startActivity(agentId, agentId, snapshot.repoRoot, event.turnId);
+    if (!snapshot) return;
+    ledger.beginTask(agentId, now());
+    startActivity(agentId, agentId, snapshot.repoRoot, event.turnId);
   }
 
   async function snapshotTurn(event: TurnStarted, paseo: Paseo): Promise<void> {
@@ -1488,6 +1494,15 @@ export function createGate(options: GateOptions): Gate {
   }
 
   async function handleTurnEnded(event: TurnEnded, paseo: Paseo): Promise<void> {
+    try {
+      await handleTurnEndedOf(event, paseo);
+    } finally {
+      // The turn's snapshot is gone: the task ends here unless a run, a carry or a chain still holds it.
+      ledger.pruneTask(event.agent.id);
+    }
+  }
+
+  async function handleTurnEndedOf(event: TurnEnded, paseo: Paseo): Promise<void> {
     const agentId = event.agent.id;
     const concurrent = endActivity(agentId, event.turnId);
     const owned = ledger.child(agentId);
@@ -1532,7 +1547,7 @@ export function createGate(options: GateOptions): Gate {
     log(`outcome ${agentId}: ${category}${detail ? ` (${detail.slice(0, 160)})` : ""}`);
     const chain = snapshot.chainId ? ledger.chain(agentId) : null;
     // Overlaps of earlier turns of the same task (chain or carry) plus this one.
-    const taskOverlap = new Set([...(taskConcurrent.get(agentId) ?? []), ...concurrent]);
+    const taskOverlap = new Set([...ledger.taskConcurrent(agentId), ...concurrent]);
     const task: Task = {
       agentId,
       workspaceId,
@@ -1558,11 +1573,8 @@ export function createGate(options: GateOptions): Gate {
     // turn keeps it for the next one (applyOutcome).
     if (snapshot.carriedRequest !== undefined && category !== "replaced" && category !== "user_canceled") ledger.deleteCarry(agentId);
     // The task goes on (a chain, a carry, or a replacing turn): keep its overlaps for the turn that finishes it.
-    if (taskOverlap.size > 0 && (category === "replaced" || ledger.chain(agentId) || ledger.carry(agentId))) {
-      taskConcurrent.set(agentId, taskOverlap);
-    } else {
-      taskConcurrent.delete(agentId);
-    }
+    const goesOn = category === "replaced" || ledger.chain(agentId) || ledger.carry(agentId);
+    ledger.setTaskConcurrent(agentId, goesOn ? [...taskOverlap] : [], now());
   }
 
   /** Auto-approves routine requests of a managed agent; returns the reason when a human must decide. */

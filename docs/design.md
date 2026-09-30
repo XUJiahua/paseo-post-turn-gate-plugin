@@ -410,10 +410,14 @@ CREATE TABLE gate_children (child_agent_id TEXT PRIMARY KEY, run_id TEXT NOT NUL
 --   turn_json / turn_at：turn_started 冻结的策略和基线（内存 pending 的副本），插件重载或 daemon 重启后该轮仍按原基线检查
 --   carried_at / checked_tree：未通过的改动（被 SUPERSEDED / NEEDS_HUMAN 的 run、被用户停止的轮次），交给下一个被检查的轮次（§4.1）
 --   chain_id 及 retries、answers、next_retry_at、answer_*、card_json、card_seq、policy_json 等：任务链与代答（turn-outcomes.md §4）
--- 三部分都空了，这一行就删除。旧版的 chains、carries、turn_snapshots 表在启动时导入并删除。
+--   task_id / run_id / concurrent_json：任务 id、正在检查它的 run（gate_runs.task_id 指回这里）、跨轮重叠运行的其他 Agent
+-- 任务从一轮被快照时开始，到它的结果成立时结束：run 以 PASSED、INCONCLUSIVE、FAILED、ERROR 结束，或一轮结束时
+-- 没有可检查的东西。NEEDS_HUMAN、SUPERSEDED 把任务交给 carry 或任务链，任务继续。没有 turn、carry、任务链和 run
+-- 时这一行删除，下一轮是新任务。旧版的 chains、carries、turn_snapshots 表在启动时导入并删除。
 CREATE TABLE tasks (agent_id TEXT PRIMARY KEY, repo_root TEXT, base_tree TEXT, request_text TEXT,
                     rounds_used INTEGER NOT NULL DEFAULT 0, checked_tree TEXT, carried_at INTEGER,
-                    chain_id TEXT UNIQUE, chain_created_at INTEGER, ..., turn_json TEXT, turn_at INTEGER, ...);
+                    chain_id TEXT UNIQUE, chain_created_at INTEGER, ..., turn_json TEXT, turn_at INTEGER,
+                    task_id TEXT, run_id TEXT, concurrent_json TEXT, ...);
 CREATE TABLE chain_children (child_agent_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, chain_id TEXT NOT NULL);
 -- 每个 Agent 最后一张配置错误卡，策略恢复有效后标为“已修复”（§3）
 CREATE TABLE config_errors (agent_id TEXT PRIMARY KEY, card_id TEXT NOT NULL, error TEXT NOT NULL);

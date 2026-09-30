@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -35,6 +36,8 @@ export interface Run {
   reviewer_changes: string | null;
   /** JSON array of other agents whose turns overlapped this task in the same repository. */
   concurrent_agents: string | null;
+  /** The source agent's task this run checks (tasks.task_id). */
+  task_id: string | null;
   /** JSON {title, nudged}: the current checker's denied permission request, and whether it was nudged for a verdict. */
   blocked_json: string | null;
   /** The agent's reply when a fix round changed nothing and disputed the findings. */
@@ -149,6 +152,9 @@ interface TaskRow extends Omit<Chain, "chain_id" | "workspace_id" | "repo_root" 
   carried_at: number | null;
   turn_json: string | null;
   turn_at: number | null;
+  task_id: string | null;
+  run_id: string | null;
+  concurrent_json: string | null;
 }
 
 export type NewRun = Pick<
@@ -164,6 +170,7 @@ export type NewRun = Pick<
   | "base_tree"
   | "end_tree"
   | "concurrent_agents"
+  | "task_id"
 >;
 
 const COLUMNS = [
@@ -187,6 +194,7 @@ const COLUMNS = [
   "result_json",
   "reviewer_changes",
   "concurrent_agents",
+  "task_id",
   "blocked_json",
   "dispute",
   "rounds_json",
@@ -229,6 +237,7 @@ export class Ledger {
         result_json TEXT,
         reviewer_changes TEXT,
         concurrent_agents TEXT,
+        task_id TEXT,
         blocked_json TEXT,
         dispute TEXT,
         rounds_json TEXT NOT NULL DEFAULT '[]',
@@ -243,6 +252,9 @@ export class Ledger {
       -- Replaces the chains, carries and turn_snapshots tables of earlier releases.
       CREATE TABLE IF NOT EXISTS tasks (
         agent_id TEXT PRIMARY KEY,
+        task_id TEXT,
+        run_id TEXT,
+        concurrent_json TEXT,
         repo_root TEXT,
         workspace_id TEXT,
         base_tree TEXT,
@@ -301,7 +313,9 @@ export class Ledger {
       concurrent_agents: "TEXT",
       blocked_json: "TEXT",
       dispute: "TEXT",
+      task_id: "TEXT",
     });
+    migrate("tasks", { task_id: "TEXT", run_id: "TEXT", concurrent_json: "TEXT" });
     this.importOldTables();
   }
 
@@ -328,8 +342,8 @@ export class Ledger {
       .prepare(
         `INSERT OR IGNORE INTO gate_runs
           (run_id, source_agent_id, source_turn_key, workspace_id, repo_root, policy_hash, policy_json,
-           request_text, base_tree, end_tree, concurrent_agents, status, round, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DISPATCHING', ?, ?, ?)`,
+           request_text, base_tree, end_tree, concurrent_agents, task_id, status, round, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DISPATCHING', ?, ?, ?)`,
       )
       .run(
         run.run_id,
@@ -343,6 +357,7 @@ export class Ledger {
         run.base_tree,
         run.end_tree,
         run.concurrent_agents,
+        run.task_id,
         round,
         now,
         now,
@@ -399,11 +414,56 @@ export class Ledger {
     this.db.prepare(`UPDATE tasks SET ${assignments} WHERE agent_id = ?`).run(...values, now, agentId);
   }
 
-  /** Drops a row that no longer holds a turn snapshot, a carry or a chain. */
-  private prune(agentId: string): void {
+  /**
+   * Ends the agent's task when nothing holds it any more: no running turn, no unchecked changes, no chain and no
+   * active check run. The next turn then starts a new task.
+   */
+  pruneTask(agentId: string): void {
     this.db
-      .prepare("DELETE FROM tasks WHERE agent_id = ? AND turn_json IS NULL AND carried_at IS NULL AND chain_id IS NULL")
+      .prepare(
+        "DELETE FROM tasks WHERE agent_id = ? AND turn_json IS NULL AND carried_at IS NULL AND chain_id IS NULL AND run_id IS NULL",
+      )
       .run(agentId);
+  }
+
+  /** The agent's current task id, or null when it has no task. */
+  taskId(agentId: string): string | null {
+    return this.row(agentId)?.task_id ?? null;
+  }
+
+  /** The agent's current task id, starting a task if it has none. */
+  beginTask(agentId: string, now: number): string {
+    const existing = this.row(agentId)?.task_id;
+    if (existing) return existing;
+    const taskId = randomUUID();
+    this.upsert(agentId, { task_id: taskId }, now);
+    return taskId;
+  }
+
+  /** The run now checking the agent's task; the task lives at least until the run ends (releaseRun). */
+  attachRun(agentId: string, runId: string, now: number): void {
+    this.upsert(agentId, { run_id: runId }, now);
+  }
+
+  /**
+   * A run ended. `accepted`: its result stands (PASSED, INCONCLUSIVE, FAILED, ERROR), so the task ends unless
+   * something else still holds it. Otherwise the caller hands the task on (a carry or a chain) and it goes on.
+   */
+  releaseRun(agentId: string, runId: string, accepted: boolean, now: number): void {
+    if (this.row(agentId)?.run_id !== runId) return;
+    this.upsert(agentId, { run_id: null }, now);
+    if (accepted) this.pruneTask(agentId);
+  }
+
+  /** Other agents whose turns overlapped the task, across its turns. */
+  taskConcurrent(agentId: string): string[] {
+    const json = this.row(agentId)?.concurrent_json;
+    return json ? (JSON.parse(json) as string[]) : [];
+  }
+
+  setTaskConcurrent(agentId: string, ids: readonly string[], now: number): void {
+    if (ids.length === 0 && !this.row(agentId)) return;
+    this.upsert(agentId, { concurrent_json: ids.length > 0 ? JSON.stringify([...new Set(ids)]) : null }, now);
   }
 
   private static asChain(row: TaskRow | undefined | null): Chain | null {
@@ -450,7 +510,7 @@ export class Ledger {
   deleteChain(agentId: string): void {
     if (!this.chain(agentId)) return;
     this.upsert(agentId, { chain_id: null, chain_created_at: null, policy_json: null, policy_hash: null, ...CHAIN_RESET }, Date.now());
-    this.prune(agentId);
+    this.pruneTask(agentId);
   }
 
   addChainChild(childAgentId: string, agentId: string, chainId: string): void {
@@ -527,7 +587,7 @@ export class Ledger {
   deleteCarry(agentId: string): void {
     if (!this.carry(agentId)) return;
     this.upsert(agentId, { carried_at: null, checked_tree: null }, Date.now());
-    this.prune(agentId);
+    this.pruneTask(agentId);
   }
 
   // ---------- turn snapshots ----------
@@ -542,11 +602,12 @@ export class Ledger {
     return row?.turn_json ? { snapshot_json: row.turn_json, created_at: row.turn_at ?? row.created_at } : null;
   }
 
-  deleteTurnSnapshot(agentId: string): void {
+  /** `keepTask`: the turn's handler goes on with the task and ends it itself (pruneTask). */
+  deleteTurnSnapshot(agentId: string, keepTask = false): void {
     const row = this.row(agentId);
     if (!row?.turn_json) return;
     this.upsert(agentId, { turn_json: null, turn_at: null }, Date.now());
-    this.prune(agentId);
+    if (!keepTask) this.pruneTask(agentId);
   }
 
   /** Moves rows of the chains, carries and turn_snapshots tables of earlier releases into tasks. */

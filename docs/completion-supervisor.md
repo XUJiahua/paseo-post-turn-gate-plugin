@@ -663,7 +663,9 @@ Workspace Lease 覆盖同一工作区内所有插件派发的 source attempts、
 - `server/dispatch.ts`：统一派发器 `sendIfIdle`（best-effort，§11.2）。fix、answer、retry 以及 FIXING 的重发都经过它；账本写入在 refresh 之后、`send()` 之前同步完成，中间不 await。唯一例外是给插件自己子 Agent 的 nudge（不变量 3）。
 - `server/decisions.ts`：`DecisionEngine` 的雏形，`decideCheck`（检查顺序、INCONCLUSIVE 分流、fix 轮次）与 `decideAnswer`（escalate、`answerRisk`、同题检测），纯函数并有决策表单测；`gate.ts` 只执行它们返回的步骤。
 
-第 2 步的第一部分已完成：`chains`、`carries`、`turn_snapshots` 合并为 `tasks` 表，每个源 Agent 一行，共用任务范围（repo、基线、请求、已用修复轮次），turn 快照、carry、任务链三部分各自结束，全部清空时删除该行；旧表在启动时导入后删除（`server/ledger.test.ts`）。`Ledger` 的对外方法不变，`gate.ts` 未改。`gate_runs` 保留为检查历史。
+第 2 步的第一部分已完成：`chains`、`carries`、`turn_snapshots` 合并为 `tasks` 表，每个源 Agent 一行，共用任务范围（repo、基线、请求、已用修复轮次），turn 快照、carry、任务链三部分各自结束，全部清空时删除该行；旧表在启动时导入后删除（`server/ledger.test.ts`）。`gate_runs` 保留为检查历史。
+
+第 2 步的第二部分已完成：任务行贯穿检查过程。`tasks.task_id` 从一轮被快照时开始，`gate_runs.task_id` 指回它，`tasks.run_id` 让任务在 run 检查期间继续存在；run 以 PASSED/INCONCLUSIVE/FAILED/ERROR 结束时任务结束，NEEDS_HUMAN/SUPERSEDED 把它交给 carry 或任务链。修复轮、打断检查的用户消息、代答后的一轮都属于同一个任务（`gate.test.ts` “a task lives from its first turn…”）。跨轮的重叠 Agent 记录从内存移到 `tasks.concurrent_json`，插件重启后仍然知道。v2 外部行为不变。
 
 尚未做：per-workspace 队列（仍是一个全局串行队列）、store/runtime adapter、`CheckRunner`/`AnswerRunner` 拆分；它们与第 2 步的统一 Task 表一起做更省事，因为拆分的边界由新表决定。
 

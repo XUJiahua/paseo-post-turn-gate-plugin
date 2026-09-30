@@ -1019,6 +1019,63 @@ describe("superseded runs keep their changes in scope", () => {
   });
 });
 
+describe("a task lives from its first turn until its result stands", () => {
+  const runTaskIds = () => ledger.active().map((run) => run.task_id);
+
+  test("fix rounds, a superseding message and the final PASS all belong to one task", async () => {
+    writePolicy({ version: 2 });
+    await sourceTurn({ change: edit });
+    const task = ledger.taskId(SOURCE);
+    assert.ok(task, "the task outlives the turn while its run checks it");
+    assert.deepEqual(runTaskIds(), [task]);
+    await childTurn(fake.created[0].agentId, FAIL);
+    // The fix turn is part of the same task.
+    const runId = fake.sent.at(-1)!.messageId!.split(":")[1];
+    await sourceTurn({ messageId: `ptg:${runId}:fix:1`, change: () => writeFileSync(path.join(repo, "a.txt"), "fixed\n") });
+    assert.equal(ledger.taskId(SOURCE), task);
+    // A message during the review supersedes the run; its changes stay in the same task.
+    await sourceTurn({ text: "also X", messageId: "m2" });
+    assert.equal(ledger.get(runId)!.status, "SUPERSEDED");
+    assert.equal(ledger.taskId(SOURCE), task);
+    assert.deepEqual(runTaskIds(), [task], "the follow-up run checks the same task");
+    await childTurn(fake.created.at(-1)!.agentId, PASS);
+    assert.equal(ledger.taskId(SOURCE), null, "a PASS ends the task");
+    // The next request is a new task.
+    await sourceTurn({ text: "next", messageId: "m3", change: () => writeFileSync(path.join(repo, "a.txt"), "next\n") });
+    assert.notEqual(ledger.taskId(SOURCE), task);
+  });
+
+  test("an answered question and the run that follows share the task; a chat turn leaves none behind", async () => {
+    writePolicy({ version: 2 });
+    await sourceTurn({ text: "hi", reply: "Hello!" });
+    assert.equal(ledger.taskId(SOURCE), null, "nothing to check: the task ends with its turn");
+    await sourceTurn({ change: edit, reply: "Which language should I use?" });
+    const task = ledger.taskId(SOURCE);
+    assert.ok(task);
+    const ask = fake.created.find((create) => create.labels["post-turn-gate.role"] === "answerer")!;
+    await childTurn(ask.agentId, JSON.stringify({ state: "awaiting_user", question: "Which?", decision: "answer", answer: "TypeScript.", reason: "" }));
+    const answer = fake.sent.at(-1)!;
+    await sourceTurn({ messageId: answer.messageId, text: answer.text, change: () => writeFileSync(path.join(repo, "b.ts"), "export {}\n") });
+    assert.deepEqual(runTaskIds(), [task]);
+    await childTurn(fake.created.at(-1)!.agentId, PASS);
+    assert.equal(ledger.taskId(SOURCE), null);
+  });
+
+  test("overlapping agents of a task survive a plugin restart", async () => {
+    writePolicy({ version: 2 });
+    const other = "other-agent";
+    fake.agents.set(other, sourceAgent({ id: other }));
+    gate.onTurnStarted({ agent: hookAgent(other), turnId: "o" }, fake.paseo);
+    await sourceTurn({ change: edit, reply: "Which language should I use?" });
+    gate = createGate({ ledger, now: () => clock, minuteMs: 1_000 / 30, log: () => {} }); // restart
+    const ask = fake.created.find((create) => create.labels["post-turn-gate.role"] === "answerer")!;
+    await childTurn(ask.agentId, JSON.stringify({ state: "awaiting_user", question: "Which?", decision: "answer", answer: "TypeScript.", reason: "" }));
+    const answer = fake.sent.at(-1)!;
+    await sourceTurn({ messageId: answer.messageId, text: answer.text, change: () => writeFileSync(path.join(repo, "b.ts"), "export {}\n") });
+    assert.match(fake.created.at(-1)!.prompt, /other-agen/, "the checker is told about the overlap from before the restart");
+  });
+});
+
 describe("recovery", () => {
   test("a crash between two checks dispatches the next check once, instead of re-reading the old verdict", async () => {
     writePolicy({ version: 2, on_outcome: { done: ["verify", "review"] } });
