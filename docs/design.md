@@ -263,7 +263,7 @@ finalizeReview(run, outcome, childTimeline):
   FAIL（本轮后面的检查不再执行）:
     report → FAILED
     fix 且 round-1 < fix.max_rounds → sendFix
-    否则 → NEEDS_HUMAN
+    否则 → NEEDS_HUMAN，写入 carry：用户接手后给源 Agent 发任意消息，下一轮从原始基线重新检查整个任务
   每次状态变化后：更新卡片；状态为终态 → 归档子 Agent（§6）
 ```
 

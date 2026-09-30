@@ -578,6 +578,8 @@ export function createGate(options: GateOptions): Gate {
       await transition(paseo, run, { ...base, status: "FAILED" });
     } else if (round - 1 >= maxFixRounds(policy)) {
       await transition(paseo, run, { ...base, status: "NEEDS_HUMAN" });
+      // The failing changes stay unaccepted: the agent's next turn checks the whole task again.
+      carryOver(run);
     } else {
       try {
         await sendFix(paseo, ledger.update(run.run_id, base, now()), verdict, policy);

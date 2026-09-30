@@ -648,6 +648,13 @@ describe("fix loop", () => {
     await childTurn(fake.created[1].agentId, FAIL);
     assert.equal(onlyRun().status, "NEEDS_HUMAN");
     assert.equal(fake.sent.length, 1);
+
+    // The user takes over and messages the agent: the whole task is checked again from the original baseline.
+    const baseOf = (prompt: string) => /diff ([0-9a-f]{40}) /.exec(prompt)![1];
+    await sourceTurn({ text: "I fixed it myself", messageId: "m2", change: () => writeFileSync(path.join(repo, "a.txt"), "by hand\n") });
+    assert.equal(fake.created.length, 3);
+    assert.equal(baseOf(fake.created[2].prompt), baseOf(fake.created[0].prompt));
+    assert.match(fake.created[2].prompt, /Implement feature X[\s\S]*Follow-up from the user: I fixed it myself/);
   });
 
   test("a busy source is never interrupted", async () => {

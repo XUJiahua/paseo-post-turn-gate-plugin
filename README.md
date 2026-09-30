@@ -90,7 +90,7 @@ policy and rules are captured when a turn starts, so the plugin takes effect on 
 
 - Checks run one after another, in the listed order. The first FAIL stops the round: reviewing the code of a change that misses a requirement is wasted work.
 - The task passes only when every check passes. An INCONCLUSIVE check does not stop the next one; the result is then INCONCLUSIVE.
-- With `on_fail: { "fix": … }` the failing check's findings go back to the agent. The next round starts again from the first check, because a fix can break a check that passed. `max_rounds` counts rounds for the whole task.
+- With `on_fail: { "fix": … }` the failing check's findings go back to the agent. The next round starts again from the first check, because a fix can break a check that passed. `max_rounds` counts rounds for the whole task. When the rounds are used up the card shows NEEDS HUMAN; after you take over, send the agent any message and its next turn checks the whole task again.
 - One card shows every check of the current round with its result.
 - `"done": "notify"` or `"ignore"` turns checks off.
 
