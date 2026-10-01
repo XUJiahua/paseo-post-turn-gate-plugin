@@ -44,13 +44,19 @@ function createFakePaseo() {
   let barrierWorkspace: string | null = null;
   const keys = new Map<string, string>();
   const profiles: Array<Record<string, unknown>> = [];
+  let refreshHook: ((id: string) => void | Promise<void>) | null = null;
+  let sendHook: ((id: string, messageId?: string) => void | Promise<void>) | null = null;
   const api = {
     config: { get: async () => ({ requestId: "r", config: { agentProfiles: profiles } }) },
     agents: {
       ref: (id: string) => ({
-        refresh: async () => (agents.has(id) ? { agent: agents.get(id), project: null } : null),
+        refresh: async () => {
+          await refreshHook?.(id);
+          return agents.has(id) ? { agent: agents.get(id), project: null } : null;
+        },
         send: async (text: string, options?: { messageId?: string }) => {
           sent.push({ agentId: id, text, messageId: options?.messageId });
+          await sendHook?.(id, options?.messageId);
         },
         respondToPermission: async (options: { requestId: string; response: Record<string, unknown> }) => {
           answered.push({ agentId: id, ...options });
@@ -105,6 +111,8 @@ function createFakePaseo() {
     cards,
     cardAppends,
     profiles,
+    setRefreshHook: (hook: typeof refreshHook) => { refreshHook = hook; },
+    setSendHook: (hook: typeof sendHook) => { sendHook = hook; },
     setFailCreate: (value: boolean) => {
       failCreate = value;
     },
@@ -748,7 +756,7 @@ describe("superseded runs keep their changes in scope", () => {
     await gate.idle();
     // Restart mid-turn: t2's snapshot (carry baseline included) comes back from the ledger, so t2 is gated.
     gate = createGate({ ledger, now: () => clock, minuteMs: 1_000 / 30, log: () => {} });
-    gate.onTurnEnded({ agent: hookAgent(SOURCE), turnId: "t2", outcome: { kind: "completed" }, timeline: [] }, fake.paseo);
+    gate.onTurnEnded({ agent: hookAgent(SOURCE), turnId: "t2", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text: "Done." }] as never }, fake.paseo);
     await gate.idle();
     assert.equal(fake.created.length, 2);
     assert.equal(diffOf(fake.created[1].prompt)[0], base);
@@ -760,7 +768,7 @@ describe("superseded runs keep their changes in scope", () => {
     await gate.idle();
     edit();
     gate = createGate({ ledger, now: () => clock, minuteMs: 1_000 / 30, log: () => {} });
-    gate.onTurnEnded({ agent: hookAgent(SOURCE), turnId: "t1", outcome: { kind: "completed" }, timeline: [] }, fake.paseo);
+    gate.onTurnEnded({ agent: hookAgent(SOURCE), turnId: "t1", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text: "Done." }] as never }, fake.paseo);
     await gate.idle();
     assert.equal(fake.created.length, 1);
     const [base, end] = diffOf(fake.created[0].prompt);
@@ -1095,6 +1103,70 @@ describe("version 3: the decider answers after every turn that did work", () => 
 });
 
 describe("decision guardrails and recovery", () => {
+  test("a source turn arriving during the final refresh invalidates the reply before queued handling", async () => {
+    policy();
+    await sourceTurn({ change: edit, reply: "Which language?" });
+    fake.setRefreshHook((id) => {
+      if (id !== SOURCE) return;
+      fake.setRefreshHook(null);
+      // Keep the reported status idle: revision must catch an ABA/late snapshot too.
+      gate.onTurnStarted({ agent: hookAgent(SOURCE), turnId: "new-user-turn" }, fake.paseo);
+    });
+    await childTurn(role("decider")[0].agentId, plan({}));
+    assert.equal(fake.sent.length, 0);
+  });
+
+  test("Stop auto-answering arriving during refresh prevents the send without waiting for its queue", async () => {
+    policy();
+    await sourceTurn({ change: edit, reply: "Which language?" });
+    let stopped: Promise<boolean> | null = null;
+    fake.setRefreshHook((id) => {
+      if (id !== SOURCE) return;
+      fake.setRefreshHook(null);
+      stopped = gate.stopAnswering(ledger.chain(SOURCE)!.chain_id, fake.paseo);
+    });
+    await childTurn(role("decider")[0].agentId, plan({}));
+    assert.equal(await stopped, true);
+    assert.equal(fake.sent.length, 0);
+  });
+
+  test("an unconfirmed send pauses automation and remains unresolved across reload without replay", async () => {
+    policy();
+    await sourceTurn({ change: edit, reply: "Which language?" });
+    fake.setSendHook(() => { throw new Error("connection lost before acknowledgement"); });
+    await childTurn(role("decider")[0].agentId, plan({}));
+    assert.equal(fake.sent.length, 1);
+    assert.equal(outcome().state, "needs_user");
+    assert.equal(ledger.unresolvedDispatches(SOURCE)[0].state, "unknown");
+    gate.close();
+    gate = createGate({ ledger, now: () => clock, log: () => {} });
+    gate.reconcile(fake.paseo);
+    await gate.idle();
+    assert.equal(fake.sent.length, 1);
+    assert.equal(ledger.chain(SOURCE)!.stop_answering, 1);
+  });
+
+  test("a lost acknowledgement with matching timeline evidence is accepted without replay", async () => {
+    policy();
+    await sourceTurn({ change: edit, reply: "Which language?" });
+    fake.setSendHook((id, messageId) => {
+      fake.timelines.set(id, [{ type: "user_message", text: "Continue", messageId }]);
+      throw new Error("ack lost after acceptance");
+    });
+    await childTurn(role("decider")[0].agentId, plan({}));
+    gate.reconcile(fake.paseo);
+    await gate.idle();
+    assert.equal(fake.sent.length, 1);
+    assert.deepEqual(ledger.unresolvedDispatches(SOURCE), []);
+    assert.equal(ledger.chain(SOURCE)!.stop_answering, 0);
+  });
+
+  test("a completed turn without a final reply cannot use the done shortcut", async () => {
+    policy();
+    await sourceTurn({ change: edit, reply: "" });
+    assert.equal(role("decider").length, 1);
+    assert.equal(ledger.chain(SOURCE)!.round_json!.includes("missing_reply"), true);
+  });
   const role = (name: string) => fake.created.filter((create) => create.labels["post-turn-gate.role"] === name);
   const policy = (supervision: Record<string, unknown> = {}, agents = {}) => writePolicy({
     version: 3, supervision: { checks: ["review"], reply_delay_seconds: 0, ...supervision }, agents,

@@ -33,3 +33,30 @@ test("sends only in an accepted status, recording before the send", async () => 
 
   assert.equal(await sendIfIdle(fakePaseo(null).paseo, "a", message, { accept: ["idle"] }), "gone");
 });
+
+test("an idle source with pending permissions is not sent to", async () => {
+  const log: string[] = [];
+  const paseo = { agents: { ref: () => ({
+    refresh: async () => ({ agent: { status: "idle", pendingPermissions: [{ id: "p" }] } }),
+    send: async () => log.push("send"),
+  }) } } as unknown as Paseo;
+  assert.equal(await sendIfIdle(paseo, "a", message, {
+    accept: IDLE_OR_ERROR, beforeSend: () => log.push("record"),
+  }), "busy");
+  assert.deepEqual(log, []);
+});
+
+test("lost send acknowledgement records uncertainty without retrying", async () => {
+  const log: string[] = [];
+  const paseo = { agents: { ref: () => ({
+    refresh: async () => ({ agent: { status: "idle", pendingPermissions: [] } }),
+    send: async () => { log.push("send"); throw new Error("ack lost"); },
+  }) } } as unknown as Paseo;
+  assert.equal(await sendIfIdle(paseo, "a", message, {
+    accept: IDLE_OR_ERROR,
+    beforeSend: () => log.push("pending"),
+    onAccepted: () => log.push("accepted"),
+    onUnknown: () => log.push("unknown"),
+  }), "unknown");
+  assert.deepEqual(log, ["pending", "send", "unknown"]);
+});

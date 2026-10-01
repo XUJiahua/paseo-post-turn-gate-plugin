@@ -16,6 +16,27 @@ const chainFields = {
   request_text: "do X",
 };
 
+test("revisions and unacknowledged dispatches survive ledger reopen and task pruning", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ptg-delivery-"));
+  const file = path.join(dir, "ledger.sqlite");
+  try {
+    const first = new Ledger(file);
+    assert.equal(first.invalidate("a"), 1);
+    first.recordDispatch("a", "chain", "msg", "Continue", 10);
+    first.close();
+    const next = new Ledger(file);
+    assert.equal(next.revision("a"), 1);
+    assert.equal(next.unresolvedDispatches("a")[0].state, "pending");
+    assert.throws(() => next.recordDispatch("a", "chain", "msg", "Continue", 20));
+    next.updateDispatch("msg", "unknown", 21);
+    next.pruneTask("a");
+    assert.equal(next.invalidate("a"), 2);
+    next.supersedeDispatches("a", 22);
+    assert.deepEqual(next.unresolvedDispatches("a"), []);
+    next.close();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("a task's carry, chain and turn snapshot share one row and end independently", () => {
   const ledger = new Ledger(":memory:");
   ledger.setCarry({ agent_id: "a", repo_root: "/repo", base_tree: "base", request_text: "do X" }, 10);

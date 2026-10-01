@@ -54,6 +54,16 @@ describe("classify: real kiro-cli 2.25 payloads (docs/turn-outcomes.md §1)", ()
 });
 
 describe("classify: Codex provider wording", () => {
+  test("a bare 429 is not sufficient evidence for mechanical retry", () => {
+    assert.equal(turn({ kind: "failed", error: { message: "HTTP 429" } }, []).category, "error");
+    assert.equal(turn({ kind: "failed", error: { message: "429 insufficient quota" } }, []).category, "quota_exhausted");
+    assert.equal(turn({ kind: "failed", error: { message: "429 rate limit" } }, []).category, "rate_limited");
+  });
+  test("missing final output is uncertain, including whitespace and synthetic error text", () => {
+    for (const items of [[], [says("  ")], [says("[System Error] hidden failure")]]) {
+      assert.deepEqual(turn({ kind: "completed" }, items), { category: "awaiting_user", detail: "missing_reply" });
+    }
+  });
   test("app-server exits are crashes", () => {
     assert.equal(
       turn({ kind: "failed", error: { message: "Codex app-server exited with code 17 and signal null\nprovider crashed" } }, []).category,
