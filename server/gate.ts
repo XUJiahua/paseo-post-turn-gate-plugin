@@ -48,6 +48,7 @@ import {
 import { answerRisk, decideAutoApproval } from "./permissions.ts";
 import { resolveRole } from "./reviewer.ts";
 import { IDLE_OR_ERROR, sendIfIdle } from "./dispatch.ts";
+import { wasDelivered } from "./delivery.ts";
 import { decideCheck, normalizeVerdict } from "./decisions.ts";
 
 export type Paseo = PluginHookContext["paseo"];
@@ -92,6 +93,7 @@ interface Pending extends LoadedPolicy {
 
 /** Everything needed to gate the work of one task (a turn, or a chain of turns). */
 interface Task {
+  revision?: number;
   agentId: string;
   workspaceId: string;
   repoRoot: string;
@@ -198,6 +200,10 @@ function firstRequestText(timeline: readonly TimelineItem[], lastUser: UserItem 
 export function createGate(options: GateOptions): Gate {
   const { ledger } = options;
   const now = options.now ?? Date.now;
+  let closed = false;
+  const currentRevision = (agentId: string, revision: number | undefined) =>
+    !closed && revision !== undefined && ledger.revision(agentId) === revision;
+  const isSource = (agentId: string) => !ledger.child(agentId) && !ledger.chainChild(agentId);
   const minuteMs = options.minuteMs ?? 60 * 1000;
   /** The check the run is on (review/verify); runs always have at least one. */
   const checkOf = (run: Run) => gateChecks(JSON.parse(run.policy_json) as Policy)[run.step] ?? "review";
@@ -861,6 +867,7 @@ export function createGate(options: GateOptions): Gate {
     detail: string | null,
     reply: string,
   ): Promise<void> {
+    if (!currentRevision(task.agentId, task.revision)) return;
     if (category === "replaced") return; // its baseline was carried into the newer turn
     if (category === "user_canceled") {
       // A stop is your decision, never the decider's: no round starts. Paseo only tells "canceled while idle", so
@@ -899,7 +906,7 @@ export function createGate(options: GateOptions): Gate {
     if (["crashed", "network", "rate_limited"].includes(category)) {
       if (chain.retries < budget.max_retries && sendsOf(chain) < budget.max_auto_sends) {
         return scheduleRetry(paseo, chain, { category, message: detail, suggestion: SUGGESTIONS[category] }, {
-          max: budget.max_retries, delay_seconds: 30 * 4 ** chain.retries,
+          max: budget.max_retries, delay_seconds: 30 * 4 ** chain.retries, revision: task.revision!,
         });
       }
       return startRound(paseo, task, category, detail, reply);
@@ -953,26 +960,47 @@ export function createGate(options: GateOptions): Gate {
     paseo: Paseo,
     chain: Chain,
     card: Partial<OutcomeCard>,
-    cfg: { max: number; delay_seconds: number; message?: string },
+    cfg: { max: number; delay_seconds: number; message?: string; revision: number },
   ): Promise<void> {
     const at = now() + cfg.delay_seconds * 1000;
-    const next = ledger.updateChain(chain.agent_id, { next_retry_at: at, retry_message: cfg.message ?? DEFAULT_RETRY_MESSAGE }, now())!;
+    if (!currentRevision(chain.agent_id, cfg.revision)) return;
+    const next = ledger.updateChain(chain.agent_id, { next_retry_at: at, retry_message: cfg.message ?? DEFAULT_RETRY_MESSAGE, retry_revision: cfg.revision }, now())!;
     await publishChainCard(paseo, next, { ...card, state: "retry_scheduled", attempt: next.retries + 1, maxAttempts: cfg.max, nextRetryAt: at });
     wakeAt(paseo, at);
   }
 
   async function sendRetry(paseo: Paseo, chain: Chain): Promise<void> {
+    if (chain.stop_answering || !currentRevision(chain.agent_id, chain.retry_revision ?? undefined)) {
+      ledger.updateChain(chain.agent_id, { next_retry_at: null }, now());
+      return;
+    }
+    if (!(await reconcileDelivery(paseo, chain))) return;
     const attempt = chain.retries + 1;
     let current: Chain = chain;
     // Send first: publishing the card between the idle check and send() would widen the race.
-    const result = await sendIfIdle(
+    const messageId = `ptg:retry:${chain.chain_id}:${attempt}`;
+    const text = chain.retry_message ?? DEFAULT_RETRY_MESSAGE;
+    let result = await sendIfIdle(
       paseo,
       chain.agent_id,
-      { text: chain.retry_message ?? DEFAULT_RETRY_MESSAGE, messageId: `ptg:retry:${chain.chain_id}:${attempt}` },
-      { accept: IDLE_OR_ERROR, beforeSend: () => (current = ledger.updateChain(chain.agent_id, { retries: attempt, next_retry_at: null }, now())!) },
+      { text, messageId },
+      {
+        accept: IDLE_OR_ERROR,
+        isCurrent: () => currentRevision(chain.agent_id, chain.retry_revision ?? undefined),
+        beforeSend: () => {
+          ledger.recordDispatch(chain.agent_id, chain.chain_id, messageId, text, now());
+          current = ledger.updateChain(chain.agent_id, { retries: attempt, next_retry_at: null }, now())!;
+        },
+        onAccepted: () => ledger.updateDispatch(messageId, "accepted", now()),
+        onUnknown: (error) => ledger.updateDispatch(messageId, "unknown", now(), String(error)),
+      },
     );
+    if (result === "unknown") {
+      if (!(await reconcileDelivery(paseo, current))) return;
+      result = "sent";
+    }
     if (result === "gone") return ledger.deleteChain(chain.agent_id);
-    if (result === "busy") {
+    if (result === "busy" || result === "stale") {
       current = ledger.updateChain(chain.agent_id, { next_retry_at: null }, now()) ?? chain;
       await publishChainCard(paseo, current, { state: "stopped", nextRetryAt: null, message: "The agent was busy again; automatic retry skipped." });
       return;
@@ -1010,6 +1038,8 @@ export function createGate(options: GateOptions): Gate {
     const chain = ledger.chainById(chainId);
     if (!chain) return false;
     if (resume) {
+      // Explicit human acknowledgement abandons uncertain old deliveries; never replay them.
+      ledger.supersedeDispatches(chain.agent_id, now());
       const resumed = ledger.updateChain(chain.agent_id, { stop_answering: 0 }, now())!;
       await publishChainCard(paseo, resumed, {
         canResume: false,
@@ -1037,6 +1067,7 @@ export function createGate(options: GateOptions): Gate {
    * the grace period, then writes the reply from the checks' results. One message to the agent, or one hand-off.
    */
   interface Round {
+    revision: number;
     seq: number;
     /** waiting: grace period; planning / merging: a decider runs; checking: the plan waits for the checks. */
     phase: "waiting" | "planning" | "checking" | "merging";
@@ -1068,8 +1099,9 @@ export function createGate(options: GateOptions): Gate {
   async function startRound(paseo: Paseo, task: Task, category: Category, detail: string | null, reply: string): Promise<void> {
     const supervision = task.policy.supervision;
     const endTree = await snapshotTree(task.repoRoot);
+    if (!currentRevision(task.agentId, task.revision)) return;
     const changed = endTree !== task.baseTree;
-    if (!changed && !FAILURES.has(category) && (category === "done" || !task.worked)) {
+    if (!changed && !FAILURES.has(category) && (category === "done" || (!task.worked && detail !== "missing_reply"))) {
       log(`skip ${task.agentId}: working tree unchanged (${category})`);
       return endChain(paseo, task.agentId, { state: "resolved", message: "The task ended without changing files." });
     }
@@ -1121,7 +1153,7 @@ export function createGate(options: GateOptions): Gate {
       runId = await startGate(paseo, { ...task, turnKey: `${task.turnKey}:round:${seq}` }, endTree);
       if (runId) chain = ledger.updateChain(task.agentId, { last_run_id: runId }, now()) ?? chain;
     }
-    const round: Round = { seq, phase: "waiting", runId, reused, userSpoke: task.userSpoke ?? false, changed, endTree, reply, signal, plan: null, rechecked: false };
+    const round: Round = { revision: task.revision!, seq, phase: "waiting", runId, reused, userSpoke: task.userSpoke ?? false, changed, endTree, reply, signal, plan: null, rechecked: false };
     if (shortcut && runId) {
       const checking: Round = {
         ...round,
@@ -1206,6 +1238,7 @@ export function createGate(options: GateOptions): Gate {
     if (!round) return;
     const policy = JSON.parse(chain.policy_json) as Policy;
     const source = await refreshAgent(paseo, chain.agent_id);
+    if (!currentRevision(chain.agent_id, round.revision)) return;
     if (!source) return;
     if (phase === "plan" && !sendable(source.status)) {
       // You (or another message) started a turn during the grace period; that turn starts a new round.
@@ -1229,6 +1262,7 @@ export function createGate(options: GateOptions): Gate {
             : `running (${gateChecks(policy).join(", ")}).`
           : `not started; list the ones you need in "workers" (${gateChecks(policy).join(", ")}).`;
     const tree = await snapshotTree(chain.repo_root);
+    if (!currentRevision(chain.agent_id, round.revision)) return;
     const childAgentId = randomUUID();
     const key = `${ROUND_PREFIX}ask:${chain.chain_id}:${childAgentId}`;
     const payload = {
@@ -1292,10 +1326,12 @@ export function createGate(options: GateOptions): Gate {
     await archiveChild(paseo, childId);
     const round = roundOf(current);
     if (!round) return;
+    if (!currentRevision(chain.agent_id, round.revision)) return;
     const handOff = (reason: string) => roundNeedsUser(paseo, current, replyTail(round.reply), reason);
     const denied = deniedDeciders.delete(childId) ? "a permission request of the decider was not answered in time and was denied; " : "";
     if (outcome.kind !== "completed") return handOff(`${denied}the decider turn ${outcome.kind}`);
     const afterTree = startTree ? await snapshotTree(current.repo_root) : null;
+    if (!currentRevision(chain.agent_id, round.revision)) return;
     if (startTree && afterTree !== startTree) {
       const changes = await diffStat(current.repo_root, startTree, afterTree!);
       return handOff(`the working tree changed while the decider ran, so nothing was sent. Nothing was reverted:\n${truncate(changes, 600)}`);
@@ -1351,6 +1387,7 @@ export function createGate(options: GateOptions): Gate {
   async function settleRound(paseo: Paseo, chain: Chain, run: Run): Promise<void> {
     const round = roundOf(chain);
     if (!round || round.runId !== run.run_id || run.status === "SUPERSEDED") return;
+    if (!currentRevision(chain.agent_id, round.revision)) return;
     // A checker that edited the tree, a denied permission, an ambiguous request or a failed checker: yours to decide.
     if (run.status === "NEEDS_HUMAN" || run.status === "ERROR") {
       if (chain.answer_child_id) await archiveChild(paseo, chain.answer_child_id);
@@ -1387,6 +1424,7 @@ export function createGate(options: GateOptions): Gate {
 
   /** The guardrails every reply passes before it is sent (docs/completion-supervisor.md §8). */
   async function applyReply(paseo: Paseo, chain: Chain, round: Round, reply: DeciderReply): Promise<void> {
+    if (!currentRevision(chain.agent_id, round.revision)) return;
     const question = round.plan?.question.trim() || replyTail(round.reply);
     if (reply.kind === "escalate") return roundNeedsUser(paseo, chain, reply.question.trim() || question, reply.reason || "the decider handed this to you");
     const run = round.runId ? ledger.get(round.runId) : null;
@@ -1414,14 +1452,19 @@ export function createGate(options: GateOptions): Gate {
     if (sendsOf(chain) >= budget) return roundNeedsUser(paseo, chain, question, `the task used its ${budget} automatic messages`);
     const attempt = chain.answers + 1;
     let current = chain;
-    const result = await sendIfIdle(
+    if (!(await reconcileDelivery(paseo, chain))) return;
+    const messageId = `${ROUND_PREFIX}${chain.chain_id}:${attempt}`;
+    const messageText = `${ANSWER_PREFIX}\n${text}`;
+    let result = await sendIfIdle(
       paseo,
       chain.agent_id,
-      { text: `${ANSWER_PREFIX}\n${text}`, messageId: `${ROUND_PREFIX}${chain.chain_id}:${attempt}` },
+      { text: messageText, messageId },
       {
         accept: IDLE_OR_ERROR,
-        beforeSend: () =>
-          (current = ledger.updateChain(
+        isCurrent: () => currentRevision(chain.agent_id, round.revision),
+        beforeSend: () => {
+          ledger.recordDispatch(chain.agent_id, chain.chain_id, messageId, messageText, now());
+          current = ledger.updateChain(
             chain.agent_id,
             {
               answers: attempt,
@@ -1430,11 +1473,18 @@ export function createGate(options: GateOptions): Gate {
               round_json: null,
             },
             now(),
-          )!),
+          )!;
+        },
+        onAccepted: () => ledger.updateDispatch(messageId, "accepted", now()),
+        onUnknown: (error) => ledger.updateDispatch(messageId, "unknown", now(), String(error)),
       },
     );
+    if (result === "unknown") {
+      if (!(await reconcileDelivery(paseo, current))) return;
+      result = "sent";
+    }
     if (result !== "sent") {
-      return endRound(paseo, saveRound(chain, null), { state: "stopped", message: "You replied first; the automatic reply was not sent." });
+      return endRound(paseo, saveRound(chain, null), { state: "stopped", message: "The source is busy, the task changed, or automation stopped; the automatic reply was not sent." });
     }
     await publishChainCard(paseo, current, {
       ...roundCard(current, round),
@@ -1601,16 +1651,16 @@ export function createGate(options: GateOptions): Gate {
     if (loaded) pending.set(agentId, { ...loaded, turnId: event.turnId, chainId: null });
   }
 
-  async function handleTurnEnded(event: TurnEnded, paseo: Paseo): Promise<void> {
+  async function handleTurnEnded(event: TurnEnded, paseo: Paseo, revision: number): Promise<void> {
     try {
-      await handleTurnEndedOf(event, paseo);
+      await handleTurnEndedOf(event, paseo, revision);
     } finally {
       // The turn's snapshot is gone: the task ends here unless a run, a carry or a chain still holds it.
       ledger.pruneTask(event.agent.id);
     }
   }
 
-  async function handleTurnEndedOf(event: TurnEnded, paseo: Paseo): Promise<void> {
+  async function handleTurnEndedOf(event: TurnEnded, paseo: Paseo, revision: number): Promise<void> {
     const agentId = event.agent.id;
     const concurrent = endActivity(agentId, event.turnId);
     const owned = ledger.child(agentId);
@@ -1650,6 +1700,7 @@ export function createGate(options: GateOptions): Gate {
     // Overlaps of earlier turns of the same task (chain or carry) plus this one.
     const taskOverlap = new Set([...ledger.taskConcurrent(agentId), ...concurrent]);
     const task: Task = {
+      revision,
       agentId,
       workspaceId,
       repoRoot: snapshot.repoRoot,
@@ -1823,6 +1874,29 @@ export function createGate(options: GateOptions): Gate {
 
   // ---------- recovery ----------
 
+  /** Unknown acceptance never triggers a fresh send. Only positive timeline evidence resolves it. */
+  async function reconcileDelivery(paseo: Paseo, chain: Chain): Promise<boolean> {
+    for (const delivery of ledger.unresolvedDispatches(chain.agent_id)) {
+      if (delivery.chain_id !== chain.chain_id) {
+        ledger.updateDispatch(delivery.message_id, "superseded", now());
+        continue;
+      }
+      const accepted = await wasDelivered(paseo, chain.agent_id, delivery.message_id).catch(() => false);
+      if (accepted) {
+        ledger.updateDispatch(delivery.message_id, "accepted", now());
+      } else {
+        ledger.updateDispatch(delivery.message_id, "unknown", now());
+        const current = ledger.updateChain(chain.agent_id, { stop_answering: 1, next_retry_at: null, answer_at: null }, now()) ?? chain;
+        await publishChainCard(paseo, current, {
+          state: "needs_user", canStopAnswering: false, canResume: true, nextRetryAt: null,
+          message: "Automatic message delivery could not be confirmed. Nothing is resent; check the chat and send a message to take over, or resume after checking.",
+        });
+        return false;
+      }
+    }
+    return true;
+  }
+
   async function reconcileRun(paseo: Paseo, run: Run): Promise<void> {
     if (run.status === "DISPATCHING") {
       // A dispatch that keeps failing before its child exists (refresh or config errors) is retried here,
@@ -1867,6 +1941,11 @@ export function createGate(options: GateOptions): Gate {
     if (!chain) return;
     {
       try {
+        if (!(await reconcileDelivery(paseo, chain))) return;
+        const round = roundOf(chain);
+        if (round && !currentRevision(chain.agent_id, round.revision)) {
+          return roundNeedsUser(paseo, chain, replyTail(round.reply), "the saved decision is stale or predates revision tracking; start a new turn to continue");
+        }
         if (now() - chain.created_at > CHAIN_TTL_MS) {
           await endChain(paseo, chain.agent_id, null);
         } else if (chain.next_retry_at !== null && chain.next_retry_at <= now()) {
@@ -1919,6 +1998,10 @@ export function createGate(options: GateOptions): Gate {
 
   return {
     onTurnStarted: (event, paseo) => {
+      if (isSource(event.agent.id)) {
+        ledger.invalidate(event.agent.id);
+        ledger.supersedeDispatches(event.agent.id, now());
+      }
       const key = event.agent.workspaceId;
       // The baseline is taken now, not when the queue reaches this event: behind another repository's work the
       // agent may already have changed files, and those changes would land in the baseline unchecked.
@@ -1926,7 +2009,11 @@ export function createGate(options: GateOptions): Gate {
       early?.catch(() => undefined); // awaited (and reported) by the handler
       enqueue("turn_started", () => handleTurnStarted(event, paseo, early), key);
     },
-    onTurnEnded: (event, paseo) => enqueue("turn_ended", () => handleTurnEnded(event, paseo), event.agent.workspaceId),
+    onTurnEnded: (event, paseo) => {
+      if (isSource(event.agent.id) && event.outcome.kind === "canceled") ledger.invalidate(event.agent.id);
+      const revision = ledger.revision(event.agent.id);
+      enqueue("turn_ended", () => handleTurnEnded(event, paseo, revision), event.agent.workspaceId);
+    },
     onPermission: (event, paseo) => enqueue("permission", () => handlePermission(event, paseo), event.agent.workspaceId),
     reconcile: (paseo) => {
       // Each run and chain is reconciled in its own workspace's queue, after that workspace's pending events.
@@ -1944,8 +2031,10 @@ export function createGate(options: GateOptions): Gate {
         enqueue(`reconcile chain of ${agent_id}`, () => reconcileChain(paseo, agent_id), workspace_id);
       }
     },
-    stopAnswering: (chainId, paseo, resume) =>
-      new Promise((resolve) =>
+    stopAnswering: (chainId, paseo, resume) => {
+      const source = ledger.chainById(chainId);
+      if (source && !resume) ledger.invalidate(source.agent_id);
+      return new Promise((resolve) =>
         enqueue("stop answering", async () => {
           try {
             resolve(await stopAnswering(chainId, paseo, resume));
@@ -1954,8 +2043,10 @@ export function createGate(options: GateOptions): Gate {
             throw error;
           }
         }, ledger.chainById(chainId)?.workspace_id),
-      ),
+      );
+    },
     close: () => {
+      closed = true;
       for (const timer of retryTimers) clearTimeout(timer);
       retryTimers.clear();
     },

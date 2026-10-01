@@ -19,11 +19,13 @@ Paseo plugins are trusted, unsandboxed code. Review the repository before instal
 For development, install this checkout instead:
 
 ```bash
-npm install            # devDependencies only, for typecheck/tests
+npm ci                 # pinned development dependencies
 paseo plugin install "$PWD"
 ```
 
 Requires Paseo >= 0.10.0 with plugins enabled (Settings → Plugins).
+See [local development and testing](docs/local-development.md) for the isolated Paseo 0.10.1 smoke test and
+optional startup recovery connection.
 
 ## Enable it for a repository
 
@@ -111,7 +113,9 @@ they read the request and code, never the source agent's explanation. A decider 
 
 Code enforces the limits the decider cannot talk its way around: "done" on changed files needs a PASS on the current
 tree, a FAIL stands until a change passes it (the checkers never see the agent's arguments), replies that would
-approve a risky action are not sent, and every message goes out only while the agent is idle. Design and status:
+approve a risky action are not sent, and every automatic send checks the source revision, idle/error status and
+pending permissions immediately before sending. These checks are best-effort: Paseo still needs an atomic
+conditional-send API to close the final race with a user message. Design and status:
 [docs/completion-supervisor.md](docs/completion-supervisor.md). Verified end to end with the `kiro` and `codex` (via `codex-proxy`) providers.
 
 ### Review, verify, or both
@@ -166,6 +170,9 @@ This creates or updates `post-turn-gate-reviewer`, `post-turn-gate-verifier` and
   Stopping a turn started by the plugin retains its task and Stop/Resume controls.
 - **Stop auto-answering** cancels the current round, including checks. Later turns go to you until you press
   **Resume auto-answering**. Your messages cancel pending automation and reset the task's budget.
+- A lost send acknowledgement pauses automation unless the message id is found in the timeline. The plugin
+  never replays an uncertain message; check the chat before resuming. An empty completed reply goes to the
+  decider rather than being accepted as done, and a bare `429` does not trigger mechanical retries.
 - Replies begin with `[post-turn gate answered on your behalf]`. Every new round gets a card at the current
   timeline position; progress updates replace that card.
 - Children run in the source workspace and appear in Subagents while running, then History after archival.

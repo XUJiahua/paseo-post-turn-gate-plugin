@@ -23,6 +23,7 @@
     "init": "node bin/post-turn-gate-init.mjs"
   },
   "devDependencies": {
+    "@getpaseo/client": "0.10.1",
     "@getpaseo/plugin": "0.10.1",
     "@tanstack/react-query": "5.90.11",
     "@types/node": "24.10.1",

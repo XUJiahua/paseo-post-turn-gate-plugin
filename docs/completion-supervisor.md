@@ -299,7 +299,7 @@ tree 改变、未满足需求减少、阻断 finding 消失、出现新的有效
 
 | 能力 | 宿主提供时 | 今天的 Paseo（等同 v2） | 剩余风险 |
 | --- | --- | --- | --- |
-| 向主 Agent 发送 | `atomic`：原子 `sendIfIdle` | `best-effort`：refresh 后确认空闲，立即 `send()` | 两步之间用户正好发消息，会被插件的消息取消（V5） |
+| 向主 Agent 发送 | `atomic`：原子 `sendIfIdle` | `best-effort`：本地 revision + refresh + 权限检查，立即 `send()` | 最后检查之后、宿主接收之前的用户消息仍可能被取消（V5） |
 | worker 工作目录 | `worktree`：隔离 worktree，可并行 | `in-place`：原目录 + 前后 tree 对比，串行 | worker 的改动会短暂出现在源目录；verdict 作废，不回滚 |
 | 同工作区排他 | `exclusive`：能列举运行中的 Agent | `plugin-only`：插件派发的动作串行，外部 turn 靠重叠检测 | 插件启动前就在运行的外部 turn 看不到 |
 
@@ -307,7 +307,9 @@ tree 改变、未满足需求减少、阻断 finding 消失、出现新的有效
 
 ### 11.2 派发
 
-所有发给主 Agent 的消息经 `server/dispatch.ts` 的 `sendIfIdle`（已实现）：refresh → 确认 `idle`（重试和答案也接受 `error`）→ 同步落盘 → `send()`，中间不 await。确认失败即放弃，用户的 turn 按 revision 规则处理。宽限期（默认 60 秒）让 Agent 刚停下、用户最可能回复的那段时间里不发生自动发送。
+所有发给主 Agent 的消息经 `server/dispatch.ts` 的 `sendIfIdle`（已实现）：检查本地 revision → refresh → 再检查 revision、`idle/error` 和无待处理权限 → 同步记录发送意图并消耗预算 → `send()`，最后检查到发送之间不 await。源 Agent 的 `turn_started`、`canceled` 和 Stop 控制在入队之前立即递增持久化 revision，因此排队中的旧决策和重试会失效；最终宿主竞态仍需要原子 API。宽限期（默认 60 秒）减少刚停下时的自动发送。
+
+发送记录使用 `pending / accepted / unknown / superseded`。ack 丢失时只用 timeline 中相同 messageId/clientMessageId 的正向证据确认；未确认就停止自动回答并出卡，不重发。已记账的发送仍计入预算，即使最后无法确认。用户开始新 turn 或确认 Resume 后使旧记录失效；Resume 只影响后续 turn，不重放旧消息。
 
 给 worker 权限被拒后的追问不受此限。当前 decider 阶段二创建另一个子 Agent。
 
@@ -317,12 +319,12 @@ tree 改变、未满足需求减少、阻断 finding 消失、出现新的有效
 
 ## 12. 崩溃恢复
 
-- 首个 hook/RPC 取得 SDK handle 后立即 reconcile，之后每 60 秒一次（已实现，`server/supervisor.ts`）。
+- 首个 hook/RPC 或可选本地启动连接取得 SDK handle 后立即 reconcile，之后每 60 秒一次（已实现，`server/supervisor.ts`）。
 - 子 Agent 用同 id/key 重放 create（V9、V10）；已 idle 的子 Agent 从 timeline 取回结果。
-- 完整 outbox 是目标；当前子 Agent create 用 id/key 对账重放，已发送源消息没有完整重发协议。
+- 完整 outbox 是目标；当前子 Agent create 用 id/key 对账重放，源消息有持久化发送证据，但不自动重发不确定的消息。源消息对账最多读取 10 页、每页 500 条；遇到 gap、epoch 改变或边界即保留不确定状态。此分页不改变子 Agent 结果恢复的尾部读取限制。
 - turn 中途重载：`tasks.turn_json` 保留基线（已实现）。
 - 存储的策略快照无法按当前 schema 解析时转 `ERROR`。
-- 冷启动无事件时不能恢复，需要 Paseo 提供 ready hook（§21）。
+- 默认冷启动仍等待首个事件。配置 `POST_TURN_GATE_RECOVERY_URL` 后，无 Agent 事件也能连接本地 daemon 并开始恢复，连接失败每 5 秒重试。地址必须显式给出，不猜端口；配置与复现命令见 [local-development.md](local-development.md)。Paseo 的 ready hook 仍是更直接的上游方案。
 
 ## 13. 用户交互
 
@@ -494,7 +496,7 @@ v1 与本设计的差异，后续步骤处理：
 尚未做：
 
 - 从 `gate.ts` 拆出 decision round 模块：试算过，它依赖 `gate.ts` 闭包里约 25 个函数（ledger、卡片、派发、任务链），拆出去只会得到一个很宽的浅接口，暂不拆。
-- 结构化 Requirement Revision 和发送 outbox：现在需求按文本累积，发送靠 messageId 对账。
+- 结构化 Requirement Revision 和完整发送 outbox：需求仍按文本累积；已实现用于使旧自动化失效的本地持久化 revision 和发送状态记录，但没有宿主 CAS 或自动重放协议。
 - Claude 冒烟：本机的 `claude-proxy` provider 不可用，未测。
 
 ## 20. 已定的默认决策
@@ -510,8 +512,8 @@ v1 与本设计的差异，后续步骤处理：
 - 原子 `sendIfIdle(expectedRevision)`；
 - 创建子 Agent 时指定 cwd（隔离 worktree）；
 - 列举同一工作区正在运行的 Agent；
-- server plugin 启动时的 SDK/ready hook；
-- 稳定读取 timeline messageId 以对账（现状只搜尾部 500 条）；
+- server plugin 启动时的 SDK/ready hook（已有可选本地 SDK 连接 workaround）；
+- 稳定读取 timeline messageId 以对账（源消息已有限分页，但缺失记录不能证明未发送）；
 - 区分用户消息与插件消息，而不只靠 messageId 前缀；
 - `PluginTurnOutcome` 的 `canceled.cause`、`completed.stopReason`、`failed.error.category`（[paseo-pr-turn-outcome.md](paseo-pr-turn-outcome.md)）；
 - 可靠的 Agent terminal/archived 事件；

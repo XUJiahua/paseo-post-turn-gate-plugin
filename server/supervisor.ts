@@ -36,18 +36,23 @@ export function createSupervisor(options: SupervisorOptions): CompletionSupervis
   const gate = createGate(options);
   const interval = options.reconcileIntervalMs ?? 60_000;
   let timer: ReturnType<typeof setInterval> | null = null;
+  let currentPaseo: Paseo | null = null;
+  let closed = false;
 
-  // The server context has no SDK handle (design.md V1); the first event supplies it and starts recovery.
-  // ponytail: nothing is recovered until some agent event arrives after a restart; upgrade path is a ready hook.
+  // The server context has no SDK handle (design.md V1). The optional startup client, or the first hook/RPC,
+  // supplies it and starts recovery. Each later entry refreshes the handle used by the interval.
   function capture(paseo: Paseo): void {
+    if (closed) return;
+    currentPaseo = paseo;
     if (timer) return;
     gate.reconcile(paseo);
-    timer = setInterval(() => gate.reconcile(paseo), interval);
+    timer = setInterval(() => { if (currentPaseo) gate.reconcile(currentPaseo); }, interval);
     timer.unref?.();
   }
 
   return {
     accept(event, paseo) {
+      if (closed) return;
       capture(paseo);
       switch (event.type) {
         case "turn_started":
@@ -62,11 +67,14 @@ export function createSupervisor(options: SupervisorOptions): CompletionSupervis
       }
     },
     control({ taskId, action }, paseo) {
+      if (closed) return Promise.resolve(false);
       capture(paseo);
       return gate.stopAnswering(taskId, paseo, action === "resume_answering");
     },
     idle: () => gate.idle(),
     async close() {
+      closed = true;
+      currentPaseo = null;
       if (timer) clearInterval(timer);
       timer = null;
       gate.close();

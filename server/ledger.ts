@@ -62,6 +62,7 @@ export interface Chain {
   stop_answering: number;
   next_retry_at: number | null;
   retry_message: string | null;
+  retry_revision: number | null;
   answer_child_id: string | null;
   answer_dispatch_json: string | null;
   answer_deadline_at: number | null;
@@ -107,6 +108,7 @@ const CHAIN_COLUMNS = [
   "stop_answering",
   "next_retry_at",
   "retry_message",
+  "retry_revision",
   "answer_child_id",
   "answer_dispatch_json",
   "answer_deadline_at",
@@ -129,6 +131,7 @@ const CHAIN_RESET = {
   stop_answering: 0,
   next_retry_at: null,
   retry_message: null,
+  retry_revision: null,
   answer_child_id: null,
   answer_dispatch_json: null,
   answer_deadline_at: null,
@@ -222,6 +225,20 @@ export class Ledger {
     this.db = new DatabaseSync(file);
     this.db.exec(`
       PRAGMA journal_mode = WAL;
+      CREATE TABLE IF NOT EXISTS source_revisions (
+        agent_id TEXT PRIMARY KEY,
+        revision INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS source_dispatches (
+        message_id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        chain_id TEXT NOT NULL,
+        text TEXT NOT NULL,
+        state TEXT NOT NULL,
+        error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS gate_runs (
         run_id TEXT PRIMARY KEY,
         source_agent_id TEXT NOT NULL,
@@ -322,6 +339,7 @@ export class Ledger {
       task_id: "TEXT",
     });
     migrate("tasks", {
+      retry_revision: "INTEGER",
       task_id: "TEXT",
       run_id: "TEXT",
       concurrent_json: "TEXT",
@@ -332,6 +350,38 @@ export class Ledger {
       budget_since: "INTEGER",
       last_run_id: "TEXT",
     });
+  }
+
+  revision(agentId: string): number {
+    return (this.db.prepare("SELECT revision FROM source_revisions WHERE agent_id = ?").get(agentId) as { revision: number } | undefined)?.revision ?? 0;
+  }
+
+  /** Synchronous: invalidate work as soon as a hook arrives, before it enters a workspace queue. */
+  invalidate(agentId: string): number {
+    this.db.prepare(`INSERT INTO source_revisions (agent_id, revision) VALUES (?, 1)
+      ON CONFLICT(agent_id) DO UPDATE SET revision = revision + 1`).run(agentId);
+    return this.revision(agentId);
+  }
+
+  recordDispatch(agentId: string, chainId: string, messageId: string, text: string, now: number): void {
+    this.db.prepare(`INSERT INTO source_dispatches
+      (message_id, agent_id, chain_id, text, state, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)`)
+      .run(messageId, agentId, chainId, text, now, now);
+  }
+
+  updateDispatch(messageId: string, state: "accepted" | "unknown" | "superseded", now: number, error: string | null = null): void {
+    this.db.prepare("UPDATE source_dispatches SET state = ?, error = ?, updated_at = ? WHERE message_id = ?")
+      .run(state, error, now, messageId);
+  }
+
+  unresolvedDispatches(agentId: string): Array<{ message_id: string; chain_id: string; state: string }> {
+    return this.db.prepare("SELECT message_id, chain_id, state FROM source_dispatches WHERE agent_id = ? AND state IN ('pending', 'unknown')")
+      .all(agentId) as Array<{ message_id: string; chain_id: string; state: string }>;
+  }
+
+  supersedeDispatches(agentId: string, now: number): void {
+    this.db.prepare("UPDATE source_dispatches SET state = 'superseded', updated_at = ? WHERE agent_id = ? AND state IN ('pending', 'unknown')")
+      .run(now, agentId);
   }
 
   /** Records a reviewer/verifier agent id before it is created, so its events are never mistaken for a source. */
