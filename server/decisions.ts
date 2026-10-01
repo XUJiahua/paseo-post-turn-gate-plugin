@@ -2,7 +2,7 @@ import type { Check, Policy, Verdict } from "../shared/schema.ts";
 import { gateChecks } from "../shared/schema.ts";
 
 /**
- * Pure next-step decisions (guardrails of docs/completion-supervisor.md §8): state and results in,
+ * Pure next-step decisions (guardrails of docs/workflow.md): state and results in,
  * the next step out, no side effects. The gate performs what they return.
  */
 

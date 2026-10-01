@@ -199,7 +199,7 @@ const REPLY_RULES = `Reply kinds:
 - "escalate": see the rules above; "question" says what the user must decide, "reason" why.`;
 
 /**
- * The decider stands in for the user after a turn (docs/completion-supervisor.md §5). Phase "plan" decides what
+ * The decider stands in for the user after a turn (docs/workflow.md). Phase "plan" decides what
  * the next step depends on; phase "merge" writes the reply from the checks' results.
  */
 export function buildDeciderPrompt(input: {

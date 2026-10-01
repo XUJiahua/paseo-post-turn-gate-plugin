@@ -1,63 +1,100 @@
-# 工作流程（当前 v3）
+# v3 工作流程
 
-最小策略是 `{ "version": 3 }`：默认按 verify、review 串行检查，decider 有 60 秒宽限期，总自动消息最多 12 次。只支持 v3，没有模板修复或只报告模式。角色规则在 `.paseo/post-turn-gate/{verifier,reviewer,decider}.md`。
+[使用入口](../README.md) · [配置指南](configuration.md) · [实现原理](design.md)
 
-## 普通完成
+## 三个角色与插件代码
+
+| 角色 | 输入与职责 | 边界 |
+| --- | --- | --- |
+| source | 接收用户需求，在现有 Paseo 会话中编码 | 插件不替代它的 runtime |
+| verifier | 只看需求和代码，将需求映射到可观察证据 | 不把 source 自述当作验收证据 |
+| reviewer | 只看需求和代码，检查正确性与可维护性 | 不读取 source 回复或反驳，不自行修复 |
+| decider | 读取需求、source 回复、检查结果，决定下一步并写回复 | 可以解释 FAIL 或交给用户，不能把 FAIL 说成 PASS |
+| 插件代码 | 处理事件、创建角色、验证结果、控制预算、权限、发送和恢复 | 可以拒绝模型决定；仍受宿主及实现限制 |
+
+verifier/reviewer 统称 checker。它们是 source 的子 Agent，默认继承 source 模型；独立性来自不同输入与执行过程，不要求不同模型。
+
+## 从 turn 结束到下一步
+
+turn 是 Agent 的一轮执行，不等于整项任务完成。任务跨多个 source turn，保留原始需求和未接受的改动。
 
 ```mermaid
 flowchart TD
-  E[主 Agent turn 结束] --> G{用户停止或接手?}
-  G -->|是| U[保留改动，等待用户下一轮]
-  G -->|否| C{done 且有改动，无提问或未完成信号?}
-  C -->|是| K[立即 verify / review，不等宽限期]
-  K --> P{全部 PASS?}
-  P -->|是| D[直接完成，无 decider，无消息]
-  P -->|否| H{检查需要人介入?}
-  H -->|是| U
-  H -->|否| M[宽限期后 decider 汇总检查结果]
-  M --> R[一条回复推动修复或找人]
-  C -->|否，做过工作| A[宽限期后 decider 计划，检查可先运行]
-  A --> R
+  E["source turn 结束"] --> F{"结果预筛"}
+  F -->|"停止或被替换"| U["等待用户 / 新 turn"]
+  F -->|"失败"| X["重试、decider 或用户"]
+  F -->|"正常完成且任务无改动"| N["结束，不启动检查"]
+  F -->|"正常完成且任务有改动"| K["立即串行检查"]
+  F -->|"提问、未完成或空回复"| Q{"有工作或空回复?"}
+  Q -->|"否：纯聊天"| N
+  Q -->|"是"| P["宽限期后 decider 计划"]
+  P -->|"回复依赖检查"| W["运行或等待检查"]
+  P -->|"可直接回复"| G["代码护栏复核"]
+  K --> R{"检查结果"}
+  R -->|"全部 PASS"| D["完成，无 decider / 消息"]
+  R -->|"需要人介入"| U
+  R -->|"FAIL / 其他 INCONCLUSIVE"| M["宽限期后 decider 汇总"]
+  W --> M
+  M --> G
+  G -->|"有效回复"| S["发回 source，开始下一 turn"]
+  G -->|"满足完成条件"| D
+  G -->|"边界、预算或无法确认"| U
 ```
 
-完成捷径即使 `speculative_checks=false` 也立即检查。一个 FAIL 停止本次检查，其余检查不再启动；下一次源 Agent 改树后从第一项重新检查。INCONCLUSIVE 继续后续检查，最终交给 decider 补齐证据或找人。
+失败分支见[轮次结果处理](turn-outcomes.md)。空回复是例外：即使没有文件变化也进入 decider；有正常回复、没用工具、没改文件的纯聊天提问不会自动代答。
 
-## 做完一部分后提问
+## 普通完成：PASS 捷径
 
-```mermaid
-sequenceDiagram
-  participant S as 主 Agent
-  participant P as 插件
-  participant K as checker
-  participant D as decider
-  S->>P: 有改动，问“要不要 commit？”
-  P->>K: 立即检查需求与代码
-  Note over P,D: 用户发消息则取消；否则宽限期后出计划
-  P->>D: 需求、回复、检查进度
-  K-->>P: PASS / FAIL / INCONCLUSIVE
-  P->>D: 汇总阶段的独立证据
-  D-->>P: 答案 + 修复要求，或找人
-  P->>S: 一条自动回复（通过护栏时）
-```
+source 回复没有问题或未完成信号，任务相对 baseline 有改动时，立即按 checks 执行。不等宽限期，不先创建计划 decider；即使 `speculative_checks=false` 也是如此。
 
-检查者不知道主 Agent 说了什么。decider 不能推翻 FAIL，也不能没有 PASS 就完成有改动的任务。模型可以把“保留当前接口”的答案与“修掉边界错误”的要求放在同一条消息中。
+全部 PASS 且对应当前 tree，任务直接完成。FAIL 或可由 decider 处理的 INCONCLUSIVE 进入汇总；宽限期尚未结束时继续等待。检查异常、文件变化、需求歧义或被拒的必需权限交给用户。
 
-## 提前停止、失败与人类边界
+“source 说完成”只用于选择检查路径，不是验收结论。未改文件的正常完成则无需启动 checker。
 
-未闭合代码块、tool-last 或未完成 todo 等信号进入 decider，通常回复“继续”；纯聊天不启动。crash、网络、限流按 30 秒、2 分钟、8 分钟重试，再交 decider；quota、context 耗尽直接找人。拒答、未知错误、缺测试、反驳先由 decider 判断。它只能坚持修改或把反驳交给用户，不能接受辩解生成 PASS。
+## 提问或未完成：计划与汇总
 
-产品取舍、外部动作、凭据、扩大范围、同题再问、预算耗尽由护栏或 decider 交给你。检查者无法给有效结论、改了工作区、权限不足或需求不明也交给你。未接受的改动一直在任务范围内。
+例如 source 实现了一部分后问“是否保持现有接口？”。默认有改动时先运行检查，等待 60 秒给用户回复机会，再启动计划 decider。`speculative_checks=false` 可以推迟检查，等待计划。
 
-## 用户接手与权限
+计划包括 assessment、需要的 workers、问题，以及可选 reply_now。若回复不依赖检查，可直接给答案或继续指令，插件取消不再需要的检查。若依赖检查，插件使用策略指定的检查列表与顺序，并复用已运行的检查；workers 表达依赖，不能任意增加新角色。
 
-你发消息会取消旧决策、归档角色并保留原始 baseline；下一轮检查整项任务。你停止主 Agent 时绝不启动 decider。停止插件发起的 turn 保留任务和 Stop/Resume 按钮；Stop auto-answering 会取消当前检查，直到 Resume 才恢复下一轮自动处理。
+检查完成后，另一个 decider 子 Agent 汇总。两个阶段是两个 Agent，分别获得计划/回复输出 schema，而非向同一个 Agent 发送第二条消息。最终回复有三种：
 
-常规角色工具请求自动批准，高风险上卡。请求 5 分钟无人回答（默认）被拒绝；checker 获得一次机会给已有证据下的结论。`agents.<role>.permissions="ask"` 可让所有请求上卡。
+| kind | 作用 |
+| --- | --- |
+| send | 一条消息，含答案、需要修复的 findings、需要补的证据或继续指令 |
+| done | 结束任务；有改动时必须满足检查 PASS 条件 |
+| escalate | 向用户说明需要决定的问题与原因 |
 
-## 多项目与恢复
+自动回复可以同时回答问题和要求修复，不会分别发送多条消息。
 
-每个 workspace 有自己的串行队列，慢创建不会堵住其他 workspace。基线在事件到达时拍摄，Git 调用最多 120 秒。共享同一仓库目录仍会混入其他 Agent 改动，重叠信息进入角色 prompt；独立 worktree 可避免。
+## 检查结果如何生效
 
-重启后首个事件触发对账，之后每 60 秒一次；未创建成功的角色按同 id/key 重放，闲置角色从 timeline 恢复结果，超时转交用户。正在运行的源 turn 保留快照。源消息尚无原子派发或完整 outbox，详见 [design.md](design.md)。
+checker 在共享目录内串行运行，verify 与 review 各最多一次，按策略顺序执行。
 
-每个决策轮一张卡片；检查、权限和 decider 的回复在同一张里。模型自由文本跟随请求语言；插件内置状态文字固定英文。
+| 结果 | 后续行为 |
+| --- | --- |
+| PASS | 继续下一检查；全部 PASS 才获得当前 tree 的通过证据 |
+| FAIL | 结束本次检查 run，decider 给出修复反馈；剩余检查不启动 |
+| INCONCLUSIVE | 继续后续检查，最终交给 decider 补证据或用户处理；不是 PASS |
+| INCONCLUSIVE 的 blocked_permission / ambiguous_request | 后续检查完成后交给用户；若先出现 FAIL，按 FAIL 路径处理 |
+| 无效 JSON、异常结束、超时或检查期间 tree 改变 | 不能作为通过证据，交给用户 |
+
+包含 CRITICAL/HIGH finding 时，代码强制按 FAIL 处理，即使模型写 PASS。其他 finding 严重性与 verdict 仍由模型判断。
+
+source 修复使 tree 改变后，检查从第一项开始。只反驳不改文件时，已有 FAIL 仍提供给 decider，它可以坚持修改或交给用户，不能接受辩解获得 PASS。同 tree 的有效 PASS 可以复用；用户追加需求后，新决策可能要求重查，tree 相同不保证新需求已验收。
+
+## 任务范围与用户接管
+
+baseline 是任务开始时工作区的 Git tree，而非每轮的 HEAD。后续修复、自动回答和用户补充沿用原始 baseline，避免仅验收最后一次修复。快照包含 tracked 与 untracked 文件，排除 ignored 文件，使用临时 index，不修改用户 index。
+
+用户新消息使旧决策和回复失效，取消旧检查，追加需求文本，保留原有改动范围。源 turn 停止时不启动 decider；未接受改动保留到下一 turn。Stop auto-answering 暂停当前任务链自动回答；Resume 允许后续 turn，不重放旧回复。
+
+decider 根据请求与仓库约定处理可逆决定。产品取舍、扩大范围、凭据、对外操作或采纳 FAIL 反驳应交给用户。代码还检查风险回复、重复问题、发送预算、无进展和时长；风险识别是启发式，不能视作沙箱。
+
+## 卡片、权限与反馈循环
+
+每个决策轮一张卡，检查进度、decider 状态、权限和回复更新在这一张；新轮创建新卡并关闭旧卡。配置或快照失败使用错误卡。
+
+角色工具权限默认 auto：常规请求批准，高风险上卡；ask 显示所有请求。默认无人回答 5 分钟后拒绝，等待也计入角色总超时。checker 可能获得一次追问，要求仅凭已有证据输出 verdict；这不是让 source 重试权限操作。
+
+自动回复经过代码护栏发送，引发下一 turn，循环直到完成、用户接管或需人工处理。发送不确定时停止循环，不凭落盘意图推断宿主已接受，也不自动重发。发送、恢复与多 workspace 边界见[实现原理](design.md)。

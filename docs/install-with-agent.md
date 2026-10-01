@@ -1,4 +1,4 @@
-# Install and tailor Post-turn Gate for this repository
+# Install and tailor Post-turn Gate v3 for this repository
 
 Target repository: `{{TARGET_REPOSITORY}}`
 
@@ -59,7 +59,7 @@ node '<installed-plugin-path>/bin/post-turn-gate-init.mjs' --dir {{TARGET_REPOSI
 
 If the installed checkout does not contain `bin/post-turn-gate-init.mjs`, stop: that installed revision does not
 provide a compatible initializer. Report its source and revision, then ask the user whether to update the plugin;
-never download a newer initializer for the older running plugin. If any target already exists, do not run
+never download a different initializer for the running plugin. If any target already exists, do not run
 initialization and do not use `--force`; preserve the files and make only evidence-backed incremental edits. Report
 an incomplete or invalid existing setup rather than silently replacing it.
 
@@ -93,11 +93,16 @@ correct rules are better than broad summaries of the repository.
 
 ## 5. Verify and report
 
-1. Parse `.paseo/post-turn-gate.json` as JSON and confirm all three `profile` values remain `null` for a new setup.
+1. Parse `.paseo/post-turn-gate.json` as JSON, confirm `version: 3`, and confirm all three `profile` values remain
+   `null` for a new setup. Validate fields against the installed checkout's `shared/schema.ts`; do not invent fields.
 2. Confirm each role file has non-empty active Markdown outside HTML comments and remains concise.
 3. Cross-check every named command against a manifest, CI workflow, or project document. Run only safe, relevant
    checks needed to confirm the customization; do not deploy, publish, or contact external services.
 4. Show `git diff -- .paseo` and summarize the evidence behind each added rule. Clearly identify any uncertainty.
 5. Leave all changes uncommitted for the user to review.
-6. Explain that policy and instructions are frozen when an agent turn starts. Because setup happened during this
-   turn, Post-turn Gate becomes functionally active on the next agent turn that changes the working tree.
+6. Explain that policy and instructions are frozen when a new task's agent turn starts, and an active task chain
+   retains its snapshot. For a new setup made during this turn, start a new task on the next agent turn after setup.
+   For an existing active chain, use a new task chain or a new Agent to verify changed settings.
+
+Usage and configuration: [README](../README.md) and [configuration.md](configuration.md). Current workflow and
+state handling: [workflow.md](workflow.md) and [design.md](design.md).

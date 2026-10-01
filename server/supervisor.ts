@@ -3,7 +3,7 @@ import { createGate, type Paseo } from "./gate.ts";
 import type { Ledger } from "./ledger.ts";
 
 /**
- * The single entry point of the supervisor (docs/completion-supervisor.md §19). Hooks, RPCs and recovery all arrive as events;
+ * The single entry point of the supervisor (docs/design.md). Hooks, RPCs and recovery all arrive as events;
  * callers never assemble the workflow. The gate owns decision rounds, checks and retries.
  */
 export type SupervisorEvent =
@@ -39,7 +39,7 @@ export function createSupervisor(options: SupervisorOptions): CompletionSupervis
   let currentPaseo: Paseo | null = null;
   let closed = false;
 
-  // The server context has no SDK handle (design.md V1). The optional startup client, or the first hook/RPC,
+  // The server context has no SDK handle (docs/design.md). The optional startup client, or the first hook/RPC,
   // supplies it and starts recovery. Each later entry refreshes the handle used by the interval.
   function capture(paseo: Paseo): void {
     if (closed) return;

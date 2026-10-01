@@ -46,7 +46,7 @@ export interface Run {
   updated_at: number;
 }
 
-/** A task that spans several turns (answered questions, retries); see docs/turn-outcomes.md §4. */
+/** A task that spans several turns (answered questions, retries); see docs/design.md. */
 export interface Chain {
   agent_id: string;
   chain_id: string;
