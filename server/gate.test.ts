@@ -82,7 +82,7 @@ function createFakePaseo() {
             created.push({ workspaceId, ...options });
             if (createBarrier && (barrierWorkspace === null || barrierWorkspace === workspaceId)) await createBarrier;
             if (failCreate) throw new Error("provider unavailable");
-            // Like the daemon (design.md V9): a key replays only its own payload.
+            // Like the daemon (docs/design.md): a key replays only its own payload.
             const payload = JSON.stringify(options);
             const previous = keys.get(options.idempotencyKey);
             if (previous !== undefined && previous !== payload) throw new Error("agent_request_key_conflict");

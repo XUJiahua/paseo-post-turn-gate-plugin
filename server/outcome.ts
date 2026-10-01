@@ -1,4 +1,4 @@
-// Classifies why an agent turn ended (docs/turn-outcomes.md §2). Pure functions, no I/O.
+// Classifies why an agent turn ended (docs/turn-outcomes.md). Pure functions, no I/O.
 import type { Category } from "../shared/schema.ts";
 
 export interface OutcomeLike {

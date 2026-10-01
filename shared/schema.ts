@@ -111,7 +111,7 @@ export const DECIDER_REPLY_JSON_SCHEMA = z.toJSONSchema(deciderReplySchema) as R
 
 export const triggerSchema = z.enum(["root_only", "root_and_opt_in", "all"]).default("root_and_opt_in");
 
-/** Task-level supervision (docs/completion-supervisor.md §15). */
+/** Task-level supervision (docs/configuration.md). */
 export const supervisionSchema = z
   .object({
     /** Checks the plugin can run for the decider, in order. */
@@ -142,7 +142,7 @@ export const supervisionSchema = z
   .prefault({});
 export type Supervision = z.output<typeof supervisionSchema>;
 
-/** A decider agent answers for the user after every turn that did work (docs/completion-supervisor.md). */
+/** A decider agent answers for the user after every turn that did work (docs/workflow.md). */
 export const policySchema = z
   .object({
     version: z.literal(3),
@@ -166,7 +166,7 @@ export const findingSchema = z.object({
 });
 export type Finding = z.output<typeof findingSchema>;
 
-/** Why a check could not decide; each reason has its own follow-up (docs/design.md §5). */
+/** Why a check could not decide; each reason has its own follow-up (docs/workflow.md). */
 export const INCONCLUSIVE_REASONS = ["blocked_permission", "ambiguous_request", "no_test_infra", "env_missing", "other"] as const;
 export type InconclusiveReason = (typeof INCONCLUSIVE_REASONS)[number];
 

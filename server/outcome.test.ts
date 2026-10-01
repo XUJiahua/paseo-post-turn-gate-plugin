@@ -13,7 +13,7 @@ const tool = (status: string) => ({ type: "tool_call", status });
 const turn = (outcome: Parameters<typeof classify>[0]["outcome"], items: object[], statusAtEnd = "idle") =>
   classify({ outcome, turnItems: currentTurnItems([user("earlier"), says("old reply?"), user("now"), ...items] as never), statusAtEnd });
 
-describe("classify: real kiro-cli 2.25 payloads (docs/turn-outcomes.md §1)", () => {
+describe("classify: provider outcome payloads (docs/turn-outcomes.md)", () => {
   test("E1 done", () => {
     assert.equal(turn({ kind: "completed" }, [says("ALL DONE")]).category, "done");
   });

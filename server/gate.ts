@@ -64,7 +64,7 @@ type AgentSnapshot = NonNullable<
 
 export const MANAGED_LABEL = "post-turn-gate.managed";
 export const TARGET_LABEL = "post-turn-gate.target";
-/** Added by the daemon to every agent created with a parent (design.md V8). */
+/** Added by the daemon to every agent created with a parent (docs/design.md). */
 const PARENT_LABEL = "paseo.parent-agent-id";
 const PLUGIN_PREFIX = "ptg:";
 const REQUEST_TEXT_LIMIT = 8000;
@@ -1060,7 +1060,7 @@ export function createGate(options: GateOptions): Gate {
     return true;
   }
 
-  // ---------- decision rounds (version 3, docs/completion-supervisor.md §5) ----------
+  // ---------- decision rounds (version 3, docs/workflow.md) ----------
 
   /**
    * One decision round per turn that did work: the checks start at once (speculative), the decider plans after
@@ -1217,7 +1217,7 @@ export function createGate(options: GateOptions): Gate {
     const records = (JSON.parse(run.rounds_json) as RoundRecord[]).filter((record) => record.round === run.round);
     const done = records.map((record) => `${record.check} ${record.verdict ?? "?"}${record.reason ? ` (${record.reason})` : ""}`);
     const running = [...done, `${checkOf(run)}…${waiting.has(run.run_id) ? " (waiting for your permission)" : ""}`];
-    // A checker is named with its id so `paseo logs` can find it; the card has no link to it (design.md V16).
+    // A checker is named with its id so `paseo logs` can find it; the card has no link to it (docs/design.md).
     const child = run.child_agent_id && !isTerminal(run.status) ? ` · ${checkOf(run)} agent ${run.child_agent_id}` : "";
     return isTerminal(run.status) ? `Checks: ${done.join(", ") || run.status}` : `Checks running: ${running.join(", ")}${child}`;
   }
@@ -1422,7 +1422,7 @@ export function createGate(options: GateOptions): Gate {
     await archiveChild(paseo, next.child_agent_id);
   }
 
-  /** The guardrails every reply passes before it is sent (docs/completion-supervisor.md §8). */
+  /** The guardrails every reply passes before it is sent (docs/workflow.md). */
   async function applyReply(paseo: Paseo, chain: Chain, round: Round, reply: DeciderReply): Promise<void> {
     if (!currentRevision(chain.agent_id, round.revision)) return;
     const question = round.plan?.question.trim() || replyTail(round.reply);

@@ -8,7 +8,7 @@
   },
   "files": [
     "bin/",
-    "docs/install-with-agent.md",
+    "docs/",
     "paseo-plugin.json",
     "index.client.tsx",
     "index.server.ts",

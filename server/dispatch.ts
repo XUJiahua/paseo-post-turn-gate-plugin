@@ -5,8 +5,8 @@ type Paseo = PluginHookContext["paseo"];
 export type DispatchResult = "sent" | "busy" | "gone" | "stale" | "unknown";
 
 /**
- * The one path every automatic message to a source agent takes (decision, retry; docs/completion-supervisor.md
- * §11.2). Paseo has no atomic "send only if idle" and send() cancels a running turn (design.md V5), so this is
+ * The one path every automatic message to a source agent takes (decision, retry; docs/design.md).
+ * Paseo has no atomic "send only if idle" and send() cancels a running turn, so this is
  * best-effort: check the local revision, refresh, recheck revision/status/permissions, record intent, then send,
  * with nothing awaited between the last check and send(). Hooks received before that check invalidate queued
  * work. A user message not yet observed by the plugin can still be canceled by ours in the final host race.
